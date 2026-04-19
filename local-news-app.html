@@ -5,7 +5,12 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Local News Desk</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'><rect width='128' height='128' rx='24' fill='%230f172a'/><path d='M28 30h72v12H28zm0 24h72v12H28zm0 24h50v12H28z' fill='%23f8fafc'/><circle cx='92' cy='84' r='12' fill='%23f97316'/></svg>">
+    <!-- Variant A: feed lines + highlight -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'><rect width='128' height='128' rx='26' fill='%23171513'/><rect x='24' y='28' width='80' height='12' rx='6' fill='%23f6f1e8'/><rect x='24' y='52' width='80' height='12' rx='6' fill='%23f6f1e8' opacity='0.88'/><rect x='24' y='76' width='52' height='12' rx='6' fill='%23f6f1e8' opacity='0.7'/><circle cx='92' cy='82' r='12' fill='%232563eb'/></svg>">
+    <!-- Variant B: signal disc -->
+    <!-- <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'><rect width='128' height='128' rx='26' fill='%23171513'/><circle cx='64' cy='64' r='34' fill='none' stroke='%23f6f1e8' stroke-width='12' opacity='0.85'/><circle cx='64' cy='64' r='8' fill='%23f6f1e8'/><path d='M64 64L92 40' stroke='%232563eb' stroke-width='12' stroke-linecap='round'/><circle cx='92' cy='40' r='10' fill='%232563eb'/></svg>"> -->
+    <!-- Variant C: stacked cards -->
+    <!-- <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'><rect width='128' height='128' rx='26' fill='%23171513'/><rect x='28' y='26' width='52' height='62' rx='10' fill='%23efe7d6'/><rect x='46' y='40' width='54' height='62' rx='10' fill='%23f6f1e8'/><rect x='58' y='54' width='30' height='8' rx='4' fill='%23171513' opacity='0.85'/><rect x='58' y='70' width='34' height='8' rx='4' fill='%23171513' opacity='0.55'/><circle cx='96' cy='92' r='10' fill='%230f766e'/></svg>"> -->
     <style>
         :root {
             --bg: #27241f;
@@ -111,7 +116,7 @@
 
         .brand h1 {
             font-family: var(--serif-font);
-            font-size: clamp(14px, 1.45vw, 20px);
+            font-size: clamp(12px, 1.15vw, 17px);
             font-weight: 600;
             line-height: 1.08;
         }
@@ -338,7 +343,7 @@
         }
 
         .summary-card h3 {
-            font-size: clamp(36px, 5vw, 54px);
+            font-size: clamp(28px, 3.6vw, 40px);
         }
 
         .prediction-strip {
@@ -702,6 +707,7 @@
                     <button class="nav-button active" data-screen="feed">Feed</button>
                     <button class="nav-button" data-screen="summaries">Summaries <span id="navSummaryCount"></span></button>
                     <button class="nav-button" data-screen="ops">Model Ops</button>
+                    <button class="nav-button" id="pageReloadButton" title="Seite neu laden">Reload</button>
                 </div>
                 <div class="status-row">
                     <div class="status-pill"><span class="status-dot" id="ollamaDot"></span> Ollama <strong id="ollamaStatus">prüfe…</strong></div>
@@ -791,6 +797,41 @@
             return `${Math.round(probability * 100)}%`;
         }
 
+        function buildShareText(item) {
+            const lines = [
+                item.summary_title || item.title || '',
+                `Quelle: ${item.source_label || 'Unbekannt'}`,
+                `URL: ${item.link_to_article || item.source_url || ''}`,
+                '',
+                item.summary_text || '',
+            ];
+            return lines.join('\n').trim();
+        }
+
+        async function copyTextToClipboard(text) {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(text);
+                return;
+            }
+
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.setAttribute('readonly', '');
+            textarea.style.position = 'fixed';
+            textarea.style.top = '-1000px';
+            textarea.style.left = '-1000px';
+            document.body.appendChild(textarea);
+            textarea.focus();
+            textarea.select();
+
+            const success = document.execCommand('copy');
+            document.body.removeChild(textarea);
+
+            if (!success) {
+                throw new Error('Kopieren in die Zwischenablage ist fehlgeschlagen');
+            }
+        }
+
         function switchScreen(nextScreen) {
             state.screen = nextScreen;
             document.querySelectorAll('.screen').forEach(screen => screen.classList.remove('active'));
@@ -866,6 +907,18 @@
                 : null;
             const payload = await api('/summaries');
             state.summaries = payload.items || [];
+            if (!state.status) {
+                state.status = {
+                    feed: {},
+                    summaries: payload.counts || {},
+                    models: {},
+                    ollama: {},
+                    config: {},
+                };
+            } else {
+                state.status.summaries = payload.counts || {};
+            }
+            renderHeaderStatus();
             if (currentId) {
                 const nextIndex = state.summaries.findIndex(item => item.id === currentId);
                 state.summaryIndex = nextIndex >= 0 ? nextIndex : Math.min(state.summaryIndex, Math.max(state.summaries.length - 1, 0));
@@ -917,6 +970,9 @@
             };
 
             if (!item) {
+                const refreshLabel = state.status?.last_feed_refresh?.finished_at
+                    ? formatRelativeTime(state.status.last_feed_refresh.finished_at)
+                    : 'unbekannt';
                 host.innerHTML = `
                     <div class="panel">
                         <div class="panel-header">
@@ -934,8 +990,8 @@
                             </div>
                         </div>
                         <div class="empty-state">
-                            <h3>Kein aktiver Feed-Eintrag</h3>
-                            <p>Im aktuellen Modus sind keine offenen Artikel da. Du kannst die Feeds neu einlesen oder auf Summaries wechseln.</p>
+                            <h3>Inbox leer</h3>
+                            <p>Im aktuellen Modus gibt es gerade keine offenen Feed-Einträge. Neue Artikel tauchen automatisch nach dem nächsten Refresh auf. Letzter Feed-Refresh: ${escapeHtml(refreshLabel)}.</p>
                         </div>
                     </div>
                 `;
@@ -1122,6 +1178,7 @@
                         <div class="action-row">
                             <div class="action-group">
                                 <button class="action-button neutral" id="summaryPrevButton" ${state.summaryIndex === 0 ? 'disabled' : ''}>Zurück</button>
+                                <button class="action-button neutral" id="summaryShareButton">Teilen</button>
                                 <a class="action-button neutral" href="${escapeHtml(item.link_to_article)}" target="_blank" rel="noopener noreferrer">Original öffnen</a>
                             </div>
                             <div class="action-group">
@@ -1139,8 +1196,21 @@
                     renderSummaryScreen();
                 }
             });
+            document.getElementById('summaryShareButton')?.addEventListener('click', handleSummaryShare);
             document.getElementById('summaryInterestingButton')?.addEventListener('click', () => handleSummaryFeedback('interesting'));
             document.getElementById('summaryNotInterestingButton')?.addEventListener('click', () => handleSummaryFeedback('not_interesting'));
+        }
+
+        async function handleSummaryShare() {
+            const item = state.summaries[state.summaryIndex];
+            if (!item) return;
+
+            try {
+                await copyTextToClipboard(buildShareText(item));
+                showToast('Summary in die Zwischenablage kopiert.', 'info');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
         }
 
         async function handleSummaryFeedback(feedback) {
@@ -1363,8 +1433,10 @@
 
         function bindNav() {
             document.querySelectorAll('.nav-button').forEach(button => {
+                if (!button.dataset.screen) return;
                 button.addEventListener('click', () => switchScreen(button.dataset.screen));
             });
+            document.getElementById('pageReloadButton')?.addEventListener('click', () => window.location.reload());
             document.addEventListener('keydown', handleKeyboard);
         }
 

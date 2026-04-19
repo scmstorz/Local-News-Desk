@@ -918,6 +918,9 @@ def get_loaded_model(target: str) -> Optional[dict[str, Any]]:
 
 
 def predict_feed_rows(rows: list[sqlite3.Row]) -> tuple[list[dict[str, Any]], Optional[int]]:
+    if not rows:
+        return [], None
+
     artifact = get_loaded_model("feed_recommendation")
     if not artifact:
         items = []
