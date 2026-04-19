@@ -4,7 +4,7 @@ __pycache__/
 *.pyo
 *.pyd
 .DS_Store
-local-news.db
+local-news.db*
 models/
 /claude-news-app.html
 /google-cloud-function.py
