@@ -125,6 +125,7 @@ Verhalten:
 - zusätzliche Compare-Modelle laufen danach sequenziell
 - Compare-Fehler dürfen die produktive Summary nicht beschädigen
 - Ergebnisse werden sowohl in SQLite als auch in einer Exportdatei pro Compare-Session abgelegt
+- der laufende Compare-Fortschritt wird separat in `app_state` gehalten und in der UI sichtbar gemacht
 
 Gründe:
 

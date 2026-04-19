@@ -883,6 +883,10 @@ def current_compare_session() -> Optional[dict[str, Any]]:
     return row_to_dict(row) if row else None
 
 
+def clear_compare_progress() -> None:
+    update_app_state("llm_compare_progress", None)
+
+
 def append_compare_session_header(export_path: Path, enabled_at: str, models: list[str]) -> None:
     header = [
         "# LLM Compare Session",
@@ -930,6 +934,7 @@ def set_compare_enabled(enabled: bool) -> dict[str, Any]:
 
         update_app_state("llm_compare_enabled", True)
         update_app_state("llm_compare_session_id", session_id)
+        clear_compare_progress()
         session = current_compare_session()
         return {"enabled": True, "session": session}
 
@@ -950,6 +955,7 @@ def set_compare_enabled(enabled: bool) -> dict[str, Any]:
 
     update_app_state("llm_compare_enabled", False)
     update_app_state("llm_compare_session_id", None)
+    clear_compare_progress()
     return {"enabled": False, "session": None}
 
 
@@ -1033,10 +1039,43 @@ def run_compare_summaries(
         existing_models = {row["model_name"] for row in existing_rows}
 
     summaries_to_export: list[dict[str, str]] = []
+    completed_models = len(existing_models)
+    total_models = len(models)
+    started_at = utc_now_iso()
+
+    update_app_state(
+        "llm_compare_progress",
+        {
+            "session_id": int(session["id"]),
+            "article_id": article_id,
+            "article_title": article.get("title", ""),
+            "completed_models": completed_models,
+            "total_models": total_models,
+            "current_model": None,
+            "status": "running",
+            "started_at": started_at,
+            "updated_at": utc_now_iso(),
+        },
+    )
 
     for model_name in models:
         if model_name in existing_models:
             continue
+
+        update_app_state(
+            "llm_compare_progress",
+            {
+                "session_id": int(session["id"]),
+                "article_id": article_id,
+                "article_title": article.get("title", ""),
+                "completed_models": completed_models,
+                "total_models": total_models,
+                "current_model": model_name,
+                "status": "running",
+                "started_at": started_at,
+                "updated_at": utc_now_iso(),
+            },
+        )
 
         if model_name == OLLAMA_MODEL:
             compare_title, compare_text = primary_title, primary_summary
@@ -1073,9 +1112,26 @@ def run_compare_summaries(
                 "summary_text": compare_text,
             }
         )
+        completed_models += 1
+        update_app_state(
+            "llm_compare_progress",
+            {
+                "session_id": int(session["id"]),
+                "article_id": article_id,
+                "article_title": article.get("title", ""),
+                "completed_models": completed_models,
+                "total_models": total_models,
+                "current_model": None,
+                "status": "running" if completed_models < total_models else "completed",
+                "started_at": started_at,
+                "updated_at": utc_now_iso(),
+            },
+        )
 
     if summaries_to_export:
         append_compare_export(session, article, final_url, summaries_to_export)
+
+    clear_compare_progress()
 
 
 def ollama_generate_summary(
@@ -1561,6 +1617,7 @@ def process_summary_job(job: dict[str, Any]) -> None:
         try:
             run_compare_summaries(job, article_text, final_url, summary_title, summary_text)
         except Exception as compare_exc:  # pragma: no cover - runtime defensive
+            clear_compare_progress()
             LOGGER.warning("LLM compare failed for article %s: %s", article_id, compare_exc)
             with db_connection() as conn:
                 log_event(
@@ -1955,10 +2012,54 @@ def summary_counts() -> dict[str, int]:
 
 def llm_compare_status() -> dict[str, Any]:
     session = current_compare_session()
+    progress = get_app_state("llm_compare_progress")
+    session_stats: Optional[dict[str, Any]] = None
+
+    if session:
+        models = json.loads(session["models_json"])
+        total_models = max(len(models), 1)
+        with db_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS result_count,
+                    COUNT(DISTINCT article_id) AS article_count
+                FROM llm_compare_results
+                WHERE session_id = ?
+                """,
+                (session["id"],),
+            ).fetchone()
+            completed_articles_row = conn.execute(
+                """
+                SELECT COUNT(*) AS completed_articles
+                FROM (
+                    SELECT article_id
+                    FROM llm_compare_results
+                    WHERE session_id = ?
+                    GROUP BY article_id
+                    HAVING COUNT(DISTINCT model_name) >= ?
+                )
+                """,
+                (session["id"], total_models),
+            ).fetchone()
+
+        result_count = int(rows["result_count"] if rows else 0)
+        article_count = int(rows["article_count"] if rows else 0)
+        completed_articles = int(completed_articles_row["completed_articles"] if completed_articles_row else 0)
+        session_stats = {
+            "article_count": article_count,
+            "completed_articles": completed_articles,
+            "articles_in_progress": 1 if progress and progress.get("session_id") == session["id"] else 0,
+            "result_count": result_count,
+            "total_models": total_models,
+        }
+
     return {
         "enabled": get_compare_enabled(),
         "models": get_compare_models(),
         "session": session,
+        "progress": progress,
+        "session_stats": session_stats,
     }
 
 

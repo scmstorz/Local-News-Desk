@@ -182,6 +182,18 @@
             font-weight: 600;
         }
 
+        .status-pill.compare-on {
+            background: rgba(15, 118, 110, 0.14);
+            color: var(--accent-strong);
+            border-color: rgba(15, 118, 110, 0.16);
+        }
+
+        .status-pill.compare-off {
+            background: rgba(249, 115, 22, 0.14);
+            color: #a04a12;
+            border-color: rgba(249, 115, 22, 0.16);
+        }
+
         .status-pill strong {
             color: var(--ink);
         }
@@ -561,6 +573,18 @@
             font-weight: 600;
         }
 
+        .data-pill.compare-on {
+            background: rgba(15, 118, 110, 0.14);
+            color: var(--accent-strong);
+            box-shadow: inset 0 0 0 1px rgba(15, 118, 110, 0.16);
+        }
+
+        .data-pill.compare-off {
+            background: rgba(249, 115, 22, 0.14);
+            color: #a04a12;
+            box-shadow: inset 0 0 0 1px rgba(249, 115, 22, 0.16);
+        }
+
         .matrix {
             width: 100%;
             border-collapse: collapse;
@@ -711,6 +735,7 @@
                     <div class="status-pill">Archiviert <strong id="feedArchivedCount">0</strong></div>
                     <div class="status-pill">Summary-Queue <strong id="summaryQueueCount">0</strong></div>
                     <div class="status-pill">Neue Summaries <strong id="summaryReadyCount">0</strong></div>
+                    <div class="status-pill compare-off" id="compareStatusPill">Compare <strong id="compareStatusValue">aus</strong></div>
                 </div>
             </div>
         </header>
@@ -809,6 +834,133 @@
             return lines.join('\n').trim();
         }
 
+        function buildCompareEvaluationPrompt() {
+            return `Du bekommst eine Markdown-Datei mit mehreren Artikel-Zusammenfassungen von verschiedenen LLMs. Die Datei ist in XML-artige Blöcke strukturiert.
+
+Deine Aufgabe ist es, die Qualität der Zusammenfassungen systematisch zu bewerten und die Modelle miteinander zu vergleichen.
+
+WICHTIG:
+- Beurteile nur auf Basis dessen, was in der Datei steht.
+- Erfinde keine zusätzlichen Fakten über die Artikel.
+- Beurteile nicht, welches Modell du "magst", sondern welche Zusammenfassung für einen informierten Nutzer am besten ist.
+- Wenn zwei Zusammenfassungen ähnlich gut sind, sage das explizit.
+- Wenn eine Zusammenfassung halluziniert, unklar, schwammig, redundant oder stilistisch unnötig aufgeblasen ist, benenne das klar.
+- Achte besonders auf Informationsdichte, Genauigkeit, Klarheit, Prägnanz und Nutzwert.
+- Eine gute Zusammenfassung soll schnell verständlich sein, die wichtigsten Punkte korrekt erfassen und ohne unnötige Füllsätze auskommen.
+
+Bewerte jede Modell-Zusammenfassung pro Artikel nach diesen Kriterien auf einer Skala von 1 bis 10:
+1. Genauigkeit / Plausibilität
+2. Vollständigkeit der zentralen Punkte
+3. Klarheit / Verständlichkeit
+4. Prägnanz / geringe Redundanz
+5. Nutzwert für einen informierten Leser
+
+Dann berechne pro Modell eine Gesamtbewertung pro Artikel als begründetes Urteil, nicht nur als Durchschnitt.
+
+Arbeite in genau dieser Struktur:
+
+# Artikelweise Bewertung
+
+Für jeden <article_compare>-Block:
+
+## Artikel: [Titel]
+URL: [URL]
+
+### Ranking
+1. [Modellname]
+2. [Modellname]
+3. [Modellname]
+...
+
+### Kurzurteile pro Modell
+- [Modellname]:
+  - Genauigkeit: X/10
+  - Vollständigkeit: X/10
+  - Klarheit: X/10
+  - Prägnanz: X/10
+  - Nutzwert: X/10
+  - Stärken: ...
+  - Schwächen: ...
+- [Modellname]:
+  ...
+
+### Sieger dieses Artikels
+- Bestes Modell: [Modellname]
+- Warum: [2-4 Sätze]
+- Falls knapp: [optional: welches Modell fast gleich gut war und warum]
+
+# Gesamtvergleich über alle Artikel
+
+## Gesamtranking der Modelle
+1. [Modellname]
+2. [Modellname]
+3. [Modellname]
+...
+
+## Aggregierte Einschätzung pro Modell
+- [Modellname]:
+  - Wiederkehrende Stärken: ...
+  - Wiederkehrende Schwächen: ...
+  - Besonders gut bei: ...
+  - Besonders schwach bei: ...
+- [Modellname]:
+  ...
+
+## Quantitative Zusammenfassung
+Erstelle eine Tabelle mit:
+- Modell
+- Anzahl Artikel auf Platz 1
+- Durchschnittliche Genauigkeit
+- Durchschnittliche Vollständigkeit
+- Durchschnittliche Klarheit
+- Durchschnittliche Prägnanz
+- Durchschnittlicher Nutzwert
+
+## Schlussfolgerung
+Beantworte abschließend klar:
+1. Welches Modell ist insgesamt am besten?
+2. Welches Modell ist am zuverlässigsten?
+3. Welches Modell ist am prägnantesten?
+4. Welches Modell wäre für den praktischen Alltagseinsatz als lokaler Summarizer am sinnvollsten?
+5. Gibt es auffällige Unterschiede je nach Artikeltyp?
+
+Hier ist die zu bewertende Datei:
+
+[PASTE DIE GESAMTE LLM-COMPARE-MARKDOWN-DATEI HIER EIN]`;
+        }
+
+        function compareProgressLabel(compare) {
+            if (!compare?.enabled) return 'aus';
+            const progress = compare.progress;
+            if (progress?.total_models) {
+                return `${progress.completed_models}/${progress.total_models}`;
+            }
+            const sessionStats = compare.session_stats;
+            if (sessionStats?.article_count) {
+                return `${sessionStats.completed_articles}/${sessionStats.article_count} Artikel`;
+            }
+            return 'an';
+        }
+
+        function compareProgressText(compare) {
+            if (!compare?.enabled) {
+                return 'LLM Compare ist gerade ausgeschaltet.';
+            }
+
+            const progress = compare.progress;
+            const sessionStats = compare.session_stats;
+            if (progress?.total_models) {
+                const currentModel = progress.current_model ? ` · gerade ${progress.current_model}` : '';
+                return `Aktueller Artikel: ${progress.completed_models}/${progress.total_models} Modelle fertig${currentModel}`;
+            }
+
+            if (sessionStats?.article_count) {
+                return `Session: ${sessionStats.completed_articles}/${sessionStats.article_count} Artikel komplett verglichen`;
+            }
+
+            return 'LLM Compare ist aktiv und wartet auf die nächste Summary.';
+        }
+
         async function copyTextToClipboard(text) {
             if (navigator.clipboard && window.isSecureContext) {
                 await navigator.clipboard.writeText(text);
@@ -856,7 +1008,8 @@
                 const readyCount = status.summaries.ready;
                 if (state.lastReadyCount && readyCount > state.lastReadyCount) {
                     const delta = readyCount - state.lastReadyCount;
-                    showToast(`${delta} neue Summary${delta > 1 ? 's' : ''} fertig`, 'info');
+                    const compareText = status.llm_compare?.enabled ? ` · ${compareProgressText(status.llm_compare)}` : '';
+                    showToast(`${delta} neue Summary${delta > 1 ? 's' : ''} fertig${compareText}`, 'info');
                 }
                 state.lastReadyCount = readyCount;
                 state.status = status;
@@ -881,6 +1034,11 @@
                 (state.status.summaries.queued ?? 0) + (state.status.summaries.processing ?? 0);
             document.getElementById('summaryReadyCount').textContent = state.status.summaries.ready ?? 0;
             document.getElementById('navSummaryCount').textContent = state.status.summaries.ready ? `(${state.status.summaries.ready})` : '';
+            const compare = state.status.llm_compare || { enabled: false };
+            const comparePill = document.getElementById('compareStatusPill');
+            comparePill.classList.toggle('compare-on', Boolean(compare.enabled));
+            comparePill.classList.toggle('compare-off', !compare.enabled);
+            document.getElementById('compareStatusValue').textContent = compareProgressLabel(compare);
             document.getElementById('ollamaStatus').textContent = ollama.reachable
                 ? (ollama.model_available ? 'bereit' : 'Modell fehlt')
                 : 'offline';
@@ -1126,6 +1284,8 @@
             const host = document.getElementById('screen-summaries');
             const item = state.summaries[state.summaryIndex];
             const counts = state.status?.summaries || { queued: 0, processing: 0, ready: state.summaries.length, failed: 0 };
+            const compare = state.status?.llm_compare || { enabled: false };
+            const compareText = compareProgressText(compare);
 
             if (!item) {
                 host.innerHTML = `
@@ -1141,7 +1301,7 @@
                         </div>
                         <div class="queue-banner">
                             <strong>${counts.ready} neue Summaries</strong>
-                            <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${counts.failed} fehlgeschlagen</span>
+                            <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${counts.failed} fehlgeschlagen${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
                         </div>
                         <div class="empty-state">
                             <h3>Gerade nichts zu reviewen</h3>
@@ -1166,7 +1326,7 @@
                     </div>
                     <div class="queue-banner">
                         <strong>${counts.ready} neue Summaries</strong>
-                        <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${counts.failed} fehlgeschlagen</span>
+                        <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${counts.failed} fehlgeschlagen${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
                     </div>
                     <div class="summary-card">
                         <div class="summary-meta">
@@ -1323,6 +1483,8 @@
             const summaryRun = state.modelOps?.targets?.summary_interest;
             const status = state.status;
             const compare = status?.llm_compare || { enabled: false, models: [], session: null };
+            const compareStats = compare.session_stats || {};
+            const compareProgress = compare.progress;
 
             host.innerHTML = `
                 <div class="panel">
@@ -1350,18 +1512,34 @@
                                     <span class="data-pill">Archiviert ${status?.feed?.archived ?? 0}</span>
                                     <span class="data-pill">Queue ${((status?.summaries?.queued ?? 0) + (status?.summaries?.processing ?? 0))}</span>
                                     <span class="data-pill">Ready ${status?.summaries?.ready ?? 0}</span>
-                                    <span class="data-pill">LLM Compare ${compare.enabled ? 'an' : 'aus'}</span>
+                                    <span class="data-pill ${compare.enabled ? 'compare-on' : 'compare-off'}">LLM Compare ${compare.enabled ? 'an' : 'aus'}</span>
                                 </div>
                                 <div class="ops-assessment">
-                                    <strong>${compare.enabled ? 'LLM Compare aktiv' : 'LLM Compare aus'}</strong>
+                                    <strong style="color: ${compare.enabled ? 'var(--accent-strong)' : '#a04a12'};">${compare.enabled ? 'LLM Compare aktiv' : 'LLM Compare aus'}</strong>
                                     <p>
                                         Modelle: ${escapeHtml((compare.models || []).join(', ') || '—')}
                                         ${compare.session?.export_path ? `<br>Export: ${escapeHtml(basename(compare.session.export_path))}` : ''}
+                                        ${compare.enabled ? `<br>${escapeHtml(compareProgressText(compare))}` : ''}
+                                        ${compareStats.article_count ? `<br>Session: ${compareStats.completed_articles}/${compareStats.article_count} Artikel komplett · ${compareStats.result_count} Modellläufe gespeichert` : ''}
+                                        ${compareProgress?.current_model ? `<br>Aktuell läuft: ${escapeHtml(compareProgress.current_model)}` : ''}
                                     </p>
                                 </div>
                                 <div class="ops-actions">
                                     <button class="inline-button" id="compareToggleButton">${compare.enabled ? 'LLM Compare ausschalten' : 'LLM Compare einschalten'}</button>
                                 </div>
+                                <details style="margin-top: 14px;">
+                                    <summary style="cursor: pointer; color: var(--accent); font-size: 0.92rem;">Eval-Prompt anzeigen</summary>
+                                    <div style="margin-top: 12px;">
+                                        <textarea
+                                            id="comparePromptText"
+                                            readonly
+                                            style="width: 100%; min-height: 320px; resize: vertical; border-radius: 16px; border: 1px solid rgba(31, 43, 68, 0.12); background: rgba(255,255,255,0.9); color: var(--ink); padding: 14px 16px; font: 0.83rem/1.45 'SF Mono', 'Menlo', monospace;"
+                                        ></textarea>
+                                        <div class="ops-actions" style="margin-top: 10px;">
+                                            <button class="inline-button" id="copyComparePromptButton">Prompt kopieren</button>
+                                        </div>
+                                    </div>
+                                </details>
                             </div>
                             <div class="ops-card">
                                 <h3>Letzter Feed-Refresh</h3>
@@ -1387,6 +1565,18 @@
             });
             document.getElementById('trainAllButton')?.addEventListener('click', () => handleTraining('all'));
             document.getElementById('compareToggleButton')?.addEventListener('click', handleCompareToggle);
+            const comparePromptText = document.getElementById('comparePromptText');
+            if (comparePromptText) {
+                comparePromptText.value = buildCompareEvaluationPrompt();
+            }
+            document.getElementById('copyComparePromptButton')?.addEventListener('click', async () => {
+                try {
+                    await copyTextToClipboard(buildCompareEvaluationPrompt());
+                    showToast('Compare-Prompt in die Zwischenablage kopiert.', 'info');
+                } catch (error) {
+                    showToast(error.message, 'error');
+                }
+            });
             document.querySelectorAll('[data-train-target]').forEach(button => {
                 button.addEventListener('click', () => handleTraining(button.dataset.trainTarget));
             });

@@ -103,6 +103,7 @@ Wenn `LLM Compare` in `Model Ops` eingeschaltet wird:
 - bleibt die produktive Summary weiter beim primären Ollama-Modell
 - laufen zusätzlich alle in `local_config.json` konfigurierten Compare-Modelle sequenziell
 - wird pro aktivierter Session genau eine Exportdatei in `compare_exports/` aufgebaut
+- zeigt die UI zusätzlich laufenden Compare-Fortschritt im Header, in der Summary-Queue und in `Model Ops`
 
 Die Datei ist bewusst frontier-modell-freundlich formatiert:
 
