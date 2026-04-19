@@ -44,6 +44,7 @@ Dort werden unter anderem gepflegt:
 - Google-News-RSS-Feeds
 - Ollama-Base-URL
 - Ollama-Modell
+- optionale `LLM Compare`-Modelle
 - Polling-Intervalle
 - Server-Port
 
@@ -93,3 +94,20 @@ LOCAL_NEWS_REFRESH_SECONDS=300
 - Summary-Feedback wird bereits gespeichert, damit spätere Modelliteration darauf aufbauen kann.
 - `trafilatura` ist optional. Wenn es lokal nicht sauber importierbar ist, fällt die Textextraktion automatisch auf `BeautifulSoup` zurück.
 - `Inbox-Reset` archiviert alle aktuell offenen Feed-Einträge, ohne sie aus der Datenbank zu löschen.
+- `LLM Compare` erzeugt pro aktivierter Session eine eigene Markdown-Datei in `compare_exports/`.
+
+## LLM Compare
+
+Wenn `LLM Compare` in `Model Ops` eingeschaltet wird:
+
+- bleibt die produktive Summary weiter beim primären Ollama-Modell
+- laufen zusätzlich alle in `local_config.json` konfigurierten Compare-Modelle sequenziell
+- wird pro aktivierter Session genau eine Exportdatei in `compare_exports/` aufgebaut
+
+Die Datei ist bewusst frontier-modell-freundlich formatiert:
+
+- ein Session-Block mit Modellliste
+- danach pro Artikel ein XML-artiger Block
+- darin URL, Titel, Quelle und die Summary jedes beteiligten Modells
+
+Der Compare-Modus ist absichtlich optional, weil er die Summary-Laufzeit deutlich erhöht.

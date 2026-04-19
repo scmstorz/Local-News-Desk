@@ -11,6 +11,16 @@
     "base_url": "http://127.0.0.1:11434",
     "model": "qwen3.5:35b"
   },
+  "llm_compare": {
+    "enabled": false,
+    "export_dir": "compare_exports",
+    "models": [
+      "qwen3.5:35b",
+      "gemma4:31b",
+      "gpt-oss:20b",
+      "nemotron-3-nano:30b"
+    ]
+  },
   "timing": {
     "feed_refresh_seconds": 300,
     "summary_poll_seconds": 3,

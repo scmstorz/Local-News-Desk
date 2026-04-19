@@ -74,6 +74,16 @@ DEFAULT_SETTINGS = {
         "base_url": "http://127.0.0.1:11434",
         "model": "qwen3.5:35b",
     },
+    "llm_compare": {
+        "enabled": False,
+        "export_dir": "compare_exports",
+        "models": [
+            "qwen3.5:35b",
+            "gemma4:31b",
+            "gpt-oss:20b",
+            "nemotron-3-nano:30b",
+        ],
+    },
     "timing": {
         "feed_refresh_seconds": 300,
         "summary_poll_seconds": 3,
@@ -117,6 +127,7 @@ def resolve_local_path(value: str) -> Path:
 SETTINGS = load_settings()
 DB_PATH = resolve_local_path(os.environ.get("LOCAL_NEWS_DB_PATH", SETTINGS["storage"]["db_path"]))
 MODEL_DIR = resolve_local_path(os.environ.get("LOCAL_NEWS_MODEL_DIR", SETTINGS["storage"]["model_dir"]))
+COMPARE_EXPORT_DIR = resolve_local_path(SETTINGS["llm_compare"]["export_dir"])
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", SETTINGS["ollama"]["base_url"]).rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", SETTINGS["ollama"]["model"])
 HOST = os.environ.get("LOCAL_NEWS_HOST", SETTINGS["server"]["host"])
@@ -131,6 +142,7 @@ REQUEST_TIMEOUT_SECONDS = int(
     os.environ.get("LOCAL_NEWS_REQUEST_TIMEOUT_SECONDS", str(SETTINGS["timing"]["request_timeout_seconds"]))
 )
 RSS_FEED_URLS = list(SETTINGS["feeds"])
+COMPARE_MODELS = list(SETTINGS["llm_compare"]["models"])
 
 LOGGER = logging.getLogger("local_news_backend")
 logging.basicConfig(
@@ -200,6 +212,29 @@ CREATE TABLE IF NOT EXISTS model_runs (
     status TEXT NOT NULL DEFAULT 'trained'
 );
 
+CREATE TABLE IF NOT EXISTS llm_compare_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    enabled_at TEXT NOT NULL,
+    disabled_at TEXT,
+    export_path TEXT NOT NULL,
+    primary_model TEXT NOT NULL,
+    models_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE IF NOT EXISTS llm_compare_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    article_id INTEGER NOT NULL,
+    model_name TEXT NOT NULL,
+    summary_title TEXT NOT NULL,
+    summary_text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES llm_compare_sessions(id) ON DELETE CASCADE,
+    FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE,
+    UNIQUE(session_id, article_id, model_name)
+);
+
 CREATE TABLE IF NOT EXISTS app_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -214,6 +249,10 @@ CREATE INDEX IF NOT EXISTS idx_events_article_time
     ON article_events(article_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_model_runs_target_time
     ON model_runs(target, trained_at DESC);
+CREATE INDEX IF NOT EXISTS idx_compare_sessions_status
+    ON llm_compare_sessions(status, enabled_at DESC);
+CREATE INDEX IF NOT EXISTS idx_compare_results_article
+    ON llm_compare_results(session_id, article_id);
 """
 
 TARGET_CONFIG = {
@@ -270,6 +309,7 @@ def utc_now_iso() -> str:
 def ensure_dirs() -> None:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    COMPARE_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @contextmanager
@@ -811,7 +851,238 @@ def parse_summary_response(text: str) -> tuple[str, str]:
     return title, summary
 
 
-def ollama_generate_summary(article_title: str, article_text: str) -> tuple[str, str]:
+def get_compare_enabled() -> bool:
+    stored = get_app_state("llm_compare_enabled", None)
+    if stored is None:
+        return bool(SETTINGS["llm_compare"]["enabled"])
+    return bool(stored)
+
+
+def get_compare_models() -> list[str]:
+    models: list[str] = []
+    for model in [OLLAMA_MODEL, *COMPARE_MODELS]:
+        if model not in models:
+            models.append(model)
+    return models
+
+
+def current_compare_session() -> Optional[dict[str, Any]]:
+    session_id = get_app_state("llm_compare_session_id", None)
+    if not session_id:
+        return None
+    with db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM llm_compare_sessions
+            WHERE id = ? AND status = 'active'
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def append_compare_session_header(export_path: Path, enabled_at: str, models: list[str]) -> None:
+    header = [
+        "# LLM Compare Session",
+        "",
+        f'<compare_session enabled_at="{html_lib.escape(enabled_at)}" primary_model="{html_lib.escape(OLLAMA_MODEL)}">',
+        "<models>",
+    ]
+    for model in models:
+        header.append(f"  <model>{html_lib.escape(model)}</model>")
+    header.extend(["</models>", ""])
+    export_path.write_text("\n".join(header), encoding="utf-8")
+
+
+def set_compare_enabled(enabled: bool) -> dict[str, Any]:
+    existing_session = current_compare_session()
+    now = utc_now_iso()
+
+    if enabled:
+        if existing_session:
+            update_app_state("llm_compare_enabled", True)
+            return {
+                "enabled": True,
+                "session": existing_session,
+            }
+
+        models = get_compare_models()
+        export_name = f"llm_compare_{utc_now().strftime('%Y%m%d_%H%M%S')}.md"
+        export_path = COMPARE_EXPORT_DIR / export_name
+        append_compare_session_header(export_path, now, models)
+
+        with db_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO llm_compare_sessions(enabled_at, export_path, primary_model, models_json, status)
+                VALUES (?, ?, ?, ?, 'active')
+                """,
+                (
+                    now,
+                    str(export_path),
+                    OLLAMA_MODEL,
+                    json.dumps(models),
+                ),
+            )
+            session_id = int(cursor.lastrowid)
+
+        update_app_state("llm_compare_enabled", True)
+        update_app_state("llm_compare_session_id", session_id)
+        session = current_compare_session()
+        return {"enabled": True, "session": session}
+
+    if existing_session:
+        export_path = Path(existing_session["export_path"])
+        if export_path.exists():
+            with open(export_path, "a", encoding="utf-8") as handle:
+                handle.write(f"\n</compare_session>\n")
+        with db_connection() as conn:
+            conn.execute(
+                """
+                UPDATE llm_compare_sessions
+                SET disabled_at = ?, status = 'closed'
+                WHERE id = ?
+                """,
+                (now, existing_session["id"]),
+            )
+
+    update_app_state("llm_compare_enabled", False)
+    update_app_state("llm_compare_session_id", None)
+    return {"enabled": False, "session": None}
+
+
+def bootstrap_compare_mode() -> None:
+    session = current_compare_session()
+    if get_compare_enabled() and session is None:
+        set_compare_enabled(True)
+
+
+def append_compare_export(
+    session: dict[str, Any],
+    article: dict[str, Any],
+    final_url: str,
+    summaries: list[dict[str, str]],
+) -> None:
+    export_path = Path(session["export_path"])
+    lines = [
+        f'<article_compare article_id="{article["id"]}" created_at="{html_lib.escape(utc_now_iso())}">',
+        f"  <article_title>{html_lib.escape(article.get('title', ''))}</article_title>",
+        f"  <source>{html_lib.escape(article.get('source_label', ''))}</source>",
+        f"  <url>{html_lib.escape(final_url)}</url>",
+    ]
+    for summary in summaries:
+        lines.extend(
+            [
+                f'  <model_summary model="{html_lib.escape(summary["model_name"])}">',
+                f"    <summary_title>{html_lib.escape(summary['summary_title'])}</summary_title>",
+                f"    <summary_text>{html_lib.escape(summary['summary_text'])}</summary_text>",
+                "  </model_summary>",
+            ]
+        )
+    lines.extend(["</article_compare>", ""])
+    with open(export_path, "a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+
+
+def store_compare_result(
+    conn: sqlite3.Connection,
+    session_id: int,
+    article_id: int,
+    model_name: str,
+    summary_title: str,
+    summary_text: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO llm_compare_results(
+            session_id, article_id, model_name, summary_title, summary_text, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (session_id, article_id, model_name, summary_title, summary_text, utc_now_iso()),
+    )
+
+
+def run_compare_summaries(
+    article: dict[str, Any],
+    article_text: str,
+    final_url: str,
+    primary_title: str,
+    primary_summary: str,
+) -> None:
+    if not get_compare_enabled():
+        return
+
+    session = current_compare_session()
+    if not session:
+        return
+
+    models = json.loads(session["models_json"])
+    article_id = int(article["id"])
+    with db_connection() as conn:
+        existing_rows = conn.execute(
+            """
+            SELECT model_name
+            FROM llm_compare_results
+            WHERE session_id = ? AND article_id = ?
+            """,
+            (session["id"], article_id),
+        ).fetchall()
+        existing_models = {row["model_name"] for row in existing_rows}
+
+    summaries_to_export: list[dict[str, str]] = []
+
+    for model_name in models:
+        if model_name in existing_models:
+            continue
+
+        if model_name == OLLAMA_MODEL:
+            compare_title, compare_text = primary_title, primary_summary
+        else:
+            compare_title, compare_text = ollama_generate_summary(
+                article["title"],
+                article_text,
+                model_name=model_name,
+            )
+
+        with db_connection() as conn:
+            store_compare_result(
+                conn,
+                int(session["id"]),
+                article_id,
+                model_name,
+                compare_title,
+                compare_text,
+            )
+            log_event(
+                conn,
+                article_id,
+                "llm_compare_summary_generated",
+                {
+                    "session_id": session["id"],
+                    "model_name": model_name,
+                },
+            )
+
+        summaries_to_export.append(
+            {
+                "model_name": model_name,
+                "summary_title": compare_title,
+                "summary_text": compare_text,
+            }
+        )
+
+    if summaries_to_export:
+        append_compare_export(session, article, final_url, summaries_to_export)
+
+
+def ollama_generate_summary(
+    article_title: str,
+    article_text: str,
+    model_name: Optional[str] = None,
+) -> tuple[str, str]:
     prompt = f"""
 Du bist ein präziser Nachrichtenassistent.
 Erzeuge einen deutschen Titel und eine deutsche Zusammenfassung.
@@ -841,7 +1112,7 @@ ARTIKELTEXT:
         f"{OLLAMA_BASE_URL}/api/generate",
         timeout=180,
         json={
-            "model": OLLAMA_MODEL,
+            "model": model_name or OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
             "options": {
@@ -1286,6 +1557,18 @@ def process_summary_job(job: dict[str, Any]) -> None:
                 "summary_generated",
                 {"model": OLLAMA_MODEL, "final_url": final_url},
             )
+
+        try:
+            run_compare_summaries(job, article_text, final_url, summary_title, summary_text)
+        except Exception as compare_exc:  # pragma: no cover - runtime defensive
+            LOGGER.warning("LLM compare failed for article %s: %s", article_id, compare_exc)
+            with db_connection() as conn:
+                log_event(
+                    conn,
+                    article_id,
+                    "llm_compare_failed",
+                    {"error": str(compare_exc)},
+                )
     except Exception as exc:  # pragma: no cover - runtime defensive
         LOGGER.warning("Summary job failed for article %s: %s", article_id, exc)
         with db_connection() as conn:
@@ -1670,6 +1953,15 @@ def summary_counts() -> dict[str, int]:
     }
 
 
+def llm_compare_status() -> dict[str, Any]:
+    session = current_compare_session()
+    return {
+        "enabled": get_compare_enabled(),
+        "models": get_compare_models(),
+        "session": session,
+    }
+
+
 def feed_counts() -> dict[str, int]:
     all_pending_rows = fetch_pending_feed_articles()
     predicted_rows, _ = predict_feed_rows(all_pending_rows)
@@ -1748,6 +2040,7 @@ def api_status():
                     "latest_run": latest_summary_run,
                 },
             },
+            "llm_compare": llm_compare_status(),
             "ollama": ollama_health(),
             "last_feed_refresh": get_app_state("last_feed_refresh"),
             "config": {
@@ -1756,6 +2049,8 @@ def api_status():
                 "ollama_base_url": OLLAMA_BASE_URL,
                 "feed_refresh_seconds": FEED_REFRESH_SECONDS,
                 "feed_count": len(RSS_FEED_URLS),
+                "llm_compare_models": get_compare_models(),
+                "llm_compare_export_dir": str(COMPARE_EXPORT_DIR),
             },
         }
     )
@@ -1764,6 +2059,13 @@ def api_status():
 @APP.post("/api/feeds/refresh")
 def api_refresh_feeds():
     return jsonify(refresh_feeds())
+
+
+@APP.post("/api/llm-compare")
+def api_llm_compare_toggle():
+    body = request.get_json(silent=True) or {}
+    enabled = bool(body.get("enabled", False))
+    return jsonify(set_compare_enabled(enabled))
 
 
 @APP.post("/api/feed/reset")
@@ -1901,6 +2203,7 @@ def shutdown() -> None:
 def main() -> None:
     init_db()
     load_persisted_models()
+    bootstrap_compare_mode()
     start_background_threads()
     LOGGER.info("Starting local news backend on http://%s:%s", HOST, PORT)
     try:

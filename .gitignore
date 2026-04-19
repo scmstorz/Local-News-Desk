@@ -6,6 +6,7 @@ __pycache__/
 .DS_Store
 local-news.db*
 models/
+compare_exports/
 /claude-news-app.html
 /google-cloud-function.py
 /CLAUDE.md

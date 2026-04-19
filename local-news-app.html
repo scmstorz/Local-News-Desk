@@ -792,6 +792,12 @@
             return `${Math.round(probability * 100)}%`;
         }
 
+        function basename(path) {
+            if (!path) return '—';
+            const parts = String(path).split(/[\\/]/);
+            return parts[parts.length - 1] || path;
+        }
+
         function buildShareText(item) {
             const lines = [
                 item.summary_title || item.title || '',
@@ -1316,6 +1322,7 @@
             const feedRun = state.modelOps?.targets?.feed_recommendation;
             const summaryRun = state.modelOps?.targets?.summary_interest;
             const status = state.status;
+            const compare = status?.llm_compare || { enabled: false, models: [], session: null };
 
             host.innerHTML = `
                 <div class="panel">
@@ -1343,6 +1350,17 @@
                                     <span class="data-pill">Archiviert ${status?.feed?.archived ?? 0}</span>
                                     <span class="data-pill">Queue ${((status?.summaries?.queued ?? 0) + (status?.summaries?.processing ?? 0))}</span>
                                     <span class="data-pill">Ready ${status?.summaries?.ready ?? 0}</span>
+                                    <span class="data-pill">LLM Compare ${compare.enabled ? 'an' : 'aus'}</span>
+                                </div>
+                                <div class="ops-assessment">
+                                    <strong>${compare.enabled ? 'LLM Compare aktiv' : 'LLM Compare aus'}</strong>
+                                    <p>
+                                        Modelle: ${escapeHtml((compare.models || []).join(', ') || '—')}
+                                        ${compare.session?.export_path ? `<br>Export: ${escapeHtml(basename(compare.session.export_path))}` : ''}
+                                    </p>
+                                </div>
+                                <div class="ops-actions">
+                                    <button class="inline-button" id="compareToggleButton">${compare.enabled ? 'LLM Compare ausschalten' : 'LLM Compare einschalten'}</button>
                                 </div>
                             </div>
                             <div class="ops-card">
@@ -1368,9 +1386,30 @@
                 await loadModelOps();
             });
             document.getElementById('trainAllButton')?.addEventListener('click', () => handleTraining('all'));
+            document.getElementById('compareToggleButton')?.addEventListener('click', handleCompareToggle);
             document.querySelectorAll('[data-train-target]').forEach(button => {
                 button.addEventListener('click', () => handleTraining(button.dataset.trainTarget));
             });
+        }
+
+        async function handleCompareToggle() {
+            const enabled = !(state.status?.llm_compare?.enabled);
+            try {
+                const result = await api('/llm-compare', {
+                    method: 'POST',
+                    body: JSON.stringify({ enabled }),
+                });
+                showToast(
+                    enabled
+                        ? `LLM Compare aktiv. Export: ${basename(result.session?.export_path)}`
+                        : 'LLM Compare ausgeschaltet.',
+                    'info'
+                );
+                await loadStatus();
+                await loadModelOps();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
         }
 
         async function handleTraining(target) {

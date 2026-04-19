@@ -35,6 +35,14 @@ Die bestehende `claude-news-app.html` bleibt unverändert als Referenz erhalten.
   - `Interessant`
   - `Doch nicht interessant`
 
+### LLM Compare
+
+- optional schaltbarer Modus in `Model Ops`
+- wenn aktiv, erzeugt jeder neue Summary-Run zusätzlich Zusammenfassungen mehrerer lokal konfigurierbarer Modelle
+- die normale App zeigt weiterhin nur die Summary des primären Standardmodells
+- zusätzlich entsteht pro aktivierter Compare-Session eine eigene lokale Markdown-Datei
+- diese Datei enthält pro Artikel URL, Metadaten und alle Modell-Summaries in XML-artig getrennten Blöcken
+
 ### Model Ops
 
 - nüchterne Metrikansicht
@@ -107,7 +115,24 @@ Gründe:
 - UI blockiert nicht
 - Queue ist sichtbar und nachvollziehbar
 
-### 5. Zwei Lernstufen statt eines unscharfen Gesamtsignals
+### 5. Optionaler Mehrmodell-Vergleich
+
+`LLM Compare` hängt sich an den normalen Summary-Worker an.
+
+Verhalten:
+
+- Primärmodell erzeugt die produktive Summary
+- zusätzliche Compare-Modelle laufen danach sequenziell
+- Compare-Fehler dürfen die produktive Summary nicht beschädigen
+- Ergebnisse werden sowohl in SQLite als auch in einer Exportdatei pro Compare-Session abgelegt
+
+Gründe:
+
+- Modellvergleich ohne Eingriff in den normalen Lesefluss
+- spätere qualitative Bewertung durch ein Frontier-Modell
+- reproduzierbare lokale Benchmark-Sessions
+
+### 6. Zwei Lernstufen statt eines unscharfen Gesamtsignals
 
 #### Stufe 1: Feed Recommendation
 
@@ -141,7 +166,7 @@ Gründe:
 - sauberere Trainingsdaten
 - später unterschiedliche Modelle oder Schwellen möglich
 
-### 6. Inbox-Reset statt Löschen
+### 7. Inbox-Reset statt Löschen
 
 Offene Feed-Einträge werden bei Bedarf nicht gelöscht, sondern archiviert.
 
@@ -151,7 +176,7 @@ Gründe:
 - Trainings- und Historiedaten bleiben vollständig erhalten
 - Feed-Cutoff ist operativ nützlich, ohne Informationsverlust zu erzeugen
 
-### 7. Model-Ops mit operativer Einschätzung
+### 8. Model-Ops mit operativer Einschätzung
 
 Die Kennzahlen werden nicht nur roh angezeigt, sondern in eine kurze operative Einschätzung übersetzt.
 
@@ -189,6 +214,7 @@ Dort liegen die produktnahen Einstellungen:
 - RSS-Feed-Liste
 - Ollama-Modell
 - Ollama-Base-URL
+- Compare-Modelle und Exportpfad
 - Polling-Intervalle
 - Server- und Speicherpfade
 
@@ -375,6 +401,68 @@ Enthält:
 Grund:
 
 Model-Ops muss nachvollziehbar und historisierbar bleiben.
+
+### Tabelle `llm_compare_sessions`
+
+Enthält:
+
+- Aktivierungszeitpunkt
+- Deaktivierungszeitpunkt
+- Exportpfad
+- Primärmodell
+- Compare-Modellliste
+
+Grund:
+
+Der Mehrmodell-Vergleich soll als klar abgegrenzte Session nachvollziehbar bleiben.
+
+### Tabelle `llm_compare_results`
+
+Enthält:
+
+- Session
+- Artikel
+- Modellname
+- Summary-Titel
+- Summary-Text
+
+Grund:
+
+Die Compare-Ergebnisse sollen lokal analysierbar bleiben, auch wenn die Markdown-Datei später extern ausgewertet wird.
+
+### Exportformat von `LLM Compare`
+
+Jede aktivierte Compare-Phase erzeugt genau eine Datei in `compare_exports/`.
+
+Die Struktur ist bewusst simpel und paste-freundlich:
+
+```xml
+<compare_session enabled_at="..." primary_model="qwen3.5:35b">
+<models>
+  <model>qwen3.5:35b</model>
+  <model>gemma4:31b</model>
+  <model>gpt-oss:20b</model>
+  <model>nemotron-3-nano:30b</model>
+</models>
+
+<article_compare article_id="...">
+  <article_title>...</article_title>
+  <source>...</source>
+  <url>...</url>
+  <model_summary model="qwen3.5:35b">
+    <summary_title>...</summary_title>
+    <summary_text>...</summary_text>
+  </model_summary>
+  ...
+</article_compare>
+</compare_session>
+```
+
+Grund:
+
+- online Frontier-Modelle sollen die Datei direkt vergleichen können
+- die Datei soll auch ohne zusätzliches Tooling lesbar bleiben
+- Session- und Artikelgrenzen müssen klar markiert sein
 
 ## Legacy-Import
 
