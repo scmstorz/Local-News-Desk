@@ -1,0 +1,1372 @@
+<!-- VERSION local-v1 - Local desktop UI for SQLite + Ollama backend -->
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local News Desk</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'><rect width='128' height='128' rx='24' fill='%230f172a'/><path d='M28 30h72v12H28zm0 24h72v12H28zm0 24h50v12H28z' fill='%23f8fafc'/><circle cx='92' cy='84' r='12' fill='%23f97316'/></svg>">
+    <style>
+        :root {
+            --bg: #f1ede2;
+            --bg-strong: #e5dcc9;
+            --panel: rgba(251, 249, 244, 0.92);
+            --panel-strong: #fffdf8;
+            --line: rgba(43, 37, 33, 0.1);
+            --ink: #181512;
+            --ink-soft: #5d544c;
+            --ink-muted: #877e77;
+            --accent: #0f766e;
+            --accent-strong: #115e59;
+            --accent-warm: #f97316;
+            --danger: #a53030;
+            --danger-soft: #fbe7e3;
+            --success-soft: #def7ec;
+            --shadow: 0 24px 60px rgba(34, 27, 22, 0.12);
+            --radius-xl: 28px;
+            --radius-lg: 20px;
+            --radius-md: 14px;
+            --ui-font: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+            --serif-font: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            min-height: 100vh;
+            font-family: var(--ui-font);
+            color: var(--ink);
+            background:
+                radial-gradient(circle at top left, rgba(249, 115, 22, 0.18), transparent 32%),
+                radial-gradient(circle at top right, rgba(15, 118, 110, 0.14), transparent 26%),
+                linear-gradient(180deg, #f7f2e8 0%, #efe7d6 100%);
+            padding: 28px;
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image:
+                linear-gradient(rgba(24, 21, 18, 0.025) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(24, 21, 18, 0.025) 1px, transparent 1px);
+            background-size: 24px 24px;
+            mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.55), transparent 95%);
+        }
+
+        .app-shell {
+            position: relative;
+            max-width: 1320px;
+            margin: 0 auto;
+            background: linear-gradient(180deg, rgba(255,255,255,0.75), rgba(250,247,241,0.92));
+            border: 1px solid rgba(255,255,255,0.6);
+            box-shadow: var(--shadow);
+            border-radius: 34px;
+            overflow: hidden;
+            backdrop-filter: blur(18px);
+        }
+
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            gap: 18px;
+            padding: 28px 30px 20px;
+            border-bottom: 1px solid var(--line);
+            background:
+                linear-gradient(120deg, rgba(255,255,255,0.75), rgba(255,255,255,0.45)),
+                linear-gradient(120deg, rgba(15,118,110,0.06), rgba(249,115,22,0.08));
+        }
+
+        .brand {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .brand-mark {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 12px;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: var(--ink-muted);
+        }
+
+        .brand-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 999px;
+            background: linear-gradient(135deg, var(--accent), var(--accent-warm));
+            box-shadow: 0 0 0 8px rgba(15, 118, 110, 0.08);
+        }
+
+        .brand h1 {
+            font-family: var(--serif-font);
+            font-size: clamp(30px, 4vw, 46px);
+            font-weight: 600;
+            line-height: 1;
+        }
+
+        .brand p {
+            color: var(--ink-soft);
+            font-size: 15px;
+        }
+
+        .topbar-right {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 14px;
+            min-width: 460px;
+        }
+
+        .nav-row,
+        .status-row {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+
+        .nav-button,
+        .pill,
+        .inline-button,
+        .action-button {
+            border: 0;
+            border-radius: 999px;
+            font-family: inherit;
+            cursor: pointer;
+            transition: transform 0.16s ease, background 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
+        }
+
+        .nav-button {
+            padding: 12px 18px;
+            background: rgba(255,255,255,0.75);
+            color: var(--ink-soft);
+            font-size: 14px;
+            font-weight: 600;
+            border: 1px solid rgba(24, 21, 18, 0.08);
+        }
+
+        .nav-button.active {
+            background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+            color: #f8fafc;
+            box-shadow: 0 12px 30px rgba(15, 118, 110, 0.22);
+        }
+
+        .nav-button:hover,
+        .inline-button:hover,
+        .action-button:hover {
+            transform: translateY(-1px);
+        }
+
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 14px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.72);
+            color: var(--ink-soft);
+            border: 1px solid rgba(24,21,18,0.08);
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .status-pill strong {
+            color: var(--ink);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 999px;
+            background: var(--accent);
+        }
+
+        .status-dot.off {
+            background: var(--danger);
+        }
+
+        .main-layout {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 24px;
+            padding: 28px 30px 34px;
+        }
+
+        .screen {
+            display: none;
+            animation: fadeIn 220ms ease;
+        }
+
+        .screen.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(6px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .panel {
+            background: var(--panel);
+            border: 1px solid rgba(255,255,255,0.65);
+            border-radius: var(--radius-xl);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.45);
+        }
+
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            padding: 18px 22px;
+            border-bottom: 1px solid var(--line);
+        }
+
+        .panel-title {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .panel-title h2 {
+            font-size: 22px;
+            font-weight: 700;
+        }
+
+        .panel-title p {
+            color: var(--ink-soft);
+            font-size: 14px;
+        }
+
+        .toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .segmented {
+            display: inline-flex;
+            padding: 4px;
+            background: rgba(24,21,18,0.06);
+            border-radius: 999px;
+        }
+
+        .segment-button {
+            padding: 10px 14px;
+            border: 0;
+            border-radius: 999px;
+            background: transparent;
+            color: var(--ink-soft);
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .segment-button.active {
+            background: var(--panel-strong);
+            color: var(--ink);
+            box-shadow: 0 6px 16px rgba(24, 21, 18, 0.08);
+        }
+
+        .inline-button {
+            background: rgba(24,21,18,0.06);
+            color: var(--ink);
+            border: 1px solid rgba(24,21,18,0.08);
+            padding: 11px 16px;
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        .feed-card,
+        .summary-card {
+            padding: 30px;
+        }
+
+        .feed-meta,
+        .summary-meta {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 26px;
+        }
+
+        .meta-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 14px;
+            border-radius: 999px;
+            background: rgba(24,21,18,0.055);
+            color: var(--ink-soft);
+            font-size: 13px;
+            font-weight: 600;
+            text-decoration: none;
+        }
+
+        .feed-card h3,
+        .summary-card h3 {
+            font-family: var(--serif-font);
+            line-height: 1.04;
+            font-weight: 600;
+            margin-bottom: 22px;
+            max-width: 980px;
+            text-wrap: balance;
+        }
+
+        .feed-card h3 {
+            font-size: clamp(28px, 3.2vw, 40px);
+            line-height: 1.08;
+            max-width: 920px;
+        }
+
+        .summary-card h3 {
+            font-size: clamp(36px, 5vw, 54px);
+        }
+
+        .prediction-strip {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            margin-bottom: 24px;
+            padding: 18px 20px;
+            border-radius: var(--radius-lg);
+            background: linear-gradient(135deg, rgba(15,118,110,0.09), rgba(255,255,255,0.8));
+            border: 1px solid rgba(15,118,110,0.12);
+        }
+
+        .prediction-main {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .prediction-label {
+            font-size: 12px;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--ink-muted);
+        }
+
+        .prediction-value {
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--ink);
+        }
+
+        .prediction-subtle {
+            font-size: 14px;
+            color: var(--ink-soft);
+        }
+
+        .prediction-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 14px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 700;
+            background: rgba(255,255,255,0.72);
+        }
+
+        .prediction-badge.good {
+            color: var(--accent-strong);
+            background: rgba(15,118,110,0.12);
+        }
+
+        .prediction-badge.bad {
+            color: var(--danger);
+            background: rgba(165,48,48,0.11);
+        }
+
+        .summary-text {
+            max-width: 860px;
+            color: #2e2822;
+            font-size: 20px;
+            line-height: 1.72;
+            white-space: pre-wrap;
+            margin-bottom: 30px;
+        }
+
+        .action-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 18px;
+            flex-wrap: wrap;
+            margin-top: 18px;
+        }
+
+        .action-group {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .action-button {
+            padding: 14px 18px;
+            font-size: 14px;
+            font-weight: 800;
+            letter-spacing: 0.01em;
+        }
+
+        .action-button.neutral {
+            background: rgba(24,21,18,0.06);
+            color: var(--ink);
+            border: 1px solid rgba(24,21,18,0.08);
+        }
+
+        .action-button.primary {
+            color: #f8fafc;
+            background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+            box-shadow: 0 12px 28px rgba(15,118,110,0.18);
+        }
+
+        .action-button.warm {
+            color: #fff9f5;
+            background: linear-gradient(135deg, #f97316, #ea580c);
+            box-shadow: 0 12px 28px rgba(249,115,22,0.2);
+        }
+
+        .action-button.danger {
+            color: #fff8f7;
+            background: linear-gradient(135deg, #c2410c, #9a3412);
+            box-shadow: 0 12px 28px rgba(154,52,18,0.18);
+        }
+
+        .action-note {
+            color: var(--ink-soft);
+            font-size: 14px;
+        }
+
+        .empty-state {
+            padding: 44px 30px;
+            text-align: center;
+        }
+
+        .empty-state h3 {
+            font-family: var(--serif-font);
+            font-size: 32px;
+            margin-bottom: 12px;
+        }
+
+        .empty-state p {
+            max-width: 620px;
+            margin: 0 auto;
+            color: var(--ink-soft);
+            line-height: 1.6;
+        }
+
+        .queue-banner {
+            margin: 0 30px 22px;
+            padding: 16px 18px;
+            border-radius: var(--radius-lg);
+            display: flex;
+            justify-content: space-between;
+            gap: 14px;
+            align-items: center;
+            flex-wrap: wrap;
+            background: linear-gradient(135deg, rgba(249,115,22,0.12), rgba(255,255,255,0.75));
+            border: 1px solid rgba(249,115,22,0.14);
+        }
+
+        .queue-banner strong {
+            font-size: 16px;
+        }
+
+        .ops-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 18px;
+        }
+
+        .ops-card {
+            padding: 22px;
+            border-radius: var(--radius-lg);
+            background: rgba(255,255,255,0.7);
+            border: 1px solid rgba(24,21,18,0.08);
+        }
+
+        .ops-card h3 {
+            font-size: 18px;
+            margin-bottom: 14px;
+        }
+
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+            margin: 16px 0 20px;
+        }
+
+        .metric {
+            padding: 14px;
+            border-radius: 16px;
+            background: rgba(24,21,18,0.045);
+        }
+
+        .metric-label {
+            font-size: 12px;
+            color: var(--ink-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: 7px;
+        }
+
+        .metric-value {
+            font-size: 24px;
+            font-weight: 800;
+            color: var(--ink);
+        }
+
+        .data-points {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 8px 0 18px;
+        }
+
+        .data-pill {
+            padding: 9px 12px;
+            border-radius: 999px;
+            background: rgba(24,21,18,0.05);
+            color: var(--ink-soft);
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .matrix {
+            width: 100%;
+            border-collapse: collapse;
+            border-radius: 16px;
+            overflow: hidden;
+            margin-bottom: 14px;
+        }
+
+        .matrix th,
+        .matrix td {
+            padding: 12px 14px;
+            text-align: center;
+            border: 1px solid rgba(24,21,18,0.08);
+        }
+
+        .matrix th {
+            background: rgba(24,21,18,0.06);
+            font-size: 12px;
+            color: var(--ink-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .ops-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+
+        .ops-assessment {
+            margin: 14px 0 18px;
+            padding: 14px 16px;
+            border-radius: 16px;
+            background: rgba(24,21,18,0.05);
+            border: 1px solid rgba(24,21,18,0.08);
+        }
+
+        .ops-assessment strong {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 15px;
+        }
+
+        .ops-assessment p {
+            color: var(--ink-soft);
+            font-size: 14px;
+            line-height: 1.55;
+        }
+
+        .toast-stack {
+            position: fixed;
+            top: 24px;
+            right: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            z-index: 9999;
+        }
+
+        .toast {
+            min-width: 280px;
+            max-width: 360px;
+            padding: 14px 16px;
+            border-radius: 18px;
+            color: #fffdf8;
+            box-shadow: 0 18px 44px rgba(24,21,18,0.18);
+            animation: toastIn 180ms ease;
+        }
+
+        .toast.info {
+            background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+        }
+
+        .toast.warn {
+            background: linear-gradient(135deg, #ea580c, #c2410c);
+        }
+
+        .toast.error {
+            background: linear-gradient(135deg, #b91c1c, #991b1b);
+        }
+
+        @keyframes toastIn {
+            from {
+                opacity: 0;
+                transform: translateY(-4px) scale(0.98);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+            }
+        }
+
+        @media (max-width: 980px) {
+            body {
+                padding: 12px;
+            }
+
+            .topbar {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .topbar-right {
+                min-width: 0;
+                align-items: flex-start;
+            }
+
+            .nav-row,
+            .status-row {
+                justify-content: flex-start;
+            }
+
+            .ops-grid,
+            .metric-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .feed-card h3,
+            .summary-card h3 {
+                font-size: 34px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-shell">
+        <header class="topbar">
+            <div class="brand">
+                <div class="brand-mark">
+                    <span class="brand-dot"></span>
+                    <span>Local News Desk</span>
+                </div>
+                <h1>Feed lesen. Lokal zusammenfassen. Modelle messen.</h1>
+                <p>Desktop-Workflow für Feed-Entscheidungen, lokale Summaries und nüchterne Model-Ops.</p>
+            </div>
+            <div class="topbar-right">
+                <div class="nav-row">
+                    <button class="nav-button active" data-screen="feed">Feed</button>
+                    <button class="nav-button" data-screen="summaries">Summaries <span id="navSummaryCount"></span></button>
+                    <button class="nav-button" data-screen="ops">Model Ops</button>
+                </div>
+                <div class="status-row">
+                    <div class="status-pill"><span class="status-dot" id="ollamaDot"></span> Ollama <strong id="ollamaStatus">prüfe…</strong></div>
+                    <div class="status-pill">Feed <strong id="feedPendingCount">0</strong></div>
+                    <div class="status-pill">Empfohlen <strong id="feedRecommendedCount">0</strong></div>
+                    <div class="status-pill">Archiviert <strong id="feedArchivedCount">0</strong></div>
+                    <div class="status-pill">Summary-Queue <strong id="summaryQueueCount">0</strong></div>
+                    <div class="status-pill">Neue Summaries <strong id="summaryReadyCount">0</strong></div>
+                </div>
+            </div>
+        </header>
+
+        <main class="main-layout">
+            <section class="screen active" id="screen-feed"></section>
+            <section class="screen" id="screen-summaries"></section>
+            <section class="screen" id="screen-ops"></section>
+        </main>
+    </div>
+
+    <div class="toast-stack" id="toastStack"></div>
+
+    <script>
+        const API_BASE = 'http://127.0.0.1:8765/api';
+        const state = {
+            screen: 'feed',
+            feedMode: 'all',
+            feedItems: [],
+            feedIndex: 0,
+            summaries: [],
+            summaryIndex: 0,
+            status: null,
+            modelOps: null,
+            lastReadyCount: 0,
+            trainingBusy: false,
+        };
+
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
+        function showToast(message, level = 'info') {
+            const stack = document.getElementById('toastStack');
+            const toast = document.createElement('div');
+            toast.className = `toast ${level}`;
+            toast.textContent = message;
+            stack.appendChild(toast);
+            window.setTimeout(() => {
+                toast.remove();
+            }, 8000);
+        }
+
+        async function api(path, options = {}) {
+            const response = await fetch(`${API_BASE}${path}`, {
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                ...options,
+            });
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                const message = body.message || `HTTP ${response.status}`;
+                throw new Error(message);
+            }
+            return body;
+        }
+
+        function formatRelativeTime(isoString) {
+            if (!isoString) return 'ohne Zeit';
+            const date = new Date(isoString);
+            const diffMs = Date.now() - date.getTime();
+            const diffMin = Math.round(diffMs / 60000);
+            if (diffMin < 1) return 'gerade eben';
+            if (diffMin < 60) return `vor ${diffMin} min`;
+            const diffHours = Math.round(diffMin / 60);
+            if (diffHours < 24) return `vor ${diffHours} h`;
+            const diffDays = Math.round(diffHours / 24);
+            return `vor ${diffDays} d`;
+        }
+
+        function formatProbability(probability) {
+            if (probability === null || probability === undefined) return '—';
+            return `${Math.round(probability * 100)}%`;
+        }
+
+        function switchScreen(nextScreen) {
+            state.screen = nextScreen;
+            document.querySelectorAll('.screen').forEach(screen => screen.classList.remove('active'));
+            document.getElementById(`screen-${nextScreen}`).classList.add('active');
+            document.querySelectorAll('.nav-button').forEach(button => {
+                button.classList.toggle('active', button.dataset.screen === nextScreen);
+            });
+
+            if (nextScreen === 'feed') {
+                renderFeedScreen();
+            } else if (nextScreen === 'summaries') {
+                loadSummaries(true);
+            } else {
+                loadModelOps();
+            }
+        }
+
+        async function loadStatus() {
+            try {
+                const status = await api('/status');
+                const readyCount = status.summaries.ready;
+                if (state.lastReadyCount && readyCount > state.lastReadyCount) {
+                    const delta = readyCount - state.lastReadyCount;
+                    showToast(`${delta} neue Summary${delta > 1 ? 's' : ''} fertig`, 'info');
+                }
+                state.lastReadyCount = readyCount;
+                state.status = status;
+                renderHeaderStatus();
+                if (state.screen === 'ops') {
+                    renderOpsScreen();
+                }
+            } catch (error) {
+                document.getElementById('ollamaStatus').textContent = 'offline';
+                document.getElementById('ollamaDot').classList.add('off');
+                showToast(`Backend nicht erreichbar: ${error.message}`, 'error');
+            }
+        }
+
+        function renderHeaderStatus() {
+            if (!state.status) return;
+            const ollama = state.status.ollama || {};
+            document.getElementById('feedPendingCount').textContent = state.status.feed.pending ?? 0;
+            document.getElementById('feedRecommendedCount').textContent = state.status.feed.recommended ?? 0;
+            document.getElementById('feedArchivedCount').textContent = state.status.feed.archived ?? 0;
+            document.getElementById('summaryQueueCount').textContent =
+                (state.status.summaries.queued ?? 0) + (state.status.summaries.processing ?? 0);
+            document.getElementById('summaryReadyCount').textContent = state.status.summaries.ready ?? 0;
+            document.getElementById('navSummaryCount').textContent = state.status.summaries.ready ? `(${state.status.summaries.ready})` : '';
+            document.getElementById('ollamaStatus').textContent = ollama.reachable
+                ? (ollama.model_available ? 'bereit' : 'Modell fehlt')
+                : 'offline';
+            document.getElementById('ollamaDot').classList.toggle('off', !ollama.reachable || !ollama.model_available);
+        }
+
+        async function loadFeed(reset = true) {
+            const currentId = !reset && state.feedItems[state.feedIndex]
+                ? state.feedItems[state.feedIndex].id
+                : null;
+            const payload = await api(`/feed?mode=${state.feedMode}`);
+            state.feedItems = payload.items || [];
+            if (currentId) {
+                const nextIndex = state.feedItems.findIndex(item => item.id === currentId);
+                state.feedIndex = nextIndex >= 0 ? nextIndex : Math.min(state.feedIndex, Math.max(state.feedItems.length - 1, 0));
+            } else {
+                state.feedIndex = 0;
+            }
+            renderFeedScreen(payload.counts);
+        }
+
+        async function loadSummaries(preserveCurrent = false) {
+            const currentId = preserveCurrent && state.summaries[state.summaryIndex]
+                ? state.summaries[state.summaryIndex].id
+                : null;
+            const payload = await api('/summaries');
+            state.summaries = payload.items || [];
+            if (currentId) {
+                const nextIndex = state.summaries.findIndex(item => item.id === currentId);
+                state.summaryIndex = nextIndex >= 0 ? nextIndex : Math.min(state.summaryIndex, Math.max(state.summaries.length - 1, 0));
+            } else {
+                state.summaryIndex = 0;
+            }
+            renderSummaryScreen();
+        }
+
+        async function loadModelOps() {
+            state.modelOps = await api('/model-ops');
+            renderOpsScreen();
+        }
+
+        function feedPredictionMarkup(prediction) {
+            if (!prediction || !prediction.available) {
+                return `
+                    <div class="prediction-strip">
+                        <div class="prediction-main">
+                            <div class="prediction-label">Feed-Modell</div>
+                            <div class="prediction-value">Noch kein Modell trainiert</div>
+                            <div class="prediction-subtle">Du siehst aktuell einfach alle Feed-Einträge.</div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            const recommended = Boolean(prediction.recommended);
+            return `
+                <div class="prediction-strip">
+                    <div class="prediction-main">
+                        <div class="prediction-label">Feed-Modell</div>
+                        <div class="prediction-value">${recommended ? 'zeigenswert' : 'eher nein'}</div>
+                        <div class="prediction-subtle">Wahrscheinlichkeit: ${formatProbability(prediction.probability)}</div>
+                    </div>
+                    <div class="prediction-badge ${recommended ? 'good' : 'bad'}">
+                        ${recommended ? 'zeigen' : 'filtern'}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderFeedScreen(counts = null) {
+            const host = document.getElementById('screen-feed');
+            const item = state.feedItems[state.feedIndex];
+            const totals = counts || {
+                total_pending: state.feedItems.length,
+                recommended_pending: state.feedItems.filter(row => row.prediction?.recommended).length,
+            };
+
+            if (!item) {
+                host.innerHTML = `
+                    <div class="panel">
+                        <div class="panel-header">
+                            <div class="panel-title">
+                                <h2>Feed</h2>
+                                <p>Linearer Schnelllauf. Weiter oder zusammenfassen.</p>
+                            </div>
+                            <div class="toolbar">
+                                <div class="segmented">
+                                    <button class="segment-button ${state.feedMode === 'all' ? 'active' : ''}" data-feed-mode="all">Alle</button>
+                                    <button class="segment-button ${state.feedMode === 'recommended' ? 'active' : ''}" data-feed-mode="recommended">Nur zeigenswert</button>
+                                </div>
+                                <button class="inline-button" id="feedResetButton">Inbox-Reset</button>
+                                <button class="inline-button" id="refreshFeedButton">Feeds aktualisieren</button>
+                            </div>
+                        </div>
+                        <div class="empty-state">
+                            <h3>Kein aktiver Feed-Eintrag</h3>
+                            <p>Im aktuellen Modus sind keine offenen Artikel da. Du kannst die Feeds neu einlesen oder auf Summaries wechseln.</p>
+                        </div>
+                    </div>
+                `;
+                bindCommonFeedControls();
+                return;
+            }
+
+            host.innerHTML = `
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title">
+                            <h2>Feed</h2>
+                            <p>${state.feedIndex + 1} / ${state.feedItems.length} in dieser Session · ${totals.total_pending ?? state.feedItems.length} offen · ${totals.recommended_pending ?? 0} zeigenswert</p>
+                        </div>
+                        <div class="toolbar">
+                                <div class="segmented">
+                                    <button class="segment-button ${state.feedMode === 'all' ? 'active' : ''}" data-feed-mode="all">Alle</button>
+                                    <button class="segment-button ${state.feedMode === 'recommended' ? 'active' : ''}" data-feed-mode="recommended">Nur zeigenswert</button>
+                                </div>
+                                <button class="inline-button" id="feedResetButton">Inbox-Reset</button>
+                                <button class="inline-button" id="refreshFeedButton">Feeds aktualisieren</button>
+                            </div>
+                        </div>
+                    <div class="feed-card">
+                        <div class="feed-meta">
+                            <a class="meta-chip" href="${escapeHtml(item.source_url)}" target="_blank" rel="noopener noreferrer">Quelle · ${escapeHtml(item.source_label)}</a>
+                            <span class="meta-chip">Zeit · ${escapeHtml(formatRelativeTime(item.published_at))}</span>
+                            <a class="meta-chip" href="${escapeHtml(item.link_to_article)}" target="_blank" rel="noopener noreferrer">Artikel · öffnen</a>
+                        </div>
+                        <h3>${escapeHtml(item.title)}</h3>
+                        ${feedPredictionMarkup(item.prediction)}
+                        <div class="action-row">
+                            <div class="action-group">
+                                <button class="action-button neutral" id="feedPrevButton" ${state.feedIndex === 0 ? 'disabled' : ''}>Zurück</button>
+                                <a class="action-button neutral" href="${escapeHtml(item.link_to_article)}" target="_blank" rel="noopener noreferrer">Original öffnen</a>
+                            </div>
+                            <div class="action-group">
+                                <button class="action-button danger" id="feedSkipButton" ${item.sessionAction === 'summarize' ? 'disabled' : ''}>Weiter</button>
+                                <button class="action-button warm" id="feedSummarizeButton">Zusammenfassen</button>
+                            </div>
+                        </div>
+                        <div class="action-note">${escapeHtml(item.sessionAction === 'summarize' ? 'Schon in die lokale Summary-Queue gelegt.' : item.sessionAction === 'skip' ? 'Zuletzt als uninteressant übersprungen.' : 'Pfeile: links zurück, rechts weiter. Taste S: zusammenfassen.')}</div>
+                    </div>
+                </div>
+            `;
+            bindCommonFeedControls();
+            document.getElementById('feedPrevButton')?.addEventListener('click', () => {
+                if (state.feedIndex > 0) {
+                    state.feedIndex -= 1;
+                    renderFeedScreen();
+                }
+            });
+            document.getElementById('feedSkipButton')?.addEventListener('click', handleFeedSkip);
+            document.getElementById('feedSummarizeButton')?.addEventListener('click', handleFeedSummarize);
+        }
+
+        function bindCommonFeedControls() {
+            document.querySelectorAll('[data-feed-mode]').forEach(button => {
+                button.addEventListener('click', async () => {
+                    state.feedMode = button.dataset.feedMode;
+                    await loadFeed(true);
+                });
+            });
+            document.getElementById('refreshFeedButton')?.addEventListener('click', async () => {
+                try {
+                    showToast('Feeds werden aktualisiert …', 'info');
+                    await api('/feeds/refresh', { method: 'POST' });
+                    await loadStatus();
+                    await loadFeed(true);
+                } catch (error) {
+                    showToast(error.message, 'error');
+                }
+            });
+            document.getElementById('feedResetButton')?.addEventListener('click', handleFeedReset);
+        }
+
+        async function handleFeedReset() {
+            const confirmed = window.confirm('Alle aktuell offenen Feed-Einträge archivieren? Sie verschwinden aus dem aktiven Feed, bleiben aber in Historie und Trainingsdaten erhalten.');
+            if (!confirmed) return;
+
+            try {
+                const result = await api('/feed/reset', { method: 'POST' });
+                showToast(`Inbox-Reset: ${result.archived_count} Einträge archiviert.`, 'info');
+                state.feedItems = [];
+                state.feedIndex = 0;
+                await loadStatus();
+                await loadFeed(true);
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        }
+
+        async function handleFeedSkip() {
+            const item = state.feedItems[state.feedIndex];
+            if (!item) return;
+            try {
+                await api(`/articles/${item.id}/skip`, { method: 'POST' });
+                item.sessionAction = 'skip';
+                if (state.feedIndex < state.feedItems.length - 1) {
+                    state.feedIndex += 1;
+                    renderFeedScreen();
+                } else {
+                    await loadFeed(true);
+                }
+                loadStatus();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        }
+
+        async function handleFeedSummarize() {
+            const item = state.feedItems[state.feedIndex];
+            if (!item) return;
+            try {
+                await api(`/articles/${item.id}/summarize`, { method: 'POST' });
+                item.sessionAction = 'summarize';
+                showToast('Summary läuft im Hintergrund.', 'info');
+                if (state.feedIndex < state.feedItems.length - 1) {
+                    state.feedIndex += 1;
+                    renderFeedScreen();
+                } else {
+                    await loadFeed(true);
+                }
+                loadStatus();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        }
+
+        function renderSummaryScreen() {
+            const host = document.getElementById('screen-summaries');
+            const item = state.summaries[state.summaryIndex];
+            const counts = state.status?.summaries || { queued: 0, processing: 0, ready: state.summaries.length, failed: 0 };
+
+            if (!item) {
+                host.innerHTML = `
+                    <div class="panel">
+                        <div class="panel-header">
+                            <div class="panel-title">
+                                <h2>Summaries</h2>
+                                <p>Ruhiger Review-Flow für bereits erzeugte lokale Zusammenfassungen.</p>
+                            </div>
+                            <div class="toolbar">
+                                <button class="inline-button" id="refreshSummaryButton">Neu laden</button>
+                            </div>
+                        </div>
+                        <div class="queue-banner">
+                            <strong>${counts.ready} neue Summaries</strong>
+                            <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${counts.failed} fehlgeschlagen</span>
+                        </div>
+                        <div class="empty-state">
+                            <h3>Gerade nichts zu reviewen</h3>
+                            <p>Neue Summaries tauchen hier auf, sobald die lokale Queue fertig ist.</p>
+                        </div>
+                    </div>
+                `;
+                document.getElementById('refreshSummaryButton')?.addEventListener('click', () => loadSummaries(false));
+                return;
+            }
+
+            host.innerHTML = `
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title">
+                            <h2>Summaries</h2>
+                            <p>${state.summaryIndex + 1} / ${state.summaries.length} offen für Review</p>
+                        </div>
+                        <div class="toolbar">
+                            <button class="inline-button" id="refreshSummaryButton">Neu laden</button>
+                        </div>
+                    </div>
+                    <div class="queue-banner">
+                        <strong>${counts.ready} neue Summaries</strong>
+                        <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${counts.failed} fehlgeschlagen</span>
+                    </div>
+                    <div class="summary-card">
+                        <div class="summary-meta">
+                            <a class="meta-chip" href="${escapeHtml(item.source_url)}" target="_blank" rel="noopener noreferrer">Quelle · ${escapeHtml(item.source_label)}</a>
+                            <span class="meta-chip">Zeit · ${escapeHtml(formatRelativeTime(item.published_at))}</span>
+                            <span class="meta-chip">Modell · ${escapeHtml(item.summary_model || 'lokal')}</span>
+                        </div>
+                        <h3>${escapeHtml(item.summary_title || item.title)}</h3>
+                        <div class="summary-text">${escapeHtml(item.summary_text)}</div>
+                        <div class="action-row">
+                            <div class="action-group">
+                                <button class="action-button neutral" id="summaryPrevButton" ${state.summaryIndex === 0 ? 'disabled' : ''}>Zurück</button>
+                                <a class="action-button neutral" href="${escapeHtml(item.link_to_article)}" target="_blank" rel="noopener noreferrer">Original öffnen</a>
+                            </div>
+                            <div class="action-group">
+                                <button class="action-button danger" id="summaryNotInterestingButton">Doch nicht interessant</button>
+                                <button class="action-button primary" id="summaryInterestingButton">Interessant</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.getElementById('refreshSummaryButton')?.addEventListener('click', () => loadSummaries(false));
+            document.getElementById('summaryPrevButton')?.addEventListener('click', () => {
+                if (state.summaryIndex > 0) {
+                    state.summaryIndex -= 1;
+                    renderSummaryScreen();
+                }
+            });
+            document.getElementById('summaryInterestingButton')?.addEventListener('click', () => handleSummaryFeedback('interesting'));
+            document.getElementById('summaryNotInterestingButton')?.addEventListener('click', () => handleSummaryFeedback('not_interesting'));
+        }
+
+        async function handleSummaryFeedback(feedback) {
+            const item = state.summaries[state.summaryIndex];
+            if (!item) return;
+            try {
+                await api(`/summaries/${item.id}/feedback`, {
+                    method: 'POST',
+                    body: JSON.stringify({ feedback }),
+                });
+                item.sessionFeedback = feedback;
+                if (state.summaryIndex < state.summaries.length - 1) {
+                    state.summaryIndex += 1;
+                    renderSummaryScreen();
+                } else {
+                    await loadSummaries(false);
+                }
+                loadStatus();
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        }
+
+        function renderMetricCard(label, value) {
+            return `
+                <div class="metric">
+                    <div class="metric-label">${escapeHtml(label)}</div>
+                    <div class="metric-value">${escapeHtml(value)}</div>
+                </div>
+            `;
+        }
+
+        function renderModelCard(title, targetKey, descriptor) {
+            const latestRun = descriptor.latest_run;
+            const counts = descriptor.label_counts || { total: 0, positive: 0, negative: 0 };
+            const retraining = descriptor.retraining || { recommended: false, reason: 'unknown', headline: 'Noch warten', detail: '' };
+            const quality = descriptor.quality || { headline: 'Keine Einschätzung', detail: '' };
+            const matrix = latestRun?.confusion_matrix || [[0, 0], [0, 0]];
+            const buttonLabel = latestRun ? 'Retrain' : 'Train';
+
+            return `
+                <div class="ops-card">
+                    <h3>${escapeHtml(title)}</h3>
+                    <div class="data-points">
+                        <span class="data-pill">Labels ${counts.total}</span>
+                        <span class="data-pill">Positiv ${counts.positive}</span>
+                        <span class="data-pill">Negativ ${counts.negative}</span>
+                        <span class="data-pill">Neu seit Training ${descriptor.new_labels_since_training ?? counts.total}</span>
+                        <span class="data-pill">${escapeHtml(retraining.headline || (retraining.recommended ? 'Retraining sinnvoll' : 'Noch warten'))}</span>
+                    </div>
+                    <div class="ops-assessment">
+                        <strong>${escapeHtml(quality.headline || 'Keine Einschätzung')}</strong>
+                        <p>${escapeHtml(quality.detail || '')}</p>
+                    </div>
+                    ${latestRun ? `
+                        <div class="metric-grid">
+                            ${renderMetricCard('Accuracy', latestRun.accuracy?.toFixed?.(3) || latestRun.accuracy)}
+                            ${renderMetricCard('Precision', latestRun.precision?.toFixed?.(3) || latestRun.precision)}
+                            ${renderMetricCard('Recall', latestRun.recall?.toFixed?.(3) || latestRun.recall)}
+                            ${renderMetricCard('F1', latestRun.f1?.toFixed?.(3) || latestRun.f1)}
+                        </div>
+                        <table class="matrix">
+                            <thead>
+                                <tr>
+                                    <th></th>
+                                    <th>Pred 0</th>
+                                    <th>Pred 1</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <th>True 0</th>
+                                    <td>${matrix[0]?.[0] ?? 0}</td>
+                                    <td>${matrix[0]?.[1] ?? 0}</td>
+                                </tr>
+                                <tr>
+                                    <th>True 1</th>
+                                    <td>${matrix[1]?.[0] ?? 0}</td>
+                                    <td>${matrix[1]?.[1] ?? 0}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                        <div class="data-points">
+                            <span class="data-pill">Trainiert ${escapeHtml(formatRelativeTime(latestRun.trained_at))}</span>
+                            <span class="data-pill">Train ${latestRun.train_size}</span>
+                            <span class="data-pill">Test ${latestRun.test_size}</span>
+                        </div>
+                        <div class="ops-assessment">
+                            <strong>${escapeHtml(retraining.headline || 'Noch warten')}</strong>
+                            <p>${escapeHtml(retraining.detail || '')}</p>
+                        </div>
+                    ` : `
+                        <p style="color: var(--ink-soft); margin-bottom: 18px;">Noch kein Lauf gespeichert.</p>
+                        <div class="ops-assessment">
+                            <strong>${escapeHtml(retraining.headline || 'Noch warten')}</strong>
+                            <p>${escapeHtml(retraining.detail || '')}</p>
+                        </div>
+                    `}
+                    <div class="ops-actions">
+                        <button class="inline-button" data-train-target="${escapeHtml(targetKey)}" ${state.trainingBusy ? 'disabled' : ''}>${buttonLabel}</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderOpsScreen() {
+            const host = document.getElementById('screen-ops');
+            const feedRun = state.modelOps?.targets?.feed_recommendation;
+            const summaryRun = state.modelOps?.targets?.summary_interest;
+            const status = state.status;
+
+            host.innerHTML = `
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title">
+                            <h2>Model Ops</h2>
+                            <p>Konfusionsmatrix, Precision, Recall, F1 und Retraining-Trigger ohne Erklärungsballast.</p>
+                        </div>
+                        <div class="toolbar">
+                            <button class="inline-button" id="refreshOpsButton">Neu laden</button>
+                            <button class="inline-button" id="trainAllButton" ${state.trainingBusy ? 'disabled' : ''}>Beide trainieren</button>
+                        </div>
+                    </div>
+                    <div style="padding: 22px 22px 0;">
+                        <div class="ops-grid" style="margin-bottom: 18px;">
+                            <div class="ops-card">
+                                <h3>System</h3>
+                                <div class="data-points">
+                                    <span class="data-pill">Ollama ${status?.ollama?.reachable ? 'online' : 'offline'}</span>
+                                    <span class="data-pill">Modell ${escapeHtml(status?.config?.ollama_model || '—')}</span>
+                                    <span class="data-pill">Feed offen ${status?.feed?.pending ?? 0}</span>
+                                    <span class="data-pill">Archiviert ${status?.feed?.archived ?? 0}</span>
+                                    <span class="data-pill">Queue ${((status?.summaries?.queued ?? 0) + (status?.summaries?.processing ?? 0))}</span>
+                                    <span class="data-pill">Ready ${status?.summaries?.ready ?? 0}</span>
+                                </div>
+                            </div>
+                            <div class="ops-card">
+                                <h3>Letzter Feed-Refresh</h3>
+                                <div class="data-points">
+                                    <span class="data-pill">Status ${escapeHtml(status?.last_feed_refresh?.status || 'unbekannt')}</span>
+                                    <span class="data-pill">Neu ${status?.last_feed_refresh?.inserted ?? 0}</span>
+                                    <span class="data-pill">Aktualisiert ${status?.last_feed_refresh?.updated ?? 0}</span>
+                                    <span class="data-pill">Fehler ${(status?.last_feed_refresh?.errors || []).length}</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="ops-grid">
+                            ${feedRun ? renderModelCard('Stufe 1 · Feed Recommendation', 'feed_recommendation', feedRun) : '<div class="ops-card"><h3>Stufe 1 · Feed Recommendation</h3><p>Wird geladen …</p></div>'}
+                            ${summaryRun ? renderModelCard('Stufe 2 · Summary Interest', 'summary_interest', summaryRun) : '<div class="ops-card"><h3>Stufe 2 · Summary Interest</h3><p>Wird geladen …</p></div>'}
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            document.getElementById('refreshOpsButton')?.addEventListener('click', async () => {
+                await loadStatus();
+                await loadModelOps();
+            });
+            document.getElementById('trainAllButton')?.addEventListener('click', () => handleTraining('all'));
+            document.querySelectorAll('[data-train-target]').forEach(button => {
+                button.addEventListener('click', () => handleTraining(button.dataset.trainTarget));
+            });
+        }
+
+        async function handleTraining(target) {
+            try {
+                state.trainingBusy = true;
+                renderOpsScreen();
+                const payload = await api('/model-ops/train', {
+                    method: 'POST',
+                    body: JSON.stringify({ target }),
+                });
+                const resultText = (payload.results || [])
+                    .map(result => `${result.target}: ${result.status}`)
+                    .join(' · ');
+                showToast(resultText || 'Training abgeschlossen', 'info');
+                await loadStatus();
+                await loadModelOps();
+                if (state.screen === 'feed') {
+                    await loadFeed(true);
+                }
+            } catch (error) {
+                showToast(error.message, 'error');
+            } finally {
+                state.trainingBusy = false;
+                if (state.screen === 'ops') {
+                    renderOpsScreen();
+                }
+            }
+        }
+
+        function handleKeyboard(event) {
+            if (state.screen === 'feed') {
+                if (event.key === 'ArrowLeft') {
+                    if (state.feedIndex > 0) {
+                        state.feedIndex -= 1;
+                        renderFeedScreen();
+                    }
+                } else if (event.key === 'ArrowRight') {
+                    handleFeedSkip();
+                } else if (event.key.toLowerCase() === 's') {
+                    handleFeedSummarize();
+                } else if (event.key.toLowerCase() === 'r') {
+                    loadFeed(true);
+                }
+            } else if (state.screen === 'summaries') {
+                if (event.key === 'ArrowLeft' && state.summaryIndex > 0) {
+                    state.summaryIndex -= 1;
+                    renderSummaryScreen();
+                } else if (event.key.toLowerCase() === 'i') {
+                    handleSummaryFeedback('interesting');
+                } else if (event.key.toLowerCase() === 'n') {
+                    handleSummaryFeedback('not_interesting');
+                }
+            }
+        }
+
+        function bindNav() {
+            document.querySelectorAll('.nav-button').forEach(button => {
+                button.addEventListener('click', () => switchScreen(button.dataset.screen));
+            });
+            document.addEventListener('keydown', handleKeyboard);
+        }
+
+        async function bootstrap() {
+            bindNav();
+            renderFeedScreen();
+            await loadStatus();
+            await loadFeed(true);
+            window.setInterval(loadStatus, 7000);
+        }
+
+        bootstrap().catch(error => {
+            showToast(`Startfehler: ${error.message}`, 'error');
+        });
+    </script>
+</body>
+</html>

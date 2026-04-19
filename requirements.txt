@@ -1,0 +1,9 @@
+beautifulsoup4>=4.12,<5
+feedparser>=6.0,<7
+Flask>=3.0,<4
+googlenewsdecoder>=0.1.7
+joblib>=1.4,<2
+requests>=2.31,<3
+scikit-learn>=1.5,<2
+trafilatura>=1.9,<2
+urllib3<2

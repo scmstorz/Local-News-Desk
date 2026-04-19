@@ -1,0 +1,77 @@
+# Local News App
+
+## Start
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
+```
+
+Falls du das Environment bereits vorher installiert hattest, einmal nachziehen:
+
+```bash
+pip install -r requirements.txt --upgrade
+```
+
+Danach `local-news-app.html` direkt im Browser öffnen.
+
+Das Frontend spricht standardmäßig mit:
+
+`http://127.0.0.1:8765`
+
+Ein separater Cronjob ist nicht nötig.
+
+Der Backend-Prozess läuft dauerhaft und zieht standardmäßig alle 5 Minuten neue RSS-Einträge nach.
+
+## Wichtige Dateien
+
+- `local-news-app.html`
+- `local_news_backend.py`
+- `LOCAL_ARCHITECTURE.md`
+- `requirements.txt`
+
+## Ollama
+
+Default-Modell:
+
+`qwen3.5:35b`
+
+Falls du ein anderes lokales Modell testen willst:
+
+```bash
+OLLAMA_MODEL=gemma3:27b python local_news_backend.py
+```
+
+## Lokale Daten
+
+Standardpfade:
+
+- SQLite: `local-news.db`
+- Modelle: `models/`
+
+Optional überschreibbar:
+
+```bash
+LOCAL_NEWS_DB_PATH=/tmp/local-news.db
+LOCAL_NEWS_MODEL_DIR=/tmp/local-news-models
+```
+
+## Nützliche Umgebungsvariablen
+
+```bash
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3.5:35b
+LOCAL_NEWS_PORT=8765
+LOCAL_NEWS_REFRESH_SECONDS=300
+```
+
+## Hinweise
+
+- `claude-news-app.html` bleibt unangetastet.
+- Das neue Frontend ist Desktop-first.
+- Der Feed-Klassifikator ist aktuell eine transparente Baseline mit `TF-IDF + LogisticRegression`.
+- Summary-Feedback wird bereits gespeichert, damit spätere Modelliteration darauf aufbauen kann.
+- `trafilatura` ist optional. Wenn es lokal nicht sauber importierbar ist, fällt die Textextraktion automatisch auf `BeautifulSoup` zurück.
+- `Inbox-Reset` archiviert alle aktuell offenen Feed-Einträge, ohne sie aus der Datenbank zu löschen.

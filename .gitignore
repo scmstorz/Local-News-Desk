@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+local-news.db
+models/
+/claude-news-app.html
+/google-cloud-function.py
+/CLAUDE.md
+/.claude/
