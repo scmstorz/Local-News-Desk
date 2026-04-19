@@ -8,8 +8,8 @@
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'><rect width='128' height='128' rx='24' fill='%230f172a'/><path d='M28 30h72v12H28zm0 24h72v12H28zm0 24h50v12H28z' fill='%23f8fafc'/><circle cx='92' cy='84' r='12' fill='%23f97316'/></svg>">
     <style>
         :root {
-            --bg: #f1ede2;
-            --bg-strong: #e5dcc9;
+            --bg: #27241f;
+            --bg-strong: #191713;
             --panel: rgba(251, 249, 244, 0.92);
             --panel-strong: #fffdf8;
             --line: rgba(43, 37, 33, 0.1);
@@ -18,11 +18,13 @@
             --ink-muted: #877e77;
             --accent: #0f766e;
             --accent-strong: #115e59;
+            --accent-cool: #2563eb;
+            --accent-cool-strong: #1d4ed8;
             --accent-warm: #f97316;
             --danger: #a53030;
             --danger-soft: #fbe7e3;
             --success-soft: #def7ec;
-            --shadow: 0 24px 60px rgba(34, 27, 22, 0.12);
+            --shadow: 0 28px 70px rgba(6, 5, 4, 0.28);
             --radius-xl: 28px;
             --radius-lg: 20px;
             --radius-md: 14px;
@@ -41,9 +43,10 @@
             font-family: var(--ui-font);
             color: var(--ink);
             background:
-                radial-gradient(circle at top left, rgba(249, 115, 22, 0.18), transparent 32%),
-                radial-gradient(circle at top right, rgba(15, 118, 110, 0.14), transparent 26%),
-                linear-gradient(180deg, #f7f2e8 0%, #efe7d6 100%);
+                radial-gradient(circle at top left, rgba(249, 115, 22, 0.16), transparent 28%),
+                radial-gradient(circle at top right, rgba(37, 99, 235, 0.14), transparent 22%),
+                radial-gradient(circle at bottom right, rgba(15, 118, 110, 0.15), transparent 26%),
+                linear-gradient(180deg, #2a2621 0%, #1b1814 100%);
             padding: 28px;
         }
 
@@ -74,8 +77,8 @@
         .topbar {
             display: flex;
             justify-content: space-between;
-            gap: 18px;
-            padding: 28px 30px 20px;
+            gap: 14px;
+            padding: 18px 22px 14px;
             border-bottom: 1px solid var(--line);
             background:
                 linear-gradient(120deg, rgba(255,255,255,0.75), rgba(255,255,255,0.45)),
@@ -85,7 +88,7 @@
         .brand {
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 6px;
         }
 
         .brand-mark {
@@ -108,28 +111,28 @@
 
         .brand h1 {
             font-family: var(--serif-font);
-            font-size: clamp(30px, 4vw, 46px);
+            font-size: clamp(14px, 1.45vw, 20px);
             font-weight: 600;
-            line-height: 1;
+            line-height: 1.08;
         }
 
         .brand p {
             color: var(--ink-soft);
-            font-size: 15px;
+            font-size: 12px;
         }
 
         .topbar-right {
             display: flex;
             flex-direction: column;
             align-items: flex-end;
-            gap: 14px;
-            min-width: 460px;
+            gap: 10px;
+            min-width: 420px;
         }
 
         .nav-row,
         .status-row {
             display: flex;
-            gap: 10px;
+            gap: 8px;
             flex-wrap: wrap;
             justify-content: flex-end;
         }
@@ -146,10 +149,10 @@
         }
 
         .nav-button {
-            padding: 12px 18px;
+            padding: 9px 14px;
             background: rgba(255,255,255,0.75);
             color: var(--ink-soft);
-            font-size: 14px;
+            font-size: 12px;
             font-weight: 600;
             border: 1px solid rgba(24, 21, 18, 0.08);
         }
@@ -169,13 +172,13 @@
         .status-pill {
             display: inline-flex;
             align-items: center;
-            gap: 8px;
-            padding: 10px 14px;
+            gap: 6px;
+            padding: 8px 11px;
             border-radius: 999px;
             background: rgba(255,255,255,0.72);
             color: var(--ink-soft);
             border: 1px solid rgba(24,21,18,0.08);
-            font-size: 13px;
+            font-size: 11px;
             font-weight: 600;
         }
 
@@ -287,8 +290,8 @@
             background: rgba(24,21,18,0.06);
             color: var(--ink);
             border: 1px solid rgba(24,21,18,0.08);
-            padding: 11px 16px;
-            font-size: 14px;
+            padding: 10px 14px;
+            font-size: 12px;
             font-weight: 700;
         }
 
@@ -437,6 +440,12 @@
             color: #f8fafc;
             background: linear-gradient(135deg, var(--accent), var(--accent-strong));
             box-shadow: 0 12px 28px rgba(15,118,110,0.18);
+        }
+
+        .action-button.cool {
+            color: #f8fbff;
+            background: linear-gradient(135deg, var(--accent-cool), var(--accent-cool-strong));
+            box-shadow: 0 12px 28px rgba(37,99,235,0.2);
         }
 
         .action-button.warm {
@@ -685,7 +694,7 @@
                     <span class="brand-dot"></span>
                     <span>Local News Desk</span>
                 </div>
-                <h1>Feed lesen. Lokal zusammenfassen. Modelle messen.</h1>
+                <h1>Feeds lesen. Lokal zusammenfassen. Prädiktor trainieren.</h1>
                 <p>Desktop-Workflow für Feed-Entscheidungen, lokale Summaries und nüchterne Model-Ops.</p>
             </div>
             <div class="topbar-right">
@@ -964,7 +973,7 @@
                                 <a class="action-button neutral" href="${escapeHtml(item.link_to_article)}" target="_blank" rel="noopener noreferrer">Original öffnen</a>
                             </div>
                             <div class="action-group">
-                                <button class="action-button danger" id="feedSkipButton" ${item.sessionAction === 'summarize' ? 'disabled' : ''}>Weiter</button>
+                                <button class="action-button cool" id="feedSkipButton" ${item.sessionAction === 'summarize' ? 'disabled' : ''}>Weiter</button>
                                 <button class="action-button warm" id="feedSummarizeButton">Zusammenfassen</button>
                             </div>
                         </div>
@@ -1262,6 +1271,9 @@
                                 <div class="data-points">
                                     <span class="data-pill">Ollama ${status?.ollama?.reachable ? 'online' : 'offline'}</span>
                                     <span class="data-pill">Modell ${escapeHtml(status?.config?.ollama_model || '—')}</span>
+                                    <span class="data-pill">Ollama-URL ${escapeHtml(status?.config?.ollama_base_url || '—')}</span>
+                                    <span class="data-pill">Feeds ${status?.config?.feed_count ?? 0}</span>
+                                    <span class="data-pill">Refresh ${status?.config?.feed_refresh_seconds ?? '—'}s</span>
                                     <span class="data-pill">Feed offen ${status?.feed?.pending ?? 0}</span>
                                     <span class="data-pill">Archiviert ${status?.feed?.archived ?? 0}</span>
                                     <span class="data-pill">Queue ${((status?.summaries?.queued ?? 0) + (status?.summaries?.processing ?? 0))}</span>

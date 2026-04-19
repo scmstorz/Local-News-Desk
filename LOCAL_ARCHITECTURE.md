@@ -180,6 +180,30 @@ Gründe:
 - `trafilatura` plus `BeautifulSoup` als Fallback für Textextraktion
 - `googlenewsdecoder` für Google-News-Links
 
+### Konfigurationsdatei
+
+Datei: `local_config.json`
+
+Dort liegen die produktnahen Einstellungen:
+
+- RSS-Feed-Liste
+- Ollama-Modell
+- Ollama-Base-URL
+- Polling-Intervalle
+- Server- und Speicherpfade
+
+Gründe:
+
+- Feeds und Modellwahl sollen nicht im Code versteckt sein
+- spätere Experimente mit anderen Feeds oder Modellen werden einfacher
+- lokale Anpassungen sind klarer von Implementierungslogik getrennt
+
+Reihenfolge:
+
+- Standardwerte im Code
+- `local_config.json`
+- optionale Umgebungsvariablen als Override
+
 ### LLM
 
 - Ollama lokal

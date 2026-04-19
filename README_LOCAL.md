@@ -29,8 +29,26 @@ Der Backend-Prozess läuft dauerhaft und zieht standardmäßig alle 5 Minuten ne
 
 - `local-news-app.html`
 - `local_news_backend.py`
+- `local_config.json`
 - `LOCAL_ARCHITECTURE.md`
 - `requirements.txt`
+
+## Konfiguration
+
+Die lokale Konfiguration liegt in:
+
+`local_config.json`
+
+Dort werden unter anderem gepflegt:
+
+- Google-News-RSS-Feeds
+- Ollama-Base-URL
+- Ollama-Modell
+- Polling-Intervalle
+- Server-Port
+
+Der Python-Code liest diese Datei standardmäßig automatisch ein.
+Umgebungsvariablen können die Werte weiterhin überschreiben.
 
 ## Ollama
 

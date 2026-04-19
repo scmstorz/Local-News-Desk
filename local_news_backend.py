@@ -60,22 +60,77 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get("LOCAL_NEWS_DB_PATH", BASE_DIR / "local-news.db"))
-MODEL_DIR = Path(os.environ.get("LOCAL_NEWS_MODEL_DIR", BASE_DIR / "models"))
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:35b")
-HOST = os.environ.get("LOCAL_NEWS_HOST", "127.0.0.1")
-PORT = int(os.environ.get("LOCAL_NEWS_PORT", "8765"))
-FEED_REFRESH_SECONDS = int(os.environ.get("LOCAL_NEWS_REFRESH_SECONDS", "300"))
-SUMMARY_POLL_SECONDS = float(os.environ.get("LOCAL_NEWS_SUMMARY_POLL_SECONDS", "3"))
-REQUEST_TIMEOUT_SECONDS = int(os.environ.get("LOCAL_NEWS_REQUEST_TIMEOUT_SECONDS", "20"))
+CONFIG_PATH = Path(os.environ.get("LOCAL_NEWS_CONFIG_PATH", BASE_DIR / "local_config.json"))
+DEFAULT_SETTINGS = {
+    "server": {
+        "host": "127.0.0.1",
+        "port": 8765,
+    },
+    "storage": {
+        "db_path": "local-news.db",
+        "model_dir": "models",
+    },
+    "ollama": {
+        "base_url": "http://127.0.0.1:11434",
+        "model": "qwen3.5:35b",
+    },
+    "timing": {
+        "feed_refresh_seconds": 300,
+        "summary_poll_seconds": 3,
+        "request_timeout_seconds": 20,
+    },
+    "feeds": [
+        "https://news.google.com/rss/search?q=%22generative%20ai%22%20OR%20llm%20when%3A1h&hl=en-US&gl=US&ceid=US%3Aen",
+        "https://news.google.com/rss/search?q=artificial%20intelligence%20when%3A1h&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=anthropic%20OR%20openai%20OR%20%22google%20gemini%22%20OR%20%22open%20source%20llm%22%20OR%20nvidia%20when%3A1h&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=machine+learning+when:2d&hl=en-US&gl=US&ceid=US:en",
+    ],
+}
 
-RSS_FEED_URLS = [
-    "https://news.google.com/rss/search?q=%22generative%20ai%22%20OR%20llm%20when%3A1h&hl=en-US&gl=US&ceid=US%3Aen",
-    "https://news.google.com/rss/search?q=artificial%20intelligence%20when%3A1h&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=anthropic%20OR%20openai%20OR%20%22google%20gemini%22%20OR%20%22open%20source%20llm%22%20OR%20nvidia%20when%3A1h&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=machine+learning+when:2d&hl=en-US&gl=US&ceid=US:en",
-]
+
+def merge_settings(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_settings(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_settings() -> dict[str, Any]:
+    settings = dict(DEFAULT_SETTINGS)
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            file_settings = json.load(handle)
+        settings = merge_settings(settings, file_settings)
+    return settings
+
+
+def resolve_local_path(value: str) -> Path:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return candidate
+    return (BASE_DIR / candidate).resolve()
+
+
+SETTINGS = load_settings()
+DB_PATH = resolve_local_path(os.environ.get("LOCAL_NEWS_DB_PATH", SETTINGS["storage"]["db_path"]))
+MODEL_DIR = resolve_local_path(os.environ.get("LOCAL_NEWS_MODEL_DIR", SETTINGS["storage"]["model_dir"]))
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", SETTINGS["ollama"]["base_url"]).rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", SETTINGS["ollama"]["model"])
+HOST = os.environ.get("LOCAL_NEWS_HOST", SETTINGS["server"]["host"])
+PORT = int(os.environ.get("LOCAL_NEWS_PORT", str(SETTINGS["server"]["port"])))
+FEED_REFRESH_SECONDS = int(
+    os.environ.get("LOCAL_NEWS_REFRESH_SECONDS", str(SETTINGS["timing"]["feed_refresh_seconds"]))
+)
+SUMMARY_POLL_SECONDS = float(
+    os.environ.get("LOCAL_NEWS_SUMMARY_POLL_SECONDS", str(SETTINGS["timing"]["summary_poll_seconds"]))
+)
+REQUEST_TIMEOUT_SECONDS = int(
+    os.environ.get("LOCAL_NEWS_REQUEST_TIMEOUT_SECONDS", str(SETTINGS["timing"]["request_timeout_seconds"]))
+)
+RSS_FEED_URLS = list(SETTINGS["feeds"])
 
 LOGGER = logging.getLogger("local_news_backend")
 logging.basicConfig(
@@ -1693,8 +1748,11 @@ def api_status():
             "ollama": ollama_health(),
             "last_feed_refresh": get_app_state("last_feed_refresh"),
             "config": {
+                "config_path": str(CONFIG_PATH),
                 "ollama_model": OLLAMA_MODEL,
+                "ollama_base_url": OLLAMA_BASE_URL,
                 "feed_refresh_seconds": FEED_REFRESH_SECONDS,
+                "feed_count": len(RSS_FEED_URLS),
             },
         }
     )
