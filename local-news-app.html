@@ -933,7 +933,8 @@ Hier ist die zu bewertende Datei:
             if (!compare?.enabled) return 'aus';
             const progress = compare.progress;
             if (progress?.total_models) {
-                return `${progress.completed_models}/${progress.total_models}`;
+                const failed = progress.failed_models ? `-${progress.failed_models}` : '';
+                return `${progress.completed_models}/${progress.total_models}${failed}`;
             }
             const sessionStats = compare.session_stats;
             if (sessionStats?.article_count) {
@@ -951,11 +952,13 @@ Hier ist die zu bewertende Datei:
             const sessionStats = compare.session_stats;
             if (progress?.total_models) {
                 const currentModel = progress.current_model ? ` · gerade ${progress.current_model}` : '';
-                return `Aktueller Artikel: ${progress.completed_models}/${progress.total_models} Modelle fertig${currentModel}`;
+                const failures = progress.failed_models ? ` · ${progress.failed_models} fehlgeschlagen` : '';
+                return `Aktueller Artikel: ${progress.completed_models}/${progress.total_models} Modelle fertig${failures}${currentModel}`;
             }
 
             if (sessionStats?.article_count) {
-                return `Session: ${sessionStats.completed_articles}/${sessionStats.article_count} Artikel komplett verglichen`;
+                const pending = sessionStats.pending_articles ? ` · ${sessionStats.pending_articles} Artikel offen` : '';
+                return `Session: ${sessionStats.completed_articles}/${sessionStats.article_count} Artikel komplett verglichen${pending}`;
             }
 
             return 'LLM Compare ist aktiv und wartet auf die nächste Summary.';
@@ -1512,6 +1515,7 @@ Hier ist die zu bewertende Datei:
                                     <span class="data-pill">Archiviert ${status?.feed?.archived ?? 0}</span>
                                     <span class="data-pill">Queue ${((status?.summaries?.queued ?? 0) + (status?.summaries?.processing ?? 0))}</span>
                                     <span class="data-pill">Ready ${status?.summaries?.ready ?? 0}</span>
+                                    <span class="data-pill">Compare-Timeout ${status?.config?.llm_compare_timeout_seconds ?? '—'}s</span>
                                     <span class="data-pill ${compare.enabled ? 'compare-on' : 'compare-off'}">LLM Compare ${compare.enabled ? 'an' : 'aus'}</span>
                                 </div>
                                 <div class="ops-assessment">
@@ -1520,7 +1524,7 @@ Hier ist die zu bewertende Datei:
                                         Modelle: ${escapeHtml((compare.models || []).join(', ') || '—')}
                                         ${compare.session?.export_path ? `<br>Export: ${escapeHtml(basename(compare.session.export_path))}` : ''}
                                         ${compare.enabled ? `<br>${escapeHtml(compareProgressText(compare))}` : ''}
-                                        ${compareStats.article_count ? `<br>Session: ${compareStats.completed_articles}/${compareStats.article_count} Artikel komplett · ${compareStats.result_count} Modellläufe gespeichert` : ''}
+                                        ${compareStats.article_count ? `<br>Session: ${compareStats.completed_articles}/${compareStats.article_count} Artikel komplett · ${compareStats.result_count} Modellläufe gespeichert${compareStats.pending_articles ? ` · ${compareStats.pending_articles} offen` : ''}` : ''}
                                         ${compareProgress?.current_model ? `<br>Aktuell läuft: ${escapeHtml(compareProgress.current_model)}` : ''}
                                     </p>
                                 </div>

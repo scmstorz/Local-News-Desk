@@ -45,6 +45,7 @@ Dort werden unter anderem gepflegt:
 - Ollama-Base-URL
 - Ollama-Modell
 - optionale `LLM Compare`-Modelle
+- Compare-Timeout pro Modellaufruf
 - Polling-Intervalle
 - Server-Port
 
@@ -104,6 +105,8 @@ Wenn `LLM Compare` in `Model Ops` eingeschaltet wird:
 - laufen zusätzlich alle in `local_config.json` konfigurierten Compare-Modelle sequenziell
 - wird pro aktivierter Session genau eine Exportdatei in `compare_exports/` aufgebaut
 - zeigt die UI zusätzlich laufenden Compare-Fortschritt im Header, in der Summary-Queue und in `Model Ops`
+- läuft der Compare-Teil in einem eigenen Hintergrund-Worker und blockiert den Summary-Worker nicht mehr
+- einzelne Compare-Timeouts werden als Fehler protokolliert und lassen die Session weiterlaufen
 
 Die Datei ist bewusst frontier-modell-freundlich formatiert:
 

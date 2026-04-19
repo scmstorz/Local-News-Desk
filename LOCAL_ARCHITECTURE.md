@@ -126,6 +126,8 @@ Verhalten:
 - Compare-Fehler dürfen die produktive Summary nicht beschädigen
 - Ergebnisse werden sowohl in SQLite als auch in einer Exportdatei pro Compare-Session abgelegt
 - der laufende Compare-Fortschritt wird separat in `app_state` gehalten und in der UI sichtbar gemacht
+- Compare läuft in einem eigenen Hintergrund-Worker und blockiert den Summary-Worker nicht
+- einzelne Modell-Timeouts werden als Vergleichsfehler geloggt und die Session läuft weiter
 
 Gründe:
 
@@ -216,6 +218,7 @@ Dort liegen die produktnahen Einstellungen:
 - Ollama-Modell
 - Ollama-Base-URL
 - Compare-Modelle und Exportpfad
+- Compare-Timeout pro Modellaufruf
 - Polling-Intervalle
 - Server- und Speicherpfade
 

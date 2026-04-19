@@ -77,6 +77,7 @@ DEFAULT_SETTINGS = {
     "llm_compare": {
         "enabled": False,
         "export_dir": "compare_exports",
+        "request_timeout_seconds": 120,
         "models": [
             "qwen3.5:35b",
             "gemma4:31b",
@@ -290,6 +291,7 @@ class RuntimeState:
         self.refresh_lock = threading.Lock()
         self.training_lock = threading.Lock()
         self.model_lock = threading.Lock()
+        self.compare_event = threading.Event()
         self.models: dict[str, dict[str, Any]] = {}
 
 
@@ -866,6 +868,25 @@ def get_compare_models() -> list[str]:
     return models
 
 
+def get_compare_timeout_seconds() -> int:
+    compare_settings = SETTINGS.get("llm_compare", {})
+    timeout = compare_settings.get("request_timeout_seconds")
+    if timeout is None:
+        timeout = SETTINGS.get("timing", {}).get("request_timeout_seconds", 120)
+    try:
+        return max(30, int(timeout))
+    except (TypeError, ValueError):
+        return 120
+
+
+def get_request_timeout_seconds() -> int:
+    timeout = SETTINGS.get("timing", {}).get("request_timeout_seconds", 20)
+    try:
+        return max(5, int(timeout))
+    except (TypeError, ValueError):
+        return 20
+
+
 def current_compare_session() -> Optional[dict[str, Any]]:
     session_id = get_app_state("llm_compare_session_id", None)
     if not session_id:
@@ -885,6 +906,10 @@ def current_compare_session() -> Optional[dict[str, Any]]:
 
 def clear_compare_progress() -> None:
     update_app_state("llm_compare_progress", None)
+
+
+def wake_compare_worker() -> None:
+    STATE.compare_event.set()
 
 
 def append_compare_session_header(export_path: Path, enabled_at: str, models: list[str]) -> None:
@@ -935,6 +960,7 @@ def set_compare_enabled(enabled: bool) -> dict[str, Any]:
         update_app_state("llm_compare_enabled", True)
         update_app_state("llm_compare_session_id", session_id)
         clear_compare_progress()
+        wake_compare_worker()
         session = current_compare_session()
         return {"enabled": True, "session": session}
 
@@ -956,6 +982,7 @@ def set_compare_enabled(enabled: bool) -> dict[str, Any]:
     update_app_state("llm_compare_enabled", False)
     update_app_state("llm_compare_session_id", None)
     clear_compare_progress()
+    wake_compare_worker()
     return {"enabled": False, "session": None}
 
 
@@ -963,13 +990,15 @@ def bootstrap_compare_mode() -> None:
     session = current_compare_session()
     if get_compare_enabled() and session is None:
         set_compare_enabled(True)
+    elif get_compare_enabled() and session is not None:
+        wake_compare_worker()
 
 
 def append_compare_export(
     session: dict[str, Any],
     article: dict[str, Any],
     final_url: str,
-    summaries: list[dict[str, str]],
+    summaries: list[dict[str, Any]],
 ) -> None:
     export_path = Path(session["export_path"])
     lines = [
@@ -979,14 +1008,13 @@ def append_compare_export(
         f"  <url>{html_lib.escape(final_url)}</url>",
     ]
     for summary in summaries:
-        lines.extend(
-            [
-                f'  <model_summary model="{html_lib.escape(summary["model_name"])}">',
-                f"    <summary_title>{html_lib.escape(summary['summary_title'])}</summary_title>",
-                f"    <summary_text>{html_lib.escape(summary['summary_text'])}</summary_text>",
-                "  </model_summary>",
-            ]
-        )
+        status = summary.get("status", "ok")
+        lines.append(f'  <model_summary model="{html_lib.escape(summary["model_name"])}" status="{html_lib.escape(status)}">')
+        lines.append(f"    <summary_title>{html_lib.escape(summary.get('summary_title', ''))}</summary_title>")
+        lines.append(f"    <summary_text>{html_lib.escape(summary.get('summary_text', ''))}</summary_text>")
+        if summary.get("error"):
+            lines.append(f"    <error>{html_lib.escape(summary.get('error', ''))}</error>")
+        lines.append("  </model_summary>")
     lines.extend(["</article_compare>", ""])
     with open(export_path, "a", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
@@ -1038,8 +1066,9 @@ def run_compare_summaries(
         ).fetchall()
         existing_models = {row["model_name"] for row in existing_rows}
 
-    summaries_to_export: list[dict[str, str]] = []
+    summaries_to_export: list[dict[str, Any]] = []
     completed_models = len(existing_models)
+    failed_models = 0
     total_models = len(models)
     started_at = utc_now_iso()
 
@@ -1050,6 +1079,7 @@ def run_compare_summaries(
             "article_id": article_id,
             "article_title": article.get("title", ""),
             "completed_models": completed_models,
+            "failed_models": failed_models,
             "total_models": total_models,
             "current_model": None,
             "status": "running",
@@ -1069,6 +1099,7 @@ def run_compare_summaries(
                 "article_id": article_id,
                 "article_title": article.get("title", ""),
                 "completed_models": completed_models,
+                "failed_models": failed_models,
                 "total_models": total_models,
                 "current_model": model_name,
                 "status": "running",
@@ -1080,11 +1111,52 @@ def run_compare_summaries(
         if model_name == OLLAMA_MODEL:
             compare_title, compare_text = primary_title, primary_summary
         else:
-            compare_title, compare_text = ollama_generate_summary(
-                article["title"],
-                article_text,
-                model_name=model_name,
-            )
+            try:
+                compare_title, compare_text = ollama_generate_summary(
+                    article["title"],
+                    article_text,
+                    model_name=model_name,
+                    timeout_seconds=get_compare_timeout_seconds(),
+                )
+            except Exception as exc:
+                failed_models += 1
+                with db_connection() as conn:
+                    log_event(
+                        conn,
+                        article_id,
+                        "llm_compare_model_failed",
+                        {
+                            "session_id": session["id"],
+                            "model_name": model_name,
+                            "error": str(exc),
+                        },
+                    )
+                summaries_to_export.append(
+                    {
+                        "model_name": model_name,
+                        "status": "failed",
+                        "error": str(exc),
+                        "summary_title": "",
+                        "summary_text": "",
+                    }
+                )
+                completed_models += 1
+                update_app_state(
+                    "llm_compare_progress",
+                    {
+                        "session_id": int(session["id"]),
+                        "article_id": article_id,
+                        "article_title": article.get("title", ""),
+                        "completed_models": completed_models,
+                        "failed_models": failed_models,
+                        "total_models": total_models,
+                        "current_model": None,
+                        "status": "running" if completed_models < total_models else "completed",
+                        "started_at": started_at,
+                        "updated_at": utc_now_iso(),
+                    },
+                )
+                continue
 
         with db_connection() as conn:
             store_compare_result(
@@ -1108,6 +1180,7 @@ def run_compare_summaries(
         summaries_to_export.append(
             {
                 "model_name": model_name,
+                "status": "ok",
                 "summary_title": compare_title,
                 "summary_text": compare_text,
             }
@@ -1120,6 +1193,7 @@ def run_compare_summaries(
                 "article_id": article_id,
                 "article_title": article.get("title", ""),
                 "completed_models": completed_models,
+                "failed_models": failed_models,
                 "total_models": total_models,
                 "current_model": None,
                 "status": "running" if completed_models < total_models else "completed",
@@ -1138,6 +1212,7 @@ def ollama_generate_summary(
     article_title: str,
     article_text: str,
     model_name: Optional[str] = None,
+    timeout_seconds: Optional[int] = None,
 ) -> tuple[str, str]:
     prompt = f"""
 Du bist ein präziser Nachrichtenassistent.
@@ -1166,7 +1241,7 @@ ARTIKELTEXT:
 
     response = requests.post(
         f"{OLLAMA_BASE_URL}/api/generate",
-        timeout=180,
+        timeout=timeout_seconds or get_request_timeout_seconds(),
         json={
             "model": model_name or OLLAMA_MODEL,
             "prompt": prompt,
@@ -1614,18 +1689,8 @@ def process_summary_job(job: dict[str, Any]) -> None:
                 {"model": OLLAMA_MODEL, "final_url": final_url},
             )
 
-        try:
-            run_compare_summaries(job, article_text, final_url, summary_title, summary_text)
-        except Exception as compare_exc:  # pragma: no cover - runtime defensive
-            clear_compare_progress()
-            LOGGER.warning("LLM compare failed for article %s: %s", article_id, compare_exc)
-            with db_connection() as conn:
-                log_event(
-                    conn,
-                    article_id,
-                    "llm_compare_failed",
-                    {"error": str(compare_exc)},
-                )
+        if get_compare_enabled():
+            wake_compare_worker()
     except Exception as exc:  # pragma: no cover - runtime defensive
         LOGGER.warning("Summary job failed for article %s: %s", article_id, exc)
         with db_connection() as conn:
@@ -1655,6 +1720,83 @@ def summary_worker() -> None:
             STATE.stop_event.wait(SUMMARY_POLL_SECONDS)
             continue
         process_summary_job(job)
+
+
+def fetch_next_compare_job() -> Optional[dict[str, Any]]:
+    if not get_compare_enabled():
+        return None
+
+    session = current_compare_session()
+    if not session:
+        return None
+
+    models = json.loads(session["models_json"])
+    model_count = len(models)
+    with db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT a.*
+            FROM articles a
+            WHERE a.summary_status = 'ready'
+              AND a.summary_feedback = 'unreviewed'
+              AND (
+                SELECT COUNT(DISTINCT model_name)
+                FROM llm_compare_results
+                WHERE session_id = ? AND article_id = a.id
+              ) < ?
+            ORDER BY datetime(a.summarized_at) ASC, a.id ASC
+            LIMIT 1
+            """,
+            (session["id"], model_count),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def compare_worker() -> None:
+    LOGGER.info("LLM compare worker started")
+    while not STATE.stop_event.is_set():
+        if not get_compare_enabled():
+            if STATE.compare_event.wait(SUMMARY_POLL_SECONDS):
+                STATE.compare_event.clear()
+            if STATE.stop_event.is_set():
+                break
+            continue
+
+        job = fetch_next_compare_job()
+        if job is None:
+            if STATE.compare_event.wait(SUMMARY_POLL_SECONDS):
+                STATE.compare_event.clear()
+            if STATE.stop_event.is_set():
+                break
+            continue
+
+        try:
+            article_text = job.get("article_text") or ""
+            final_url = job.get("link_to_article") or job.get("rss_source_url") or ""
+            if not article_text and final_url:
+                article_text, final_url = fetch_and_extract_article_text(final_url)
+            if not article_text:
+                LOGGER.warning("LLM compare skipped article %s because article text is empty", job["id"])
+                STATE.compare_event.wait(SUMMARY_POLL_SECONDS)
+                STATE.compare_event.clear()
+                continue
+            run_compare_summaries(
+                job,
+                article_text,
+                final_url,
+                job.get("summary_title") or job.get("title") or "",
+                job.get("summary_text") or "",
+            )
+        except Exception as exc:  # pragma: no cover - runtime defensive
+            LOGGER.warning("LLM compare worker failed for article %s: %s", job.get("id"), exc)
+            with db_connection() as conn:
+                log_event(
+                    conn,
+                    int(job["id"]),
+                    "llm_compare_failed",
+                    {"error": str(exc)},
+                )
+            clear_compare_progress()
 
 
 def feed_refresh_worker() -> None:
@@ -2042,13 +2184,29 @@ def llm_compare_status() -> dict[str, Any]:
                 """,
                 (session["id"], total_models),
             ).fetchone()
+            pending_articles_row = conn.execute(
+                """
+                SELECT COUNT(*) AS pending_articles
+                FROM articles a
+                WHERE a.summary_status = 'ready'
+                  AND a.summary_feedback = 'unreviewed'
+                  AND (
+                    SELECT COUNT(DISTINCT model_name)
+                    FROM llm_compare_results
+                    WHERE session_id = ? AND article_id = a.id
+                  ) < ?
+                """,
+                (session["id"], total_models),
+            ).fetchone()
 
         result_count = int(rows["result_count"] if rows else 0)
         article_count = int(rows["article_count"] if rows else 0)
         completed_articles = int(completed_articles_row["completed_articles"] if completed_articles_row else 0)
+        pending_articles = int(pending_articles_row["pending_articles"] if pending_articles_row else 0)
         session_stats = {
             "article_count": article_count,
             "completed_articles": completed_articles,
+            "pending_articles": pending_articles,
             "articles_in_progress": 1 if progress and progress.get("session_id") == session["id"] else 0,
             "result_count": result_count,
             "total_models": total_models,
@@ -2152,6 +2310,7 @@ def api_status():
                 "feed_count": len(RSS_FEED_URLS),
                 "llm_compare_models": get_compare_models(),
                 "llm_compare_export_dir": str(COMPARE_EXPORT_DIR),
+                "llm_compare_timeout_seconds": get_compare_timeout_seconds(),
             },
         }
     )
@@ -2290,6 +2449,7 @@ def api_model_train():
 def start_background_threads() -> list[threading.Thread]:
     threads = [
         threading.Thread(target=summary_worker, name="summary-worker", daemon=True),
+        threading.Thread(target=compare_worker, name="llm-compare-worker", daemon=True),
         threading.Thread(target=feed_refresh_worker, name="feed-refresh-worker", daemon=True),
     ]
     for thread in threads:
