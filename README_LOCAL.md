@@ -98,6 +98,10 @@ LOCAL_NEWS_REFRESH_SECONDS=300
 - `Inbox-Reset` archiviert alle aktuell offenen Feed-Einträge, ohne sie aus der Datenbank zu löschen.
 - `LLM Compare` erzeugt pro aktivierter Session eine eigene Markdown-Datei in `compare_exports/`.
 - Wenn ein Artikel wegen Paywall, Popup oder Blockade nicht sauber extrahiert werden kann, zeigt die UI nur den generischen Zustand `Not available`.
+- `Not available`-Fälle erscheinen in der Summary-Liste, damit der Originalartikel bei Bedarf noch geöffnet werden kann.
+- hängengebliebene `processing`-Summaries werden nach einem Recovery-Timeout automatisch auf `failed` gesetzt.
+- Der Feed blendet sehr ähnliche Meldungen aus anderen Quellen standardmäßig zusammen und zeigt nur einen Hauptartikel pro Story.
+- Die Ähnlichkeitsgruppierung läuft als Hintergrund-Snapshot; der Feed-Request liest diesen Snapshot nur noch aus und bleibt dadurch beim Reload deutlich schneller.
 
 ## LLM Compare
 
@@ -108,6 +112,7 @@ Wenn `LLM Compare` in `Model Ops` eingeschaltet wird:
 - wird pro aktivierter Session genau eine Exportdatei in `compare_exports/` aufgebaut
 - zeigt die UI zusätzlich laufenden Compare-Fortschritt im Header, in der Summary-Queue und in `Model Ops`
 - `Model Ops` zeigt zusätzlich einen Compare-Diagnostics-Block mit letztem Status, letzter Dauer und letztem Fehler pro Modell
+- `Model Ops` zeigt bei trainierten Targets zusätzlich einen direkten Vorher/Nachher-Vergleich der letzten Metriken (`Accuracy`, `Precision`, `Recall`, `F1`)
 - der Compare-Bereich in `Model Ops` trennt Primär-Summary-Zahlen der aktiven Session sauber von Compare-Modellläufen
 - Primär-Fehler werden dort grob in `Quelle/Text` versus `Ollama` getrennt, Compare-Fehler separat als Modelllauf-Fehler gezählt
 - der sichtbare Hauptstatus in `Model Ops` ist bewusst in Klartext formuliert; technische Zähler liegen nur noch unter `Technische Details`
@@ -126,3 +131,27 @@ Die Datei ist bewusst frontier-modell-freundlich formatiert:
 - darin URL, Titel, Quelle und die Summary jedes beteiligten Modells
 
 Der Compare-Modus ist absichtlich optional, weil er die Summary-Laufzeit deutlich erhöht.
+
+## Ähnliche Feed-Meldungen
+
+Der Feed gruppiert sehr ähnliche Headlines konservativ, damit dieselbe Story nicht mehrfach aus verschiedenen Quellen auftaucht.
+
+Verhalten:
+
+- pro Story bleibt nur ein sichtbarer Hauptartikel im Feed
+- der Feed zeigt bei Bedarf `+N ähnliche Meldungen`
+- oben zeigt die UI zusätzlich, wie viele ähnliche Meldungen aktuell in wie vielen Gruppen unterdrückt werden
+- über `Inbox kompaktieren` lässt sich die aktuelle Inbox optional einmalig konservativ aufräumen
+- wenn du den Hauptartikel `Weiter` klickst oder `Zusammenfassen` wählst, werden die sehr ähnlichen Pending-Dubletten ebenfalls aus dem aktiven Feed entfernt
+- nach einem bereits getroffenen Entscheid werden später eingehende, sehr ähnliche Nachzügler automatisch aus dem Feed genommen
+
+Die Logik ist bewusst konservativ:
+
+- nur sehr ähnliche Headlines werden zusammengezogen
+- verwandte Follow-ups mit neuem Winkel sollen weiterhin durchkommen
+
+Performance:
+
+- die Similarity-Bildung über viele Pending-Artikel läuft nicht mehr direkt im Feed-Request
+- stattdessen wird ein Snapshot im Hintergrund vorbereitet und in `app_state` gespeichert
+- der Feed fällt nur dann kurzfristig auf einen ungruppierten Zustand zurück, wenn noch kein aktueller Snapshot vorhanden ist

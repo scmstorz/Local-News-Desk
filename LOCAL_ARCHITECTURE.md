@@ -20,6 +20,7 @@ Die bestehende `claude-news-app.html` bleibt unverändert als Referenz erhalten.
 - Start immer im Feed
 - linearer schneller Flow
 - sichtbar: `Titel`, `Quelle`, `Zeit`
+- sehr ähnliche Meldungen aus mehreren Quellen werden zu einer Story zusammengezogen
 - Aktionen:
   - `Weiter` -> negatives Label
   - `Zusammenfassen` -> positives Label
@@ -34,6 +35,7 @@ Die bestehende `claude-news-app.html` bleibt unverändert als Referenz erhalten.
 - Aktionen:
   - `Interessant`
   - `Doch nicht interessant`
+- fehlgeschlagene Summaries erscheinen ebenfalls als `Not available` im Review-Flow
 
 ### LLM Compare
 
@@ -119,6 +121,7 @@ Gründe:
 - schneller Feed-Flow
 - UI blockiert nicht
 - Queue ist sichtbar und nachvollziehbar
+- hängengebliebene `processing`-Jobs werden per Recovery-Timeout automatisch freigeräumt
 
 ### 5. Optionaler Mehrmodell-Vergleich
 
@@ -205,6 +208,33 @@ Gründe:
 - Metriken allein sind im Alltag zu abstrakt
 - die Entscheidung "jetzt retrainen oder nicht" soll direkt lesbar sein
 - der aktuelle Produktstatus des Modells wird klarer
+- der letzte Trainingslauf ist direkt gegen den vorherigen Lauf vergleichbar
+
+### 9. Near-Duplicate-Filter im Feed
+
+Der Feed soll dieselbe Story nicht mehrfach aus verschiedenen Quellen zeigen, darf aber echte Follow-ups nicht zu aggressiv wegfiltern.
+
+Verhalten:
+
+- sehr ähnliche Pending-Headlines werden nur noch als ein sichtbarer Hauptartikel gezeigt
+- der Hauptartikel trägt optional einen Zähler wie `+3 ähnliche Meldungen`
+- die UI zeigt zusätzlich, wie viele ähnliche Meldungen gerade in wie vielen Gruppen unterdrückt werden
+- ein manueller Feed-Job `Inbox kompaktieren` kann die aktuelle Inbox einmalig mit derselben Logik aufräumen
+- sobald der Hauptartikel bearbeitet wird, werden die sehr ähnlichen Pending-Dubletten ebenfalls aus dem aktiven Feed entfernt
+- neue Nachzügler, die sehr ähnlich zu einer bereits bearbeiteten Story sind, werden beim nächsten Feed-Refresh automatisch entfernt
+
+Technik:
+
+- konservative Titel-Ähnlichkeit auf Basis normalisierter Tokens und String-Ähnlichkeit
+- Zeitfenster von 48 Stunden
+- Gruppierung nur bei hoher Ähnlichkeit
+- die aufwendige Similarity-Bildung läuft als Hintergrund-Snapshot und nicht mehr im Hot Path des Feed-Requests
+
+Gründe:
+
+- weniger Feed-Rauschen bei großen Storys
+- keine Datenlöschung
+- echte Folgeberichte sollen möglichst weiter sichtbar bleiben
 
 ## Technologieentscheidungen
 
@@ -346,7 +376,7 @@ Im Feed wird von Anfang an sichtbar:
 Zusätzlich gibt es den Toggle:
 
 - `Alle`
-- `Nur zeigenswert`
+- `Empfohlen`
 
 Grund:
 

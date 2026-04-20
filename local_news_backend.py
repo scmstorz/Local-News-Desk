@@ -24,7 +24,8 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -98,6 +99,18 @@ DEFAULT_SETTINGS = {
         "https://news.google.com/rss/search?q=machine+learning+when:2d&hl=en-US&gl=US&ceid=US:en",
     ],
 }
+
+TITLE_SIMILARITY_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "at", "by", "from",
+    "with", "without", "after", "before", "over", "under", "into", "about", "than",
+    "is", "are", "was", "were", "be", "being", "been", "as", "it", "its", "their",
+    "his", "her", "they", "them", "this", "that", "these", "those", "new", "news",
+    "report", "reports", "reportedly", "update", "updates", "says", "say", "said",
+    "using", "used", "use", "will", "would", "could", "should", "how", "why", "what",
+    "when", "where", "who", "which", "you", "your",
+}
+SIMILARITY_LOOKBACK_HOURS = 48
+SUMMARY_PROCESSING_STALE_MINUTES = 20
 
 
 def merge_settings(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -297,6 +310,10 @@ class RuntimeState:
         self.model_lock = threading.Lock()
         self.ollama_lock = threading.Lock()
         self.compare_event = threading.Event()
+        self.feed_similarity_lock = threading.Lock()
+        self.feed_similarity_snapshot: dict[str, Any] = {}
+        self.feed_similarity_dirty = True
+        self.feed_similarity_building = False
         self.models: dict[str, dict[str, Any]] = {}
 
 
@@ -321,13 +338,17 @@ def ensure_dirs() -> None:
 
 @contextmanager
 def db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=10,
+        check_same_thread=False,
+        isolation_level=None,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 10000")
     try:
         yield conn
-        conn.commit()
     finally:
         conn.close()
 
@@ -335,6 +356,7 @@ def db_connection() -> sqlite3.Connection:
 def init_db() -> None:
     ensure_dirs()
     with db_connection() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA_SQL)
         migrate_db(conn)
 
@@ -386,6 +408,456 @@ def format_source_label(url: str) -> str:
     if host.startswith("www."):
         host = host[4:]
     return host or "Unknown source"
+
+
+def normalize_title_for_similarity(title: str) -> str:
+    text = html_lib.unescape(title or "").strip().lower()
+    if " - " in text:
+        head, tail = text.rsplit(" - ", 1)
+        if len(head.split()) >= 4 and 1 <= len(tail.split()) <= 6:
+            text = head
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def build_title_signature(title: str) -> dict[str, Any]:
+    normalized = normalize_title_for_similarity(title)
+    raw_tokens = [token for token in normalized.split() if len(token) >= 2]
+    filtered_tokens = [
+        token
+        for token in raw_tokens
+        if len(token) >= 3 and token not in TITLE_SIMILARITY_STOPWORDS
+    ]
+    tokens = filtered_tokens or raw_tokens
+    token_set = set(tokens)
+    long_tokens = {token for token in token_set if len(token) >= 5 and not token.isdigit()}
+    numbers = {token for token in token_set if any(char.isdigit() for char in token)}
+    sequence_text = " ".join(tokens) if tokens else normalized
+    return {
+        "normalized": normalized,
+        "tokens": token_set,
+        "long_tokens": long_tokens,
+        "numbers": numbers,
+        "sequence_text": sequence_text,
+    }
+
+
+def title_similarity_metrics(title_a: str, title_b: str) -> dict[str, Any]:
+    signature_a = build_title_signature(title_a)
+    signature_b = build_title_signature(title_b)
+
+    if not signature_a["normalized"] or not signature_b["normalized"]:
+        return {"similar": False, "score": 0.0}
+
+    if signature_a["normalized"] == signature_b["normalized"]:
+        return {
+            "similar": True,
+            "score": 1.0,
+            "overlap": 1.0,
+            "jaccard": 1.0,
+            "sequence": 1.0,
+        }
+
+    tokens_a = signature_a["tokens"]
+    tokens_b = signature_b["tokens"]
+    if not tokens_a or not tokens_b:
+        return {"similar": False, "score": 0.0}
+
+    intersection = tokens_a & tokens_b
+    overlap = len(intersection) / max(1, min(len(tokens_a), len(tokens_b)))
+    jaccard = len(intersection) / max(1, len(tokens_a | tokens_b))
+    sequence = SequenceMatcher(None, signature_a["sequence_text"], signature_b["sequence_text"]).ratio()
+    long_overlap = len(signature_a["long_tokens"] & signature_b["long_tokens"])
+    numbers_conflict = bool(
+        signature_a["numbers"] and signature_b["numbers"] and signature_a["numbers"] != signature_b["numbers"]
+    )
+    score = round((0.5 * overlap) + (0.2 * jaccard) + (0.3 * sequence), 4)
+
+    similar = False
+    if overlap >= 0.9 and len(intersection) >= 3:
+        similar = True
+    elif not numbers_conflict and overlap >= 0.74 and long_overlap >= 2 and (jaccard >= 0.45 or sequence >= 0.74):
+        similar = True
+    elif not numbers_conflict and overlap >= 0.64 and long_overlap >= 3 and sequence >= 0.84:
+        similar = True
+
+    return {
+        "similar": similar,
+        "score": score,
+        "overlap": round(overlap, 4),
+        "jaccard": round(jaccard, 4),
+        "sequence": round(sequence, 4),
+    }
+
+
+def articles_within_similarity_window(article_a: dict[str, Any], article_b: dict[str, Any]) -> bool:
+    published_a = parse_datetime(article_a.get("published_at") or article_a.get("created_at"))
+    published_b = parse_datetime(article_b.get("published_at") or article_b.get("created_at"))
+    return abs((published_a - published_b).total_seconds()) <= (SIMILARITY_LOOKBACK_HOURS * 3600)
+
+
+def summarize_pending_similarity(rows: list[sqlite3.Row | dict[str, Any]]) -> dict[str, Any]:
+    items = [row if isinstance(row, dict) else row_to_dict(row) for row in rows]
+    sorted_items = sorted(
+        items,
+        key=lambda item: (
+            parse_datetime(item.get("published_at")),
+            int(item.get("id", 0)),
+        ),
+        reverse=True,
+    )
+
+    clusters: list[dict[str, Any]] = []
+    for item in sorted_items:
+        best_cluster: Optional[dict[str, Any]] = None
+        best_score = 0.0
+        for cluster in clusters:
+            canonical = cluster["canonical"]
+            if not articles_within_similarity_window(item, canonical):
+                continue
+            metrics = title_similarity_metrics(item.get("title", ""), canonical.get("title", ""))
+            if metrics["similar"] and metrics["score"] > best_score:
+                best_cluster = cluster
+                best_score = metrics["score"]
+        if best_cluster:
+            best_cluster["members"].append(item)
+        else:
+            clusters.append({"canonical": item, "members": [item]})
+
+    visible_items: list[dict[str, Any]] = []
+    for cluster in clusters:
+        canonical = dict(cluster["canonical"])
+        members = cluster["members"]
+        canonical["similar_count"] = max(len(members) - 1, 0)
+        canonical["similar_sources"] = sorted(
+            {
+                member.get("source_label", "")
+                for member in members[1:]
+                if member.get("source_label")
+            }
+        )
+        visible_items.append(canonical)
+
+    similar_group_count = sum(1 for cluster in clusters if len(cluster["members"]) > 1)
+    similar_hidden_count = sum(max(len(cluster["members"]) - 1, 0) for cluster in clusters)
+    return {
+        "visible_items": visible_items,
+        "pending_total": len(items),
+        "visible_total": len(visible_items),
+        "similar_group_count": similar_group_count,
+        "similar_hidden_count": similar_hidden_count,
+    }
+
+
+def build_visible_pending_feed_items(rows: list[sqlite3.Row | dict[str, Any]]) -> list[dict[str, Any]]:
+    return summarize_pending_similarity(rows)["visible_items"]
+
+
+def build_feed_similarity_snapshot(rows: list[sqlite3.Row | dict[str, Any]]) -> dict[str, Any]:
+    summary = summarize_pending_similarity(rows)
+    visible_items = summary["visible_items"]
+    return {
+        "pending_total": summary["pending_total"],
+        "visible_total": summary["visible_total"],
+        "similar_group_count": summary["similar_group_count"],
+        "similar_hidden_count": summary["similar_hidden_count"],
+        "visible_article_ids": [int(item["id"]) for item in visible_items],
+        "similar_count_by_id": {
+            str(int(item["id"])): int(item.get("similar_count", 0))
+            for item in visible_items
+            if item.get("similar_count", 0)
+        },
+        "updated_at": utc_now_iso(),
+    }
+
+
+def trigger_feed_similarity_refresh() -> None:
+    with STATE.feed_similarity_lock:
+        STATE.feed_similarity_dirty = True
+
+
+def current_feed_similarity_snapshot() -> dict[str, Any]:
+    with STATE.feed_similarity_lock:
+        return dict(STATE.feed_similarity_snapshot)
+
+
+def update_feed_similarity_snapshot(rows: Optional[list[sqlite3.Row | dict[str, Any]]] = None) -> dict[str, Any]:
+    pending_rows = rows if rows is not None else fetch_pending_feed_articles()
+    snapshot = build_feed_similarity_snapshot(pending_rows)
+    with STATE.feed_similarity_lock:
+        STATE.feed_similarity_snapshot = snapshot
+        STATE.feed_similarity_dirty = False
+        STATE.feed_similarity_building = False
+    return snapshot
+
+
+def _feed_similarity_build_loop() -> None:
+    while not STATE.stop_event.is_set():
+        try:
+            update_feed_similarity_snapshot()
+        except Exception as exc:  # pragma: no cover - runtime defensive
+            LOGGER.warning("Feed similarity refresh failed: %s", exc)
+        with STATE.feed_similarity_lock:
+            if not STATE.feed_similarity_dirty:
+                STATE.feed_similarity_building = False
+                return
+            STATE.feed_similarity_dirty = False
+
+
+def archive_pending_duplicates_for_article(
+    conn: sqlite3.Connection,
+    article: dict[str, Any],
+    triggering_decision: str,
+) -> list[int]:
+    cutoff = (utc_now() - timedelta(hours=SIMILARITY_LOOKBACK_HOURS)).isoformat()
+    candidates = conn.execute(
+        """
+        SELECT *
+        FROM articles
+        WHERE feed_decision = 'pending'
+          AND id != ?
+          AND datetime(published_at) >= datetime(?)
+        ORDER BY datetime(published_at) DESC, id DESC
+        """,
+        (article["id"], cutoff),
+    ).fetchall()
+
+    duplicate_ids: list[int] = []
+    for candidate in candidates:
+        candidate_dict = row_to_dict(candidate)
+        if not articles_within_similarity_window(article, candidate_dict):
+            continue
+        metrics = title_similarity_metrics(article.get("title", ""), candidate_dict.get("title", ""))
+        if metrics["similar"]:
+            duplicate_ids.append(int(candidate_dict["id"]))
+
+    if not duplicate_ids:
+        return []
+
+    now = utc_now_iso()
+    placeholders = ",".join("?" for _ in duplicate_ids)
+    conn.execute(
+        f"""
+        UPDATE articles
+        SET feed_decision = 'archived',
+            feed_decision_at = ?,
+            updated_at = ?
+        WHERE id IN ({placeholders})
+        """,
+        (now, now, *duplicate_ids),
+    )
+
+    for duplicate_id in duplicate_ids:
+        log_event(
+            conn,
+            duplicate_id,
+            "feed_auto_deduplicated",
+            {
+                "canonical_article_id": article["id"],
+                "triggering_decision": triggering_decision,
+            },
+        )
+
+    return duplicate_ids
+
+
+def auto_archive_pending_duplicates_of_handled_articles(conn: sqlite3.Connection) -> int:
+    cutoff = (utc_now() - timedelta(hours=SIMILARITY_LOOKBACK_HOURS)).isoformat()
+    handled_rows = conn.execute(
+        """
+        SELECT *
+        FROM articles
+        WHERE feed_decision IN ('skip', 'summarize')
+          AND feed_decision_at IS NOT NULL
+          AND datetime(feed_decision_at) >= datetime(?)
+        ORDER BY datetime(feed_decision_at) DESC, id DESC
+        """,
+        (cutoff,),
+    ).fetchall()
+    pending_rows = conn.execute(
+        """
+        SELECT *
+        FROM articles
+        WHERE feed_decision = 'pending'
+          AND datetime(published_at) >= datetime(?)
+        ORDER BY datetime(published_at) DESC, id DESC
+        """,
+        (cutoff,),
+    ).fetchall()
+
+    handled_articles = [row_to_dict(row) for row in handled_rows]
+    pending_articles = [row_to_dict(row) for row in pending_rows]
+    archive_map: dict[int, int] = {}
+
+    for pending_article in pending_articles:
+        for handled_article in handled_articles:
+            if not articles_within_similarity_window(pending_article, handled_article):
+                continue
+            metrics = title_similarity_metrics(pending_article.get("title", ""), handled_article.get("title", ""))
+            if metrics["similar"] and metrics["score"] >= 0.82:
+                archive_map[int(pending_article["id"])] = int(handled_article["id"])
+                break
+
+    if not archive_map:
+        return 0
+
+    now = utc_now_iso()
+    archive_ids = list(archive_map.keys())
+    placeholders = ",".join("?" for _ in archive_ids)
+    conn.execute(
+        f"""
+        UPDATE articles
+        SET feed_decision = 'archived',
+            feed_decision_at = ?,
+            updated_at = ?
+        WHERE id IN ({placeholders})
+        """,
+        (now, now, *archive_ids),
+    )
+
+    for article_id, canonical_article_id in archive_map.items():
+        log_event(
+            conn,
+            article_id,
+            "feed_auto_deduplicated_to_handled_story",
+            {"canonical_article_id": canonical_article_id},
+        )
+
+    return len(archive_ids)
+
+
+def deduplicate_current_pending_feed() -> dict[str, Any]:
+    now = utc_now_iso()
+    with db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM articles
+            WHERE feed_decision = 'pending'
+            ORDER BY datetime(published_at) DESC, id DESC
+            """
+        ).fetchall()
+        clusters = []
+        items = [row_to_dict(row) for row in rows]
+        sorted_items = sorted(
+            items,
+            key=lambda item: (
+                parse_datetime(item.get("published_at")),
+                int(item.get("id", 0)),
+            ),
+            reverse=True,
+        )
+        for item in sorted_items:
+            best_cluster: Optional[dict[str, Any]] = None
+            best_score = 0.0
+            for cluster in clusters:
+                canonical = cluster["canonical"]
+                if not articles_within_similarity_window(item, canonical):
+                    continue
+                metrics = title_similarity_metrics(item.get("title", ""), canonical.get("title", ""))
+                if metrics["similar"] and metrics["score"] > best_score:
+                    best_cluster = cluster
+                    best_score = metrics["score"]
+            if best_cluster:
+                best_cluster["members"].append(item)
+            else:
+                clusters.append({"canonical": item, "members": [item]})
+
+        before_pending = len(items)
+        before_visible = len(clusters)
+        archive_map: dict[int, int] = {}
+        for cluster in clusters:
+            canonical_id = int(cluster["canonical"]["id"])
+            for member in cluster["members"][1:]:
+                archive_map[int(member["id"])] = canonical_id
+
+        if not archive_map:
+            trigger_feed_similarity_refresh()
+            ensure_feed_similarity_snapshot_async()
+            return {
+                "status": "ok",
+                "archived_count": 0,
+                "cluster_count": len(clusters),
+                "before_pending": before_pending,
+                "after_pending": before_pending,
+                "before_visible": before_visible,
+                "after_visible": before_visible,
+                "processed_at": now,
+            }
+
+        archive_ids = list(archive_map.keys())
+        placeholders = ",".join("?" for _ in archive_ids)
+        conn.execute(
+            f"""
+            UPDATE articles
+            SET feed_decision = 'archived',
+                feed_decision_at = ?,
+                updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (now, now, *archive_ids),
+        )
+        for article_id, canonical_article_id in archive_map.items():
+            log_event(
+                conn,
+                article_id,
+                "feed_manual_deduplicated",
+                {"canonical_article_id": canonical_article_id},
+            )
+
+    trigger_feed_similarity_refresh()
+    ensure_feed_similarity_snapshot_async()
+    return {
+        "status": "ok",
+        "archived_count": len(archive_map),
+        "cluster_count": len(clusters),
+        "before_pending": before_pending,
+        "after_pending": before_pending - len(archive_map),
+        "before_visible": before_visible,
+        "after_visible": before_visible,
+        "processed_at": now,
+    }
+
+
+def fetch_visible_pending_feed_articles_from_snapshot() -> list[dict[str, Any]]:
+    snapshot = current_feed_similarity_snapshot()
+    visible_ids = [int(article_id) for article_id in snapshot.get("visible_article_ids", [])]
+    similar_count_by_id = snapshot.get("similar_count_by_id", {}) or {}
+    if not visible_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in visible_ids)
+    with db_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM articles
+            WHERE feed_decision = 'pending'
+              AND id IN ({placeholders})
+            ORDER BY datetime(published_at) DESC, id DESC
+            """,
+            tuple(visible_ids),
+        ).fetchall()
+
+    items = [row_to_dict(row) for row in rows]
+    for item in items:
+        item["similar_count"] = int(similar_count_by_id.get(str(int(item["id"])), 0))
+    return items
+
+
+def ensure_feed_similarity_snapshot_async() -> None:
+    with STATE.feed_similarity_lock:
+        needs_build = STATE.feed_similarity_dirty or not STATE.feed_similarity_snapshot
+        if not needs_build or STATE.feed_similarity_building:
+            return
+        STATE.feed_similarity_building = True
+        STATE.feed_similarity_dirty = False
+    threading.Thread(
+        target=_feed_similarity_build_loop,
+        name="feed-similarity-build",
+        daemon=True,
+    ).start()
 
 
 def parse_legacy_timestamp(value: Any) -> str:
@@ -1384,6 +1856,21 @@ def latest_model_run(target: str) -> Optional[dict[str, Any]]:
     return row_to_dict(row) if row else None
 
 
+def previous_model_run(target: str) -> Optional[dict[str, Any]]:
+    with db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM model_runs
+            WHERE target = ?
+            ORDER BY datetime(trained_at) DESC, id DESC
+            LIMIT 1 OFFSET 1
+            """,
+            (target,),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
 def load_persisted_models() -> None:
     with STATE.model_lock:
         STATE.models.clear()
@@ -1404,7 +1891,22 @@ def get_loaded_model(target: str) -> Optional[dict[str, Any]]:
         return STATE.models.get(target)
 
 
-def predict_feed_rows(rows: list[sqlite3.Row]) -> tuple[list[dict[str, Any]], Optional[int]]:
+def build_cached_feed_prediction(item: dict[str, Any], run_id: int) -> Optional[dict[str, Any]]:
+    probability = item.get("predicted_probability")
+    recommendation = item.get("predicted_recommendation")
+    if item.get("prediction_model_run_id") != run_id:
+        return None
+    if probability is None or recommendation is None:
+        return None
+    return {
+        "available": True,
+        "recommended": bool(recommendation),
+        "probability": round(float(probability), 4),
+        "run_id": run_id,
+    }
+
+
+def predict_feed_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[list[dict[str, Any]], Optional[int]]:
     if not rows:
         return [], None
 
@@ -1412,7 +1914,7 @@ def predict_feed_rows(rows: list[sqlite3.Row]) -> tuple[list[dict[str, Any]], Op
     if not artifact:
         items = []
         for row in rows:
-            item = row_to_dict(row)
+            item = row if isinstance(row, dict) else row_to_dict(row)
             item["prediction"] = {
                 "available": False,
                 "recommended": None,
@@ -1423,19 +1925,27 @@ def predict_feed_rows(rows: list[sqlite3.Row]) -> tuple[list[dict[str, Any]], Op
         return items, None
 
     pipeline: Pipeline = artifact["pipeline"]
-    features = [build_feature_text("feed_recommendation", row) for row in rows]
-    probabilities = pipeline.predict_proba(features)[:, 1]
-    items = []
-    for row, probability in zip(rows, probabilities):
-        item = row_to_dict(row)
-        recommended = bool(probability >= artifact["threshold"])
-        item["prediction"] = {
-            "available": True,
-            "recommended": recommended,
-            "probability": round(float(probability), 4),
-            "run_id": artifact["run_id"],
-        }
-        items.append(item)
+    items = [row if isinstance(row, dict) else row_to_dict(row) for row in rows]
+    stale_items: list[dict[str, Any]] = []
+    for item in items:
+        cached_prediction = build_cached_feed_prediction(item, artifact["run_id"])
+        if cached_prediction is not None:
+            item["prediction"] = cached_prediction
+        else:
+            stale_items.append(item)
+
+    if stale_items:
+        features = [build_feature_text("feed_recommendation", row) for row in stale_items]
+        probabilities = pipeline.predict_proba(features)[:, 1]
+        for item, probability in zip(stale_items, probabilities):
+            recommended = bool(probability >= artifact["threshold"])
+            item["prediction"] = {
+                "available": True,
+                "recommended": recommended,
+                "probability": round(float(probability), 4),
+                "run_id": artifact["run_id"],
+            }
+
     return items, artifact["run_id"]
 
 
@@ -1476,15 +1986,18 @@ def refresh_feeds() -> dict[str, Any]:
     started_at = utc_now_iso()
     try:
         LOGGER.info("Starting RSS refresh")
-        with db_connection() as conn:
-            for feed_url in RSS_FEED_URLS:
-                try:
-                    feed = feedparser.parse(feed_url)
-                except Exception as exc:
-                    feed_errors.append(f"{feed_url}: {exc}")
-                    LOGGER.warning("Could not parse feed %s: %s", feed_url, exc)
-                    continue
+        parsed_feeds: list[tuple[str, Any]] = []
+        for feed_url in RSS_FEED_URLS:
+            try:
+                feed = feedparser.parse(feed_url)
+                parsed_feeds.append((feed_url, feed))
+            except Exception as exc:
+                feed_errors.append(f"{feed_url}: {exc}")
+                LOGGER.warning("Could not parse feed %s: %s", feed_url, exc)
+                continue
 
+        with db_connection() as conn:
+            for feed_url, feed in parsed_feeds:
                 for entry in feed.entries:
                     guid = entry.get("id") or entry.get("guid") or entry.get("link")
                     if not guid:
@@ -1557,15 +2070,20 @@ def refresh_feeds() -> dict[str, Any]:
                     )
                     inserted += 1
 
+            deduplicated = auto_archive_pending_duplicates_of_handled_articles(conn)
+
         result = {
             "status": "ok",
             "inserted": inserted,
             "updated": updated,
+            "deduplicated": deduplicated,
             "errors": feed_errors,
             "started_at": started_at,
             "finished_at": utc_now_iso(),
         }
         update_app_state("last_feed_refresh", result)
+        trigger_feed_similarity_refresh()
+        ensure_feed_similarity_snapshot_async()
         LOGGER.info("RSS refresh finished: %s inserted, %s updated", inserted, updated)
         return result
     finally:
@@ -1626,7 +2144,15 @@ def set_feed_decision(article_id: int, decision: str) -> dict[str, Any]:
                 "new_feed_decision": decision,
             },
         )
-    return {"status": "ok", "article_id": article_id, "decision": decision}
+        deduplicated_ids = archive_pending_duplicates_for_article(conn, row_dict, decision)
+    trigger_feed_similarity_refresh()
+    ensure_feed_similarity_snapshot_async()
+    return {
+        "status": "ok",
+        "article_id": article_id,
+        "decision": decision,
+        "deduplicated_count": len(deduplicated_ids),
+    }
 
 
 def archive_pending_feed() -> dict[str, Any]:
@@ -1651,6 +2177,8 @@ def archive_pending_feed() -> dict[str, Any]:
                 "archived_at": now,
             }
             update_app_state("last_feed_reset", result)
+            trigger_feed_similarity_refresh()
+            ensure_feed_similarity_snapshot_async()
             return result
 
         conn.execute(
@@ -1678,11 +2206,13 @@ def archive_pending_feed() -> dict[str, Any]:
         "archived_at": now,
     }
     update_app_state("last_feed_reset", result)
+    trigger_feed_similarity_refresh()
+    ensure_feed_similarity_snapshot_async()
     return result
 
 
 def set_summary_feedback(article_id: int, feedback: str) -> dict[str, Any]:
-    if feedback not in {"interesting", "not_interesting"}:
+    if feedback not in {"interesting", "not_interesting", "not_available"}:
         raise ValueError("Unsupported summary feedback")
     with db_connection() as conn:
         row = conn.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
@@ -1703,7 +2233,50 @@ def set_summary_feedback(article_id: int, feedback: str) -> dict[str, Any]:
     return {"status": "ok", "article_id": article_id, "feedback": feedback}
 
 
+def recover_stale_processing_jobs() -> int:
+    cutoff = (utc_now() - timedelta(minutes=SUMMARY_PROCESSING_STALE_MINUTES)).isoformat()
+    with db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM articles
+            WHERE summary_status = 'processing'
+              AND datetime(updated_at) < datetime(?)
+            ORDER BY id
+            """,
+            (cutoff,),
+        ).fetchall()
+        if not rows:
+            return 0
+
+        stale_ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in stale_ids)
+        now = utc_now_iso()
+        conn.execute(
+            f"""
+            UPDATE articles
+            SET summary_status = 'failed',
+                updated_at = ?,
+                last_error = CASE
+                    WHEN last_error = '' THEN 'Summary processing exceeded the recovery timeout.'
+                    ELSE last_error
+                END
+            WHERE id IN ({placeholders})
+            """,
+            (now, *stale_ids),
+        )
+        for article_id in stale_ids:
+            log_event(
+                conn,
+                article_id,
+                "summary_processing_recovered",
+                {"recovery": "stale_to_failed", "timeout_minutes": SUMMARY_PROCESSING_STALE_MINUTES},
+            )
+    return len(stale_ids)
+
+
 def get_next_summary_job() -> Optional[dict[str, Any]]:
+    recover_stale_processing_jobs()
     with db_connection() as conn:
         row = conn.execute(
             """
@@ -1913,15 +2486,24 @@ def fetch_pending_feed_articles() -> list[sqlite3.Row]:
     return list(rows)
 
 
-def fetch_ready_summaries() -> list[dict[str, Any]]:
+def fetch_visible_pending_feed_articles() -> list[dict[str, Any]]:
+    return build_visible_pending_feed_items(fetch_pending_feed_articles())
+
+
+def fetch_review_summaries() -> list[dict[str, Any]]:
     with db_connection() as conn:
         rows = conn.execute(
             """
             SELECT *
             FROM articles
-            WHERE summary_status = 'ready'
-              AND summary_feedback = 'unreviewed'
-            ORDER BY datetime(summarized_at) DESC, id DESC
+            WHERE (
+                summary_status = 'ready'
+                AND summary_feedback = 'unreviewed'
+            ) OR (
+                summary_status = 'failed'
+                AND summary_feedback = 'unreviewed'
+            )
+            ORDER BY datetime(COALESCE(summarized_at, summary_requested_at, updated_at)) DESC, id DESC
             """
         ).fetchall()
     return [row_to_dict(row) for row in rows]
@@ -2171,7 +2753,7 @@ def train_model(target: str) -> dict[str, Any]:
         STATE.models[target] = artifact
 
     if target == "feed_recommendation":
-        rows_for_prediction = fetch_pending_feed_articles()
+        rows_for_prediction = fetch_visible_pending_feed_articles()
         predicted_rows, used_run_id = predict_feed_rows(rows_for_prediction)
         update_cached_feed_predictions(predicted_rows, used_run_id)
 
@@ -2209,6 +2791,7 @@ def serialize_article_for_feed(item: dict[str, Any]) -> dict[str, Any]:
         "published_at": item["published_at"],
         "link_to_article": item["link_to_article"],
         "feed_decision": item["feed_decision"],
+        "similar_count": item.get("similar_count", 0),
         "prediction": item["prediction"],
     }
 
@@ -2219,6 +2802,7 @@ def serialize_summary(item: dict[str, Any]) -> dict[str, Any]:
         "title": item["title"],
         "summary_title": item["summary_title"],
         "summary_text": item["summary_text"],
+        "summary_status": item["summary_status"],
         "source_label": item["source_label"],
         "source_url": item["source_url"],
         "published_at": item["published_at"],
@@ -2229,11 +2813,14 @@ def serialize_summary(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def summary_counts() -> dict[str, int]:
+    ready = count_rows("summary_status = 'ready' AND summary_feedback = 'unreviewed'")
+    failed = count_rows("summary_status = 'failed' AND summary_feedback = 'unreviewed'")
     return {
         "queued": count_rows("summary_status = 'queued'"),
         "processing": count_rows("summary_status = 'processing'"),
-        "ready": count_rows("summary_status = 'ready' AND summary_feedback = 'unreviewed'"),
-        "failed": count_rows("summary_status = 'failed'"),
+        "ready": ready,
+        "failed": failed,
+        "review_total": ready + failed,
     }
 
 
@@ -2437,12 +3024,16 @@ def llm_compare_status() -> dict[str, Any]:
 
 
 def feed_counts() -> dict[str, int]:
-    all_pending_rows = fetch_pending_feed_articles()
-    predicted_rows, _ = predict_feed_rows(all_pending_rows)
-    recommended = sum(1 for row in predicted_rows if row["prediction"]["recommended"])
+    snapshot = current_feed_similarity_snapshot()
+    pending = int(snapshot.get("visible_total", count_rows("feed_decision = 'pending'")))
+    similar_groups = int(snapshot.get("similar_group_count", 0))
+    similar_hidden = int(snapshot.get("similar_hidden_count", 0))
+    recommended = count_rows("feed_decision = 'pending' AND predicted_recommendation = 1")
     return {
-        "pending": len(all_pending_rows),
+        "pending": pending,
         "recommended": recommended,
+        "similar_groups": similar_groups,
+        "similar_hidden": similar_hidden,
         "labeled_skip": count_rows("feed_decision = 'skip'"),
         "labeled_summarize": count_rows("feed_decision = 'summarize'"),
         "archived": count_rows("feed_decision = 'archived'"),
@@ -2549,10 +3140,34 @@ def api_feed_reset():
     return jsonify(archive_pending_feed())
 
 
+@APP.post("/api/feed/deduplicate")
+def api_feed_deduplicate():
+    return jsonify(deduplicate_current_pending_feed())
+
+
 @APP.get("/api/feed")
 def api_feed():
     mode = request.args.get("mode", "all")
-    rows = fetch_pending_feed_articles()
+    snapshot = current_feed_similarity_snapshot()
+    rows = fetch_visible_pending_feed_articles_from_snapshot()
+    similarity = {
+        "pending_total": int(snapshot.get("pending_total", 0)),
+        "visible_total": int(snapshot.get("visible_total", len(rows))),
+        "similar_group_count": int(snapshot.get("similar_group_count", 0)),
+        "similar_hidden_count": int(snapshot.get("similar_hidden_count", 0)),
+    }
+
+    if not rows:
+        pending_rows = fetch_pending_feed_articles()
+        rows = [row_to_dict(row) for row in pending_rows]
+        similarity = {
+            "pending_total": len(rows),
+            "visible_total": len(rows),
+            "similar_group_count": 0,
+            "similar_hidden_count": 0,
+        }
+        ensure_feed_similarity_snapshot_async()
+
     predicted_rows, run_id = predict_feed_rows(rows)
     update_cached_feed_predictions(predicted_rows, run_id)
 
@@ -2570,6 +3185,8 @@ def api_feed():
                 "recommended_pending": sum(
                     1 for row in predicted_rows if row["prediction"]["recommended"]
                 ),
+                "similar_group_count": similarity["similar_group_count"],
+                "similar_hidden_count": similarity["similar_hidden_count"],
             },
         }
     )
@@ -2595,7 +3212,7 @@ def api_summarize_article(article_id: int):
 
 @APP.get("/api/summaries")
 def api_summaries():
-    items = fetch_ready_summaries()
+    items = fetch_review_summaries()
     return jsonify(
         {
             "items": [serialize_summary(item) for item in items],
@@ -2621,9 +3238,11 @@ def api_model_ops():
     payload: dict[str, Any] = {"targets": {}}
     for target in TARGET_CONFIG:
         latest_run = latest_model_run(target)
+        previous_run = previous_model_run(target)
         counts = latest_labels_count(target)
         payload["targets"][target] = {
             "latest_run": latest_run,
+            "previous_run": previous_run,
             "label_counts": counts,
             "new_labels_since_training": new_labels_since_training(
                 target,
@@ -2681,6 +3300,7 @@ def main() -> None:
     init_db()
     load_persisted_models()
     bootstrap_compare_mode()
+    ensure_feed_similarity_snapshot_async()
     start_background_threads()
     LOGGER.info("Starting local news backend on http://%s:%s", HOST, PORT)
     try:

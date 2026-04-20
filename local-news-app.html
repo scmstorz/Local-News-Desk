@@ -729,12 +729,11 @@
                     <button class="nav-button" id="pageReloadButton" title="Seite neu laden">Reload</button>
                 </div>
                 <div class="status-row">
-                    <div class="status-pill"><span class="status-dot" id="ollamaDot"></span> Ollama <strong id="ollamaStatus">prüfe…</strong></div>
                     <div class="status-pill">Feed <strong id="feedPendingCount">0</strong></div>
                     <div class="status-pill">Empfohlen <strong id="feedRecommendedCount">0</strong></div>
+                    <div class="status-pill" id="feedSimilarPill" style="display:none;">Ähnliche <strong id="feedSimilarCount">0 in 0 Gruppen</strong></div>
                     <div class="status-pill">Primär-Queue <strong id="summaryQueueCount">0</strong></div>
                     <div class="status-pill">Primär bereit <strong id="summaryReadyCount">0</strong></div>
-                    <div class="status-pill">Primär N/A <strong id="summaryFailedCount">0</strong></div>
                     <div class="status-pill compare-off" id="compareStatusPill">Compare <strong id="compareStatusValue">aus</strong></div>
                 </div>
             </div>
@@ -754,14 +753,25 @@
         const state = {
             screen: 'feed',
             feedMode: 'all',
+            allFeedItems: [],
             feedItems: [],
+            feedCounts: null,
             feedIndex: 0,
+            feedHistory: [],
+            feedHistoryIndex: -1,
+            feedLoading: false,
+            feedError: '',
+            feedActionBusy: false,
+            feedDeduplicating: false,
+            lastFeedDeduplicateResult: null,
             summaries: [],
             summaryIndex: 0,
             status: null,
             modelOps: null,
             lastReadyCount: 0,
             trainingBusy: false,
+            trainingState: null,
+            trainingTickHandle: null,
         };
 
         function escapeHtml(value) {
@@ -782,6 +792,26 @@
             window.setTimeout(() => {
                 toast.remove();
             }, 8000);
+        }
+
+        function nextFrame() {
+            return new Promise(resolve => window.requestAnimationFrame(() => resolve()));
+        }
+
+        function startTrainingTicker() {
+            stopTrainingTicker();
+            state.trainingTickHandle = window.setInterval(() => {
+                if (state.trainingBusy && state.screen === 'ops') {
+                    renderOpsScreen();
+                }
+            }, 1000);
+        }
+
+        function stopTrainingTicker() {
+            if (state.trainingTickHandle) {
+                window.clearInterval(state.trainingTickHandle);
+                state.trainingTickHandle = null;
+            }
         }
 
         async function api(path, options = {}) {
@@ -834,10 +864,6 @@
                 return `${minutes} min`;
             }
             return `${numeric} s`;
-        }
-
-        function formatPrimaryUnavailableCount(count) {
-            return `${count ?? 0} Primär N/A`;
         }
 
         function formatPrimaryFailureBreakdown(sessionStats) {
@@ -1154,46 +1180,165 @@ Die Markdown-Datei ist attached.`;
                     renderOpsScreen();
                 }
             } catch (error) {
-                document.getElementById('ollamaStatus').textContent = 'offline';
-                document.getElementById('ollamaDot').classList.add('off');
                 showToast(`Backend nicht erreichbar: ${error.message}`, 'error');
             }
         }
 
         function renderHeaderStatus() {
             if (!state.status) return;
-            const ollama = state.status.ollama || {};
             document.getElementById('feedPendingCount').textContent = state.status.feed.pending ?? 0;
             document.getElementById('feedRecommendedCount').textContent = state.status.feed.recommended ?? 0;
+            const similarHidden = state.status.feed.similar_hidden ?? 0;
+            const similarGroups = state.status.feed.similar_groups ?? 0;
+            const similarPill = document.getElementById('feedSimilarPill');
+            document.getElementById('feedSimilarCount').textContent = `${similarHidden} in ${similarGroups} Gruppen`;
+            if (similarPill) {
+                similarPill.style.display = similarHidden > 0 ? '' : 'none';
+            }
             document.getElementById('summaryQueueCount').textContent =
                 (state.status.summaries.queued ?? 0) + (state.status.summaries.processing ?? 0);
             document.getElementById('summaryReadyCount').textContent = state.status.summaries.ready ?? 0;
-            document.getElementById('summaryFailedCount').textContent = state.status.summaries.failed ?? 0;
-            document.getElementById('navSummaryCount').textContent = state.status.summaries.ready ? `(${state.status.summaries.ready})` : '';
+            const reviewTotal = state.status.summaries.review_total ?? ((state.status.summaries.ready ?? 0) + (state.status.summaries.failed ?? 0));
+            document.getElementById('navSummaryCount').textContent = reviewTotal ? `(${reviewTotal})` : '';
             const compare = state.status.llm_compare || { enabled: false };
             const comparePill = document.getElementById('compareStatusPill');
             comparePill.classList.toggle('compare-on', Boolean(compare.enabled));
             comparePill.classList.toggle('compare-off', !compare.enabled);
             document.getElementById('compareStatusValue').textContent = compareProgressLabel(compare);
-            document.getElementById('ollamaStatus').textContent = ollama.reachable
-                ? (ollama.model_available ? 'bereit' : 'Modell fehlt')
-                : 'offline';
-            document.getElementById('ollamaDot').classList.toggle('off', !ollama.reachable || !ollama.model_available);
+        }
+
+        function applyFeedMode(reset = false, currentId = null) {
+            const sourceItems = state.allFeedItems || [];
+            const filteredItems = state.feedMode === 'recommended'
+                ? sourceItems.filter(item => item.prediction?.recommended)
+                : sourceItems.slice();
+            state.feedItems = filteredItems;
+
+            if (reset) {
+                state.feedIndex = 0;
+                return;
+            }
+
+            if (currentId) {
+                const nextIndex = filteredItems.findIndex(item => item.id === currentId);
+                state.feedIndex = nextIndex >= 0 ? nextIndex : Math.min(state.feedIndex, Math.max(filteredItems.length - 1, 0));
+                return;
+            }
+
+            state.feedIndex = Math.min(state.feedIndex, Math.max(filteredItems.length - 1, 0));
+        }
+
+        function currentFeedItem() {
+            if (state.feedHistoryIndex >= 0) {
+                return state.feedHistory[state.feedHistoryIndex] || null;
+            }
+            return state.feedItems[state.feedIndex] || null;
+        }
+
+        function canGoBackInFeed() {
+            if (state.feedHistoryIndex >= 0) {
+                return state.feedHistoryIndex > 0;
+            }
+            return state.feedHistory.length > 0 || state.feedIndex > 0;
+        }
+
+        function pushFeedHistoryItem(item, sessionAction) {
+            if (!item) return;
+            const snapshot = {
+                ...item,
+                sessionAction: sessionAction || item.sessionAction || null,
+            };
+            const existingIndex = state.feedHistory.findIndex(historyItem => Number(historyItem.id) === Number(snapshot.id));
+            if (existingIndex >= 0) {
+                state.feedHistory[existingIndex] = snapshot;
+            } else {
+                state.feedHistory.push(snapshot);
+            }
+        }
+
+        function handleFeedBack() {
+            if (state.feedHistoryIndex >= 0) {
+                if (state.feedHistoryIndex > 0) {
+                    state.feedHistoryIndex -= 1;
+                    renderFeedScreen(state.feedCounts);
+                }
+                return;
+            }
+
+            if (state.feedHistory.length > 0) {
+                state.feedHistoryIndex = state.feedHistory.length - 1;
+                renderFeedScreen(state.feedCounts);
+                return;
+            }
+
+            if (state.feedIndex > 0) {
+                state.feedIndex -= 1;
+                renderFeedScreen(state.feedCounts);
+            }
+        }
+
+        function exitFeedHistoryMode() {
+            state.feedHistoryIndex = -1;
+        }
+
+        function removeFeedItemsByIds(articleIds) {
+            const idSet = new Set((articleIds || []).map(id => Number(id)));
+            if (!idSet.size) return;
+            state.allFeedItems = (state.allFeedItems || []).filter(item => !idSet.has(Number(item.id)));
+            applyFeedMode(false);
+        }
+
+        function removeCurrentAndSimilarFeedItems(currentItem, deduplicatedCount) {
+            const currentId = Number(currentItem?.id);
+            const idsToRemove = [currentId];
+
+            if ((deduplicatedCount || 0) > 0 && currentItem?.similar_count) {
+                let remaining = Number(deduplicatedCount);
+                for (const candidate of (state.allFeedItems || [])) {
+                    if (remaining <= 0) break;
+                    if (Number(candidate.id) === currentId) continue;
+                    if (candidate.title === currentItem.title) {
+                        idsToRemove.push(Number(candidate.id));
+                        remaining -= 1;
+                    }
+                }
+            }
+
+            removeFeedItemsByIds(idsToRemove);
+        }
+
+        function removeOnlyCurrentFeedItem(currentItem) {
+            if (!currentItem) return;
+            removeFeedItemsByIds([Number(currentItem.id)]);
         }
 
         async function loadFeed(reset = true) {
+            state.feedLoading = true;
+            state.feedError = '';
+            if (state.screen === 'feed') {
+                renderFeedScreen();
+            }
             const currentId = !reset && state.feedItems[state.feedIndex]
                 ? state.feedItems[state.feedIndex].id
                 : null;
-            const payload = await api(`/feed?mode=${state.feedMode}`);
-            state.feedItems = payload.items || [];
-            if (currentId) {
-                const nextIndex = state.feedItems.findIndex(item => item.id === currentId);
-                state.feedIndex = nextIndex >= 0 ? nextIndex : Math.min(state.feedIndex, Math.max(state.feedItems.length - 1, 0));
-            } else {
-                state.feedIndex = 0;
+            try {
+                const payload = await api('/feed?mode=all');
+                state.feedError = '';
+                state.allFeedItems = payload.items || [];
+                state.feedCounts = payload.counts || null;
+                applyFeedMode(reset, currentId);
+                state.feedLoading = false;
+                renderFeedScreen(state.feedCounts);
+            } catch (error) {
+                state.feedLoading = false;
+                state.feedError = error.message || 'Feed konnte nicht geladen werden';
+                renderFeedScreen();
+                showToast(`Feed konnte nicht geladen werden: ${state.feedError}`, 'error');
+            } finally {
+                if (state.feedLoading) {
+                    state.feedLoading = false;
+                }
             }
-            renderFeedScreen(payload.counts);
         }
 
         async function loadSummaries(preserveCurrent = false) {
@@ -1246,11 +1391,8 @@ Die Markdown-Datei ist attached.`;
                 <div class="prediction-strip">
                     <div class="prediction-main">
                         <div class="prediction-label">Feed-Modell</div>
-                        <div class="prediction-value">${recommended ? 'zeigenswert' : 'eher nein'}</div>
+                        <div class="prediction-value">${recommended ? 'empfohlen' : 'eher nein'}</div>
                         <div class="prediction-subtle">Wahrscheinlichkeit: ${formatProbability(prediction.probability)}</div>
-                    </div>
-                    <div class="prediction-badge ${recommended ? 'good' : 'bad'}">
-                        ${recommended ? 'zeigen' : 'filtern'}
                     </div>
                 </div>
             `;
@@ -1258,16 +1400,51 @@ Die Markdown-Datei ist attached.`;
 
         function renderFeedScreen(counts = null) {
             const host = document.getElementById('screen-feed');
-            const item = state.feedItems[state.feedIndex];
+            const item = currentFeedItem();
+            const viewingHistory = state.feedHistoryIndex >= 0;
             const totals = counts || {
-                total_pending: state.feedItems.length,
-                recommended_pending: state.feedItems.filter(row => row.prediction?.recommended).length,
+                total_pending: state.allFeedItems.length,
+                recommended_pending: state.allFeedItems.filter(row => row.prediction?.recommended).length,
             };
+            const lastDeduplicate = state.lastFeedDeduplicateResult;
+            const deduplicateBanner = lastDeduplicate
+                ? `
+                    <div class="ops-assessment" style="margin: 0 22px 18px;">
+                        <strong>Letzter Bereinigungslauf</strong>
+                        <p>
+                            ${lastDeduplicate.archived_count
+                                ? `${lastDeduplicate.archived_count} ähnliche Meldung${lastDeduplicate.archived_count > 1 ? 'en' : ''} aus der Inbox entfernt.`
+                                : 'Keine ähnlichen Meldungen entfernt.'}
+                            <br>Offene Rohmeldungen: ${lastDeduplicate.before_pending} -> ${lastDeduplicate.after_pending}
+                            <br>Sichtbare Stories: ${lastDeduplicate.before_visible} -> ${lastDeduplicate.after_visible}
+                        </p>
+                    </div>
+                `
+                : '';
+
+            if (state.feedLoading) {
+                host.innerHTML = `
+                    <div class="panel">
+                        <div class="panel-header">
+                            <div class="panel-title">
+                                <h2>Feed</h2>
+                            </div>
+                        </div>
+                        <div class="empty-state">
+                            <h3>Feed wird geladen</h3>
+                            <p>Die Inbox und die aktuellen Modellvorhersagen werden gerade aufgebaut.</p>
+                        </div>
+                    </div>
+                `;
+                return;
+            }
 
             if (!item) {
                 const refreshLabel = state.status?.last_feed_refresh?.finished_at
                     ? formatRelativeTime(state.status.last_feed_refresh.finished_at)
                     : 'unbekannt';
+                const emptyRecommended = state.feedMode === 'recommended' && (totals.total_pending ?? 0) > 0;
+                const hasFeedError = Boolean(state.feedError);
                 host.innerHTML = `
                     <div class="panel">
                         <div class="panel-header">
@@ -1277,76 +1454,100 @@ Die Markdown-Datei ist attached.`;
                             <div class="toolbar">
                                 <div class="segmented">
                                     <button class="segment-button ${state.feedMode === 'all' ? 'active' : ''}" data-feed-mode="all">Alle</button>
-                                    <button class="segment-button ${state.feedMode === 'recommended' ? 'active' : ''}" data-feed-mode="recommended">Nur zeigenswert</button>
+                                    <button class="segment-button ${state.feedMode === 'recommended' ? 'active' : ''}" data-feed-mode="recommended">Empfohlen</button>
                                 </div>
+                                <button class="inline-button" id="feedDeduplicateButton" ${state.feedDeduplicating ? 'disabled' : ''}>${state.feedDeduplicating ? 'Kompaktiere …' : 'Inbox kompaktieren'}</button>
                                 <button class="inline-button" id="feedResetButton">Inbox-Reset</button>
                                 <button class="inline-button" id="refreshFeedButton">Feeds aktualisieren</button>
                             </div>
                         </div>
+                        ${deduplicateBanner}
                         <div class="empty-state">
-                            <h3>Inbox leer</h3>
-                            <p>Im aktuellen Modus gibt es gerade keine offenen Feed-Einträge. Neue Artikel tauchen automatisch nach dem nächsten Feed-Refresh auf. Letzter Feed-Refresh: ${escapeHtml(refreshLabel)}.</p>
+                            <h3>${hasFeedError ? 'Feed derzeit nicht verfügbar' : (emptyRecommended ? 'Keine zeigenswerten Treffer' : 'Inbox leer')}</h3>
+                            <p>${hasFeedError
+                                ? `Der Feed konnte nicht geladen werden: ${escapeHtml(state.feedError)}`
+                                : emptyRecommended
+                                    ? `Im Modus „Empfohlen“ gibt es gerade keine Treffer. Insgesamt sind aber noch ${totals.total_pending ?? 0} offene Feed-Einträge vorhanden.`
+                                    : `Im aktuellen Modus gibt es gerade keine offenen Feed-Einträge. Neue Artikel tauchen automatisch nach dem nächsten Feed-Refresh auf.`}
+                                ${hasFeedError ? '' : `Letzter Feed-Refresh: ${escapeHtml(refreshLabel)}.`}</p>
+                            ${emptyRecommended ? '<div class="ops-actions" style="justify-content: center; margin-top: 14px;"><button class="inline-button" id="showAllFeedButton">Alle Feed-Einträge zeigen</button></div>' : ''}
                         </div>
                     </div>
                 `;
                 bindCommonFeedControls();
+                document.getElementById('showAllFeedButton')?.addEventListener('click', async () => {
+                    state.feedMode = 'all';
+                    applyFeedMode(true);
+                    renderFeedScreen(state.feedCounts);
+                });
                 return;
             }
 
             host.innerHTML = `
                 <div class="panel">
-                    <div class="panel-header">
-                        <div class="panel-title">
-                            <h2>Feed</h2>
-                            <p>${state.feedIndex + 1} / ${state.feedItems.length} in dieser Session · ${totals.total_pending ?? state.feedItems.length} offen · ${totals.recommended_pending ?? 0} zeigenswert</p>
-                        </div>
+                        <div class="panel-header">
+                            <div class="panel-title">
+                                <h2>Feed</h2>
+                                <p>${viewingHistory
+                                    ? `Verlauf ${state.feedHistoryIndex + 1} / ${state.feedHistory.length} · ${totals.total_pending ?? state.feedItems.length} offen · ${totals.recommended_pending ?? 0} empfohlen`
+                                    : `${state.feedIndex + 1} / ${state.feedItems.length} in dieser Session · ${totals.total_pending ?? state.feedItems.length} offen · ${totals.recommended_pending ?? 0} empfohlen`}</p>
+                            </div>
                         <div class="toolbar">
                                 <div class="segmented">
                                     <button class="segment-button ${state.feedMode === 'all' ? 'active' : ''}" data-feed-mode="all">Alle</button>
-                                    <button class="segment-button ${state.feedMode === 'recommended' ? 'active' : ''}" data-feed-mode="recommended">Nur zeigenswert</button>
+                                    <button class="segment-button ${state.feedMode === 'recommended' ? 'active' : ''}" data-feed-mode="recommended">Empfohlen</button>
                                 </div>
+                                <button class="inline-button" id="feedDeduplicateButton" ${state.feedDeduplicating ? 'disabled' : ''}>${state.feedDeduplicating ? 'Kompaktiere …' : 'Inbox kompaktieren'}</button>
                                 <button class="inline-button" id="feedResetButton">Inbox-Reset</button>
                                 <button class="inline-button" id="refreshFeedButton">Feeds aktualisieren</button>
                             </div>
                         </div>
+                    ${deduplicateBanner}
                     <div class="feed-card">
                         <div class="feed-meta">
                             <a class="meta-chip" href="${escapeHtml(item.source_url)}" target="_blank" rel="noopener noreferrer">Quelle · ${escapeHtml(item.source_label)}</a>
                             <span class="meta-chip">Zeit · ${escapeHtml(formatRelativeTime(item.published_at))}</span>
+                            ${item.similar_count ? `<span class="meta-chip">+${item.similar_count} ähnliche Meldungen</span>` : ''}
                             <a class="meta-chip" href="${escapeHtml(item.link_to_article)}" target="_blank" rel="noopener noreferrer">Artikel · öffnen</a>
                         </div>
                         <h3>${escapeHtml(item.title)}</h3>
                         ${feedPredictionMarkup(item.prediction)}
                         <div class="action-row">
                             <div class="action-group">
-                                <button class="action-button neutral" id="feedPrevButton" ${state.feedIndex === 0 ? 'disabled' : ''}>Zurück</button>
+                                <button class="action-button neutral" id="feedPrevButton" ${canGoBackInFeed() ? '' : 'disabled'}>Zurück</button>
                                 <a class="action-button neutral" href="${escapeHtml(item.link_to_article)}" target="_blank" rel="noopener noreferrer">Original öffnen</a>
                             </div>
                             <div class="action-group">
-                                <button class="action-button cool" id="feedSkipButton" ${item.sessionAction === 'summarize' ? 'disabled' : ''}>Weiter</button>
-                                <button class="action-button warm" id="feedSummarizeButton">Zusammenfassen</button>
+                                <button class="action-button cool" id="feedSkipButton" ${state.feedActionBusy || item.sessionAction === 'summarize' ? 'disabled' : ''}>${state.feedActionBusy ? 'Lade ...' : 'Weiter'}</button>
+                                <button class="action-button warm" id="feedSummarizeButton" ${state.feedActionBusy ? 'disabled' : ''}>${state.feedActionBusy ? 'Lade ...' : 'Zusammenfassen'}</button>
                             </div>
                         </div>
-                        <div class="action-note">${escapeHtml(item.sessionAction === 'summarize' ? 'Schon in die lokale Summary-Queue gelegt.' : item.sessionAction === 'skip' ? 'Zuletzt als uninteressant übersprungen.' : 'Pfeile: links zurück, rechts weiter. Taste S: zusammenfassen.')}</div>
+                        <div class="action-note">${escapeHtml(viewingHistory
+                            ? (item.sessionAction === 'summarize'
+                                ? 'Verlaufseintrag. Zuletzt zur Summary vorgemerkt.'
+                                : item.sessionAction === 'skip'
+                                    ? 'Verlaufseintrag. Zuletzt uebersprungen.'
+                                    : 'Verlaufseintrag.')
+                            : (item.sessionAction === 'summarize'
+                                ? 'Schon in die lokale Summary-Queue gelegt.'
+                                : item.sessionAction === 'skip'
+                                    ? 'Zuletzt als uninteressant übersprungen.'
+                                    : 'Pfeile: links zurück, rechts weiter. Taste S: zusammenfassen.'))}</div>
                     </div>
                 </div>
             `;
             bindCommonFeedControls();
-            document.getElementById('feedPrevButton')?.addEventListener('click', () => {
-                if (state.feedIndex > 0) {
-                    state.feedIndex -= 1;
-                    renderFeedScreen();
-                }
-            });
+            document.getElementById('feedPrevButton')?.addEventListener('click', handleFeedBack);
             document.getElementById('feedSkipButton')?.addEventListener('click', handleFeedSkip);
             document.getElementById('feedSummarizeButton')?.addEventListener('click', handleFeedSummarize);
         }
 
         function bindCommonFeedControls() {
             document.querySelectorAll('[data-feed-mode]').forEach(button => {
-                button.addEventListener('click', async () => {
+                button.addEventListener('click', () => {
                     state.feedMode = button.dataset.feedMode;
-                    await loadFeed(true);
+                    applyFeedMode(true);
+                    renderFeedScreen(state.feedCounts);
                 });
             });
             document.getElementById('refreshFeedButton')?.addEventListener('click', async () => {
@@ -1359,7 +1560,36 @@ Die Markdown-Datei ist attached.`;
                     showToast(error.message, 'error');
                 }
             });
+            document.getElementById('feedDeduplicateButton')?.addEventListener('click', handleFeedDeduplicate);
             document.getElementById('feedResetButton')?.addEventListener('click', handleFeedReset);
+        }
+
+        async function handleFeedDeduplicate() {
+            const confirmed = window.confirm('Sehr ähnliche offene Feed-Meldungen jetzt endgültig aus der aktiven Inbox entfernen? Die sichtbare Gruppierung läuft ohnehin schon automatisch.');
+            if (!confirmed) return;
+
+            try {
+                state.feedDeduplicating = true;
+                renderFeedScreen();
+                showToast('Inbox wird kompaktisiert …', 'info');
+                const result = await api('/feed/deduplicate', { method: 'POST' });
+                state.lastFeedDeduplicateResult = result;
+                showToast(
+                    result.archived_count
+                        ? `${result.archived_count} ähnliche Meldung${result.archived_count > 1 ? 'en' : ''} entfernt · Rohmeldungen ${result.before_pending} -> ${result.after_pending} · Stories ${result.before_visible} -> ${result.after_visible}.`
+                        : 'Keine ähnlichen Feed-Meldungen zum Bereinigen gefunden.',
+                    'info'
+                );
+                await loadStatus();
+                await loadFeed(true);
+            } catch (error) {
+                showToast(error.message, 'error');
+            } finally {
+                state.feedDeduplicating = false;
+                if (state.screen === 'feed') {
+                    renderFeedScreen();
+                }
+            }
         }
 
         async function handleFeedReset() {
@@ -1379,48 +1609,106 @@ Die Markdown-Datei ist attached.`;
         }
 
         async function handleFeedSkip() {
-            const item = state.feedItems[state.feedIndex];
-            if (!item) return;
+            const item = currentFeedItem();
+            if (!item || state.feedActionBusy) return;
+            const wasViewingHistory = state.feedHistoryIndex >= 0;
+            const previousAllItems = state.allFeedItems.slice();
+            const previousFeedIndex = state.feedIndex;
+            const previousHistoryIndex = state.feedHistoryIndex;
+            const previousHistory = state.feedHistory.slice();
             try {
-                await api(`/articles/${item.id}/skip`, { method: 'POST' });
-                item.sessionAction = 'skip';
-                if (state.feedIndex < state.feedItems.length - 1) {
-                    state.feedIndex += 1;
+                state.feedActionBusy = true;
+                pushFeedHistoryItem(item, 'skip');
+                if (!wasViewingHistory) {
+                    removeOnlyCurrentFeedItem(item);
+                } else {
+                    exitFeedHistoryMode();
+                }
+                if (state.feedItems.length || wasViewingHistory) {
+                    renderFeedScreen();
+                }
+                const result = await api(`/articles/${item.id}/skip`, { method: 'POST' });
+                removeCurrentAndSimilarFeedItems(item, result.deduplicated_count);
+                if (result.deduplicated_count) {
+                    showToast(`${result.deduplicated_count} ähnliche Meldung${result.deduplicated_count > 1 ? 'en' : ''} ebenfalls aus dem Feed entfernt.`, 'info');
+                }
+                if (state.feedItems.length) {
                     renderFeedScreen();
                 } else {
                     await loadFeed(true);
                 }
                 loadStatus();
             } catch (error) {
+                state.allFeedItems = previousAllItems;
+                state.feedHistory = previousHistory;
+                applyFeedMode(false);
+                state.feedIndex = Math.min(previousFeedIndex, Math.max(state.feedItems.length - 1, 0));
+                state.feedHistoryIndex = previousHistoryIndex;
+                renderFeedScreen();
                 showToast(error.message, 'error');
+            } finally {
+                state.feedActionBusy = false;
+                if (state.screen === 'feed' && state.feedItems.length) {
+                    renderFeedScreen();
+                }
             }
         }
 
         async function handleFeedSummarize() {
-            const item = state.feedItems[state.feedIndex];
-            if (!item) return;
+            const item = currentFeedItem();
+            if (!item || state.feedActionBusy) return;
+            const wasViewingHistory = state.feedHistoryIndex >= 0;
+            const previousAllItems = state.allFeedItems.slice();
+            const previousFeedIndex = state.feedIndex;
+            const previousHistoryIndex = state.feedHistoryIndex;
+            const previousHistory = state.feedHistory.slice();
             try {
-                await api(`/articles/${item.id}/summarize`, { method: 'POST' });
-                item.sessionAction = 'summarize';
-                showToast('Summary läuft im Hintergrund.', 'info');
-                if (state.feedIndex < state.feedItems.length - 1) {
-                    state.feedIndex += 1;
+                state.feedActionBusy = true;
+                pushFeedHistoryItem(item, 'summarize');
+                if (!wasViewingHistory) {
+                    removeOnlyCurrentFeedItem(item);
+                } else {
+                    exitFeedHistoryMode();
+                }
+                if (state.feedItems.length || wasViewingHistory) {
+                    renderFeedScreen();
+                }
+                const result = await api(`/articles/${item.id}/summarize`, { method: 'POST' });
+                removeCurrentAndSimilarFeedItems(item, result.deduplicated_count);
+                const duplicateText = result.deduplicated_count
+                    ? ` ${result.deduplicated_count} ähnliche Meldung${result.deduplicated_count > 1 ? 'en wurden' : ' wurde'} ebenfalls aus dem Feed entfernt.`
+                    : '';
+                showToast(`Summary läuft im Hintergrund.${duplicateText}`, 'info');
+                if (state.feedItems.length) {
                     renderFeedScreen();
                 } else {
                     await loadFeed(true);
                 }
                 loadStatus();
             } catch (error) {
+                state.allFeedItems = previousAllItems;
+                state.feedHistory = previousHistory;
+                applyFeedMode(false);
+                state.feedIndex = Math.min(previousFeedIndex, Math.max(state.feedItems.length - 1, 0));
+                state.feedHistoryIndex = previousHistoryIndex;
+                renderFeedScreen();
                 showToast(error.message, 'error');
+            } finally {
+                state.feedActionBusy = false;
+                if (state.screen === 'feed' && state.feedItems.length) {
+                    renderFeedScreen();
+                }
             }
         }
 
         function renderSummaryScreen() {
             const host = document.getElementById('screen-summaries');
             const item = state.summaries[state.summaryIndex];
-            const counts = state.status?.summaries || { queued: 0, processing: 0, ready: state.summaries.length, failed: 0 };
+            const counts = state.status?.summaries || { queued: 0, processing: 0, ready: state.summaries.length, failed: 0, review_total: state.summaries.length };
             const compare = state.status?.llm_compare || { enabled: false };
             const compareText = compareProgressText(compare);
+            const isUnavailable = item?.summary_status === 'failed';
+            const reviewTotal = counts.review_total ?? ((counts.ready ?? 0) + (counts.failed ?? 0));
 
             if (!item) {
                 host.innerHTML = `
@@ -1435,12 +1723,12 @@ Die Markdown-Datei ist attached.`;
                             </div>
                         </div>
                         <div class="queue-banner">
-                            <strong>${counts.ready} neue Summaries</strong>
-                            <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${formatPrimaryUnavailableCount(counts.failed)}${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
+                            <strong>${reviewTotal} Review-Fälle</strong>
+                            <span>${counts.queued} in Queue · ${counts.processing} in Arbeit${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
                         </div>
                         <div class="empty-state">
                             <h3>Gerade nichts zu reviewen</h3>
-                            <p>Neue Summaries tauchen hier auf, sobald die lokale Queue fertig ist.${counts.failed ? ` ${formatPrimaryUnavailableCount(counts.failed)}.` : ''}</p>
+                            <p>Neue Summaries tauchen hier auf, sobald die lokale Queue fertig ist.</p>
                         </div>
                     </div>
                 `;
@@ -1460,26 +1748,27 @@ Die Markdown-Datei ist attached.`;
                         </div>
                     </div>
                     <div class="queue-banner">
-                        <strong>${counts.ready} neue Summaries</strong>
-                        <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${formatPrimaryUnavailableCount(counts.failed)}${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
+                        <strong>${reviewTotal} Review-Fälle</strong>
+                        <span>${counts.queued} in Queue · ${counts.processing} in Arbeit${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
                     </div>
                     <div class="summary-card">
                         <div class="summary-meta">
                             <a class="meta-chip" href="${escapeHtml(item.source_url)}" target="_blank" rel="noopener noreferrer">Quelle · ${escapeHtml(item.source_label)}</a>
                             <span class="meta-chip">Zeit · ${escapeHtml(formatRelativeTime(item.published_at))}</span>
-                            <span class="meta-chip">Modell · ${escapeHtml(item.summary_model || 'lokal')}</span>
+                            <span class="meta-chip">Status · ${isUnavailable ? 'Not available' : escapeHtml(item.summary_model || 'lokal')}</span>
                         </div>
                         <h3>${escapeHtml(item.summary_title || item.title)}</h3>
-                        <div class="summary-text">${escapeHtml(item.summary_text)}</div>
+                        <div class="summary-text">${isUnavailable ? 'Für diesen Artikel konnte lokal keine Summary erzeugt werden. Du kannst den Originalartikel trotzdem öffnen und den Eintrag danach aus der Liste nehmen.' : escapeHtml(item.summary_text)}</div>
                         <div class="action-row">
                             <div class="action-group">
                                 <button class="action-button neutral" id="summaryPrevButton" ${state.summaryIndex === 0 ? 'disabled' : ''}>Zurück</button>
-                                <button class="action-button neutral" id="summaryShareButton">Teilen</button>
+                                ${isUnavailable ? '' : '<button class="action-button neutral" id="summaryShareButton">Teilen</button>'}
                                 <a class="action-button neutral" href="${escapeHtml(item.link_to_article)}" target="_blank" rel="noopener noreferrer">Original öffnen</a>
                             </div>
                             <div class="action-group">
-                                <button class="action-button danger" id="summaryNotInterestingButton">Doch nicht interessant</button>
-                                <button class="action-button primary" id="summaryInterestingButton">Interessant</button>
+                                ${isUnavailable
+                                    ? '<button class="action-button primary" id="summaryUnavailableDoneButton">Aus Liste nehmen</button>'
+                                    : '<button class="action-button danger" id="summaryNotInterestingButton">Doch nicht interessant</button><button class="action-button primary" id="summaryInterestingButton">Interessant</button>'}
                             </div>
                         </div>
                     </div>
@@ -1495,6 +1784,7 @@ Die Markdown-Datei ist attached.`;
             document.getElementById('summaryShareButton')?.addEventListener('click', handleSummaryShare);
             document.getElementById('summaryInterestingButton')?.addEventListener('click', () => handleSummaryFeedback('interesting'));
             document.getElementById('summaryNotInterestingButton')?.addEventListener('click', () => handleSummaryFeedback('not_interesting'));
+            document.getElementById('summaryUnavailableDoneButton')?.addEventListener('click', () => handleSummaryFeedback('not_available'));
         }
 
         async function handleSummaryShare() {
@@ -1539,13 +1829,116 @@ Die Markdown-Datei ist attached.`;
             `;
         }
 
+        function formatMetric(value) {
+            if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+            return Number(value).toFixed(3);
+        }
+
+        function formatDelta(latestValue, previousValue) {
+            if (latestValue === null || latestValue === undefined || previousValue === null || previousValue === undefined) {
+                return null;
+            }
+            const delta = Number(latestValue) - Number(previousValue);
+            const rounded = Math.round(delta * 1000) / 1000;
+            const sign = rounded > 0 ? '+' : '';
+            return {
+                value: `${sign}${rounded.toFixed(3)}`,
+                direction: rounded > 0 ? 'up' : rounded < 0 ? 'down' : 'flat',
+            };
+        }
+
+        function renderDeltaRow(label, latestValue, previousValue) {
+            const delta = formatDelta(latestValue, previousValue);
+            const deltaMarkup = delta
+                ? `<span class="data-pill ${delta.direction === 'up' ? 'compare-on' : delta.direction === 'down' ? 'compare-off' : ''}">${delta.value}</span>`
+                : '<span class="data-pill">—</span>';
+            return `
+                <div class="data-points" style="margin-top: 8px;">
+                    <span class="data-pill">${escapeHtml(label)} ${escapeHtml(formatMetric(previousValue))} -> ${escapeHtml(formatMetric(latestValue))}</span>
+                    ${deltaMarkup}
+                </div>
+            `;
+        }
+
+        function trainingOutcomeAssessment(latestRun, previousRun) {
+            if (!latestRun || !previousRun) return null;
+
+            const f1Delta = Number(latestRun.f1 ?? 0) - Number(previousRun.f1 ?? 0);
+            const precisionDelta = Number(latestRun.precision ?? 0) - Number(previousRun.precision ?? 0);
+            const recallDelta = Number(latestRun.recall ?? 0) - Number(previousRun.recall ?? 0);
+
+            if (f1Delta >= 0.02) {
+                return {
+                    tone: 'compare-on',
+                    headline: 'Eher besser',
+                    detail: 'Der neue Lauf verbessert vor allem die Gesamtbalance aus Precision und Recall.',
+                };
+            }
+
+            if (f1Delta <= -0.02) {
+                return {
+                    tone: 'compare-off',
+                    headline: 'Eher schlechter',
+                    detail: 'Der neue Lauf verschlechtert die Gesamtbalance aus Precision und Recall.',
+                };
+            }
+
+            if (Math.abs(precisionDelta) >= 0.02 || Math.abs(recallDelta) >= 0.02) {
+                return {
+                    tone: '',
+                    headline: 'Gemischt',
+                    detail: 'Eine Metrik bewegt sich sichtbar, aber insgesamt ist der Lauf noch kein klarer Fortschritt.',
+                };
+            }
+
+            return {
+                tone: '',
+                headline: 'Eher seitwaerts',
+                detail: 'Die Kennzahlen liegen sehr nah am vorherigen Lauf. Praktisch ist das noch kein klarer Sprung.',
+            };
+        }
+
+        function trainingOutcomeExplainMarkup() {
+            return `
+                <details style="margin-top: 12px;">
+                    <summary style="cursor: pointer; color: var(--accent); font-size: 0.92rem;">Was bedeutet das?</summary>
+                    <div style="margin-top: 10px; color: var(--ink-soft); line-height: 1.55;">
+                        <div><strong>Precision</strong>: Wenn das Modell "interessant" sagt, wie oft stimmt das dann?</div>
+                        <div><strong>Recall</strong>: Von allen wirklich interessanten Faellen, wie viele findet das Modell?</div>
+                        <div><strong>F1</strong>: Ein gemeinsamer Wert fuer die Balance aus Precision und Recall. Fuer diese App ist das meist die wichtigste Kurzmetrik.</div>
+                    </div>
+                </details>
+            `;
+        }
+
+        function trainingTargetLabel(target) {
+            if (target === 'feed_recommendation') return 'Stufe 1';
+            if (target === 'summary_interest') return 'Stufe 2';
+            return 'Beide Stufen';
+        }
+
+        function trainingElapsedText() {
+            if (!state.trainingState?.startedAt) return 'gerade gestartet';
+            const elapsedMs = Date.now() - state.trainingState.startedAt;
+            const elapsedSeconds = Math.max(1, Math.round(elapsedMs / 1000));
+            if (elapsedSeconds < 60) return `seit ${elapsedSeconds}s`;
+            return `seit ${Math.round(elapsedSeconds / 60)} min`;
+        }
+
         function renderModelCard(title, targetKey, descriptor) {
             const latestRun = descriptor.latest_run;
+            const previousRun = descriptor.previous_run;
             const counts = descriptor.label_counts || { total: 0, positive: 0, negative: 0 };
             const retraining = descriptor.retraining || { recommended: false, reason: 'unknown', headline: 'Noch warten', detail: '' };
             const quality = descriptor.quality || { headline: 'Keine Einschätzung', detail: '' };
+            const outcome = trainingOutcomeAssessment(latestRun, previousRun);
             const matrix = latestRun?.confusion_matrix || [[0, 0], [0, 0]];
-            const buttonLabel = latestRun ? 'Retrain' : 'Train';
+            const trainingThisTarget = state.trainingBusy && (
+                state.trainingState?.target === targetKey || state.trainingState?.target === 'all'
+            );
+            const buttonLabel = trainingThisTarget
+                ? 'Training läuft ...'
+                : (latestRun ? 'Retrain' : 'Train');
 
             return `
                 <div class="ops-card">
@@ -1594,6 +1987,23 @@ Die Markdown-Datei ist attached.`;
                             <span class="data-pill">Train ${latestRun.train_size}</span>
                             <span class="data-pill">Test ${latestRun.test_size}</span>
                         </div>
+                        ${previousRun ? `
+                            <div class="ops-assessment">
+                                <strong>Vergleich zum vorherigen Lauf</strong>
+                                <p>So haben sich die Metriken seit dem letzten Training verändert.</p>
+                                ${outcome ? `
+                                    <div class="data-points" style="margin-top: 10px;">
+                                        <span class="data-pill ${escapeHtml(outcome.tone)}">${escapeHtml(outcome.headline)}</span>
+                                    </div>
+                                    <p style="margin-top: 10px;">${escapeHtml(outcome.detail)}</p>
+                                ` : ''}
+                                ${renderDeltaRow('Accuracy', latestRun.accuracy, previousRun.accuracy)}
+                                ${renderDeltaRow('Precision', latestRun.precision, previousRun.precision)}
+                                ${renderDeltaRow('Recall', latestRun.recall, previousRun.recall)}
+                                ${renderDeltaRow('F1', latestRun.f1, previousRun.f1)}
+                                ${trainingOutcomeExplainMarkup()}
+                            </div>
+                        ` : ''}
                         <div class="ops-assessment">
                             <strong>${escapeHtml(retraining.headline || 'Noch warten')}</strong>
                             <p>${escapeHtml(retraining.detail || '')}</p>
@@ -1682,6 +2092,15 @@ Die Markdown-Datei ist attached.`;
             const compareProgress = compare.progress;
             const compareStatus = compareStatusDescriptor(compare);
 
+            const trainingBanner = state.trainingBusy
+                ? `
+                    <div class="ops-assessment" style="margin: 0 22px 18px;">
+                        <strong>Training läuft</strong>
+                        <p>${escapeHtml(trainingTargetLabel(state.trainingState?.target))} wird gerade trainiert, ${escapeHtml(trainingElapsedText())}. Die Metriken werden aktualisiert, sobald der Lauf fertig ist.</p>
+                    </div>
+                `
+                : '';
+
             host.innerHTML = `
                 <div class="panel">
                     <div class="panel-header">
@@ -1691,10 +2110,11 @@ Die Markdown-Datei ist attached.`;
                         </div>
                         <div class="toolbar">
                             <button class="inline-button" id="refreshOpsButton">Neu laden</button>
-                            <button class="inline-button" id="trainAllButton" ${state.trainingBusy ? 'disabled' : ''}>Beide trainieren</button>
+                            <button class="inline-button" id="trainAllButton" ${state.trainingBusy ? 'disabled' : ''}>${state.trainingBusy && state.trainingState?.target === 'all' ? 'Training läuft ...' : 'Beide trainieren'}</button>
                         </div>
                     </div>
                     <div style="padding: 22px 22px 0;">
+                        ${trainingBanner}
                         <div class="ops-grid" style="margin-bottom: 18px;">
                             <div class="ops-card">
                                 <h3>System</h3>
@@ -1808,7 +2228,14 @@ Die Markdown-Datei ist attached.`;
         async function handleTraining(target) {
             try {
                 state.trainingBusy = true;
+                state.trainingState = {
+                    target,
+                    startedAt: Date.now(),
+                };
+                startTrainingTicker();
                 renderOpsScreen();
+                showToast(`Training gestartet: ${trainingTargetLabel(target)}.`, 'info');
+                await nextFrame();
                 const payload = await api('/model-ops/train', {
                     method: 'POST',
                     body: JSON.stringify({ target }),
@@ -1826,6 +2253,8 @@ Die Markdown-Datei ist attached.`;
                 showToast(error.message, 'error');
             } finally {
                 state.trainingBusy = false;
+                state.trainingState = null;
+                stopTrainingTicker();
                 if (state.screen === 'ops') {
                     renderOpsScreen();
                 }
@@ -1835,10 +2264,7 @@ Die Markdown-Datei ist attached.`;
         function handleKeyboard(event) {
             if (state.screen === 'feed') {
                 if (event.key === 'ArrowLeft') {
-                    if (state.feedIndex > 0) {
-                        state.feedIndex -= 1;
-                        renderFeedScreen();
-                    }
+                    handleFeedBack();
                 } else if (event.key === 'ArrowRight') {
                     handleFeedSkip();
                 } else if (event.key.toLowerCase() === 's') {
@@ -1869,6 +2295,7 @@ Die Markdown-Datei ist attached.`;
 
         async function bootstrap() {
             bindNav();
+            state.feedLoading = true;
             renderFeedScreen();
             await loadStatus();
             await loadFeed(true);
