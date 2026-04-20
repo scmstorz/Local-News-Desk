@@ -81,7 +81,7 @@ DEFAULT_SETTINGS = {
         "request_timeout_seconds": 600,
         "models": [
             "qwen3.5:35b",
-            "gemma4:31b",
+            "qwen3.6:latest",
             "gpt-oss:20b",
             "nemotron-3-nano:30b",
         ],
@@ -2237,6 +2237,13 @@ def summary_counts() -> dict[str, int]:
     }
 
 
+def classify_primary_summary_failure(error_text: str) -> str:
+    lower = (error_text or "").lower()
+    if "127.0.0.1" in lower or ":11434" in lower or "ollama" in lower:
+        return "ollama"
+    return "source"
+
+
 def llm_compare_status() -> dict[str, Any]:
     session = current_compare_session()
     diagnostics_session = latest_compare_session()
@@ -2252,7 +2259,9 @@ def llm_compare_status() -> dict[str, Any]:
                 """
                 SELECT
                     COUNT(*) AS result_count,
-                    COUNT(DISTINCT article_id) AS article_count
+                    COUNT(DISTINCT article_id) AS article_count,
+                    SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok_count,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count
                 FROM llm_compare_results
                 WHERE session_id = ?
                 """,
@@ -2300,9 +2309,22 @@ def llm_compare_status() -> dict[str, Any]:
                 """,
                 (session["enabled_at"],),
             ).fetchone()
+            failed_primary_rows = conn.execute(
+                """
+                SELECT last_error
+                FROM articles
+                WHERE feed_decision = 'summarize'
+                  AND summary_status = 'failed'
+                  AND summary_requested_at IS NOT NULL
+                  AND datetime(summary_requested_at) >= datetime(?)
+                """,
+                (session["enabled_at"],),
+            ).fetchall()
 
         result_count = int(rows["result_count"] if rows else 0)
         article_count = int(rows["article_count"] if rows else 0)
+        compare_ok_count = int(rows["ok_count"] if rows and rows["ok_count"] is not None else 0)
+        compare_failed_count = int(rows["failed_count"] if rows and rows["failed_count"] is not None else 0)
         completed_articles = int(completed_articles_row["completed_articles"] if completed_articles_row else 0)
         pending_articles = int(pending_articles_row["pending_articles"] if pending_articles_row else 0)
         requested_total = int(primary_rows["requested_total"] if primary_rows and primary_rows["requested_total"] is not None else 0)
@@ -2310,17 +2332,30 @@ def llm_compare_status() -> dict[str, Any]:
         processing_count = int(primary_rows["processing_count"] if primary_rows and primary_rows["processing_count"] is not None else 0)
         ready_count = int(primary_rows["ready_count"] if primary_rows and primary_rows["ready_count"] is not None else 0)
         failed_count = int(primary_rows["failed_count"] if primary_rows and primary_rows["failed_count"] is not None else 0)
+        primary_failed_source = 0
+        primary_failed_ollama = 0
+        for row in failed_primary_rows:
+            failure_type = classify_primary_summary_failure(row["last_error"] or "")
+            if failure_type == "ollama":
+                primary_failed_ollama += 1
+            else:
+                primary_failed_source += 1
         session_stats = {
             "requested_total": requested_total,
             "primary_queued": queued_count,
             "primary_processing": processing_count,
             "primary_ready": ready_count,
             "primary_failed": failed_count,
-            "article_count": article_count,
+            "primary_failed_source": primary_failed_source,
+            "primary_failed_ollama": primary_failed_ollama,
+            "compare_article_count": article_count,
+            "compare_candidate_total": ready_count,
             "completed_articles": completed_articles,
             "pending_articles": pending_articles,
             "articles_in_progress": 1 if progress and progress.get("session_id") == session["id"] else 0,
             "result_count": result_count,
+            "compare_ok_results": compare_ok_count,
+            "compare_failed_results": compare_failed_count,
             "total_models": total_models,
         }
 
