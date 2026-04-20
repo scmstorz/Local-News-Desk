@@ -31,6 +31,7 @@ Der Backend-Prozess läuft dauerhaft und zieht standardmäßig alle 5 Minuten ne
 - `local_news_backend.py`
 - `local_config.json`
 - `LOCAL_ARCHITECTURE.md`
+- `MODEL_OPTIMIZATION_GUIDE.md`
 - `requirements.txt`
 
 ## Konfiguration
@@ -105,6 +106,9 @@ LOCAL_NEWS_REFRESH_SECONDS=300
 - Der Toggle `Empfohlen` filtert inzwischen client-seitig auf Basis bereits geladener Feed-Daten; das Umschalten erzeugt keinen zusätzlichen Backend-Request mehr.
 - Der Feed hält einen lokalen Verlauf, damit `Zurück` und Pfeil links auch nach `Weiter` oder `Zusammenfassen` weiter funktionieren.
 - `Model Ops` zeigt während eines Trainingslaufs sofort einen sichtbaren Laufstatus statt nur still auf neue Zahlen zu springen.
+- beim Feed-Retraining wird die Entscheidungsschwelle nicht starr auf `0.5` gelassen, sondern automatisch auf dem Testsplit recall-lastig optimiert, aber mit Schutz gegen zu starken Precision-Abfall
+- `Model Ops` zeigt fuer das Feed-Modell deshalb zusaetzlich die aktive `Threshold`-Schwelle sowie `Precision@10`, `Precision@20` und `Precision@50`
+- Feed-Entscheidungen loggen im Event-Store jetzt zusaetzlich einen Snapshot der damals aktiven Modellvorhersage mit
 
 ## LLM Compare
 
@@ -117,7 +121,8 @@ Wenn `LLM Compare` in `Model Ops` eingeschaltet wird:
 - `Model Ops` zeigt zusätzlich einen Compare-Diagnostics-Block mit letztem Status, letzter Dauer und letztem Fehler pro Modell
 - `Model Ops` zeigt bei trainierten Targets zusätzlich einen direkten Vorher/Nachher-Vergleich der letzten Metriken (`Accuracy`, `Precision`, `Recall`, `F1`)
 - `Model Ops` ergänzt diesen Vergleich inzwischen um eine kurze verbale Einschätzung wie `Eher besser`, `Gemischt` oder `Eher seitwaerts`
-- ein aufklappbarer Erklärbereich beschreibt für Laien, was `Precision`, `Recall` und `F1` in diesem Produktkontext bedeuten
+- ein aufklappbarer Erklärbereich beschreibt für Laien, was `Precision`, `Recall`, `F1`, `Threshold` und `Precision@K` in diesem Produktkontext bedeuten
+- `Model Ops` zeigt zusätzlich die Dauer des letzten Trainingslaufs
 - der Compare-Bereich in `Model Ops` trennt Primär-Summary-Zahlen der aktiven Session sauber von Compare-Modellläufen
 - Primär-Fehler werden dort grob in `Quelle/Text` versus `Ollama` getrennt, Compare-Fehler separat als Modelllauf-Fehler gezählt
 - der sichtbare Hauptstatus in `Model Ops` ist bewusst in Klartext formuliert; technische Zähler liegen nur noch unter `Technische Details`

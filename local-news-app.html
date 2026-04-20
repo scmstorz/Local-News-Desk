@@ -1834,6 +1834,22 @@ Die Markdown-Datei ist attached.`;
             return Number(value).toFixed(3);
         }
 
+        function formatThreshold(value) {
+            if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+            return Number(value).toFixed(3);
+        }
+
+        function precisionAtKDescriptor(notesJson, k) {
+            const bucket = notesJson?.precision_at_k?.[String(k)];
+            if (!bucket || bucket.value === null || bucket.value === undefined) {
+                return null;
+            }
+            return {
+                value: Number(bucket.value).toFixed(3),
+                evaluatedCount: Number(bucket.evaluated_count || 0),
+            };
+        }
+
         function formatDelta(latestValue, previousValue) {
             if (latestValue === null || latestValue === undefined || previousValue === null || previousValue === undefined) {
                 return null;
@@ -1906,6 +1922,8 @@ Die Markdown-Datei ist attached.`;
                         <div><strong>Precision</strong>: Wenn das Modell "interessant" sagt, wie oft stimmt das dann?</div>
                         <div><strong>Recall</strong>: Von allen wirklich interessanten Faellen, wie viele findet das Modell?</div>
                         <div><strong>F1</strong>: Ein gemeinsamer Wert fuer die Balance aus Precision und Recall. Fuer diese App ist das meist die wichtigste Kurzmetrik.</div>
+                        <div><strong>Threshold</strong>: Ab welcher Modell-Wahrscheinlichkeit ein Artikel als empfohlen gilt. Niedriger bedeutet meist weniger uebersehene Treffer, aber mehr zusaetzliche Lese-Arbeit.</div>
+                        <div><strong>Precision@10 / @20 / @50</strong>: Wie viele der obersten Empfehlungen wirklich gut waren. Fuer den Alltag ist das oft aussagekraeftiger als nur eine globale Accuracy.</div>
                     </div>
                 </details>
             `;
@@ -1933,6 +1951,11 @@ Die Markdown-Datei ist attached.`;
             const quality = descriptor.quality || { headline: 'Keine Einschätzung', detail: '' };
             const outcome = trainingOutcomeAssessment(latestRun, previousRun);
             const matrix = latestRun?.confusion_matrix || [[0, 0], [0, 0]];
+            const notesJson = latestRun?.notes_json || {};
+            const precisionAt10 = precisionAtKDescriptor(notesJson, 10);
+            const precisionAt20 = precisionAtKDescriptor(notesJson, 20);
+            const precisionAt50 = precisionAtKDescriptor(notesJson, 50);
+            const thresholdStrategy = notesJson?.threshold_strategy;
             const trainingThisTarget = state.trainingBusy && (
                 state.trainingState?.target === targetKey || state.trainingState?.target === 'all'
             );
@@ -1961,6 +1984,22 @@ Die Markdown-Datei ist attached.`;
                             ${renderMetricCard('Recall', latestRun.recall?.toFixed?.(3) || latestRun.recall)}
                             ${renderMetricCard('F1', latestRun.f1?.toFixed?.(3) || latestRun.f1)}
                         </div>
+                        ${targetKey === 'feed_recommendation' ? `
+                            <div class="data-points" style="margin-top: 14px;">
+                                <span class="data-pill">Threshold ${escapeHtml(formatThreshold(latestRun.threshold_value))}</span>
+                                ${precisionAt10 ? `<span class="data-pill">P@10 ${escapeHtml(precisionAt10.value)}${precisionAt10.evaluatedCount < 10 ? ` (${precisionAt10.evaluatedCount})` : ''}</span>` : ''}
+                                ${precisionAt20 ? `<span class="data-pill">P@20 ${escapeHtml(precisionAt20.value)}${precisionAt20.evaluatedCount < 20 ? ` (${precisionAt20.evaluatedCount})` : ''}</span>` : ''}
+                                ${precisionAt50 ? `<span class="data-pill">P@50 ${escapeHtml(precisionAt50.value)}${precisionAt50.evaluatedCount < 50 ? ` (${precisionAt50.evaluatedCount})` : ''}</span>` : ''}
+                            </div>
+                            <div class="ops-assessment" style="margin-top: 14px;">
+                                <strong>${escapeHtml(thresholdStrategy?.strategy === 'auto_tuned' ? 'Threshold automatisch optimiert' : 'Threshold aktuell fix')}</strong>
+                                <p>
+                                    ${escapeHtml(thresholdStrategy?.strategy === 'auto_tuned'
+                                        ? `Beim letzten Retrain wurde die Schwelle fuer weniger uebersehene Treffer optimiert (${thresholdStrategy?.objective || 'maximize_f2'}).`
+                                        : 'Aktuell gilt die Standardschwelle 0.5.' )}
+                                </p>
+                            </div>
+                        ` : ''}
                         <table class="matrix">
                             <thead>
                                 <tr>
@@ -1986,6 +2025,7 @@ Die Markdown-Datei ist attached.`;
                             <span class="data-pill">Trainiert ${escapeHtml(formatRelativeTime(latestRun.trained_at))}</span>
                             <span class="data-pill">Train ${latestRun.train_size}</span>
                             <span class="data-pill">Test ${latestRun.test_size}</span>
+                            <span class="data-pill">Dauer ${escapeHtml(formatDuration(notesJson?.training_duration_ms))}</span>
                         </div>
                         ${previousRun ? `
                             <div class="ops-assessment">

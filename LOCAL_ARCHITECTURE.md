@@ -13,6 +13,11 @@ Diese lokale Version ersetzt den bisherigen Google-Stack vollständig:
 
 Die bestehende `claude-news-app.html` bleibt unverändert als Referenz erhalten.
 
+Eine erklaerende Einordnung der Modell-Metriken und der Optimierungsstrategie
+fuer Nicht-Statistiker steht zusaetzlich in:
+
+- `MODEL_OPTIMIZATION_GUIDE.md`
+
 ## Produktfluss
 
 ### Feed
@@ -52,6 +57,8 @@ Die bestehende `claude-news-app.html` bleibt unverändert als Referenz erhalten.
 - nüchterne Metrikansicht
 - Konfusionsmatrix
 - Precision / Recall / F1 / Accuracy
+- aktiver Threshold fuer das Feed-Modell
+- `Precision@10`, `Precision@20`, `Precision@50`
 - Anzahl neuer Labels seit letztem Training
 - explizite Einschätzung, ob Retraining aktuell sinnvoll ist
 - explizite Einschätzung, ob das Feed-Modell eher nur fürs Ranking oder schon fürs härtere Filtering taugt
@@ -59,7 +66,8 @@ Die bestehende `claude-news-app.html` bleibt unverändert als Referenz erhalten.
 - sichtbarer Laufstatus während eines Trainings
 - direkter Vergleich zum vorherigen Lauf mit Delta pro Kernmetrik
 - verbale Einordnung des letzten Laufs (`Eher besser`, `Gemischt`, `Eher seitwaerts`, `Eher schlechter`)
-- aufklappbare Laien-Erklärung für `Precision`, `Recall` und `F1`
+- aufklappbare Laien-Erklärung für `Precision`, `Recall`, `F1`, `Threshold` und `Precision@K`
+- sichtbare Dauer des letzten Trainingslaufs
 - Compare-Diagnostics pro Modell mit letztem Status, letzter Dauer und letztem Fehler
 - Compare-Systembereich zeigt zusätzlich Primär-Summary-Zahlen der aktiven Session
 - Primär-Summary-Status und Compare-Modellstatus werden im UI strikt getrennt dargestellt
@@ -167,6 +175,13 @@ Labels:
 - `skip`
 - `summarize`
 
+Training:
+
+- `TF-IDF + LogisticRegression`
+- automatische Threshold-Optimierung beim Retraining statt starrem `0.5`
+- die Schwelle wird recall-lastig ueber ein milderes `F1.5`-Ziel gesucht, aber nur solange die Precision nicht zu stark einbricht
+- `Precision@K` dient zusaetzlich als alltagsnahe Ranking-Metrik fuer die obersten Empfehlungen
+
 Zusätzlicher nicht-trainierender Zustand:
 
 - `archived`
@@ -217,6 +232,7 @@ Gründe:
 - der letzte Trainingslauf ist direkt gegen den vorherigen Lauf vergleichbar
 - ein ausgelöster Trainingslauf darf sich nicht wie ein toter Klick anfühlen
 - Metriken brauchen kurze Übersetzung für Nicht-ML-Spezialisten
+- fuer das Feed-Modell sind uebersehene interessante Artikel teurer als zu viele Empfehlungen; deshalb wird die Schwelle beim Retraining bewusst asymmetrisch optimiert
 
 ### 9. Near-Duplicate-Filter im Feed
 
@@ -446,6 +462,7 @@ Enthält die Ereignishistorie:
 - Summary failed
 - Summary feedback
 - Feed archiviert
+- bei Feed-Entscheidungen zusaetzlich den damaligen Prediction-Snapshot (`run_id`, Wahrscheinlichkeit, Ja/Nein, Threshold)
 
 Grund:
 
@@ -460,6 +477,8 @@ Enthält:
 - Labelmenge
 - Train/Test-Split
 - Accuracy / Precision / Recall / F1
+- Threshold
+- `Precision@10`, `Precision@20`, `Precision@50` im `notes`-Payload
 - Konfusionsmatrix
 
 Grund:

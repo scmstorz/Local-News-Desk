@@ -42,6 +42,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
+    fbeta_score,
     f1_score,
     precision_score,
     recall_score,
@@ -1951,6 +1952,32 @@ def predict_feed_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[list[di
     return items, artifact["run_id"]
 
 
+def compute_feed_prediction_snapshot(row: sqlite3.Row | dict[str, Any]) -> Optional[dict[str, Any]]:
+    artifact = get_loaded_model("feed_recommendation")
+    if not artifact:
+        return None
+
+    item = row if isinstance(row, dict) else row_to_dict(row)
+    cached_prediction = build_cached_feed_prediction(item, artifact["run_id"])
+    if cached_prediction is None:
+        pipeline: Pipeline = artifact["pipeline"]
+        feature = build_feature_text("feed_recommendation", item)
+        probability = float(pipeline.predict_proba([feature])[0][1])
+        cached_prediction = {
+            "available": True,
+            "recommended": bool(probability >= artifact["threshold"]),
+            "probability": round(probability, 4),
+            "run_id": artifact["run_id"],
+        }
+
+    return {
+        "prediction_model_run_id": cached_prediction["run_id"],
+        "predicted_probability": cached_prediction["probability"],
+        "predicted_recommendation": bool(cached_prediction["recommended"]),
+        "threshold": round(float(artifact["threshold"]), 4),
+    }
+
+
 def update_cached_feed_predictions(rows: list[dict[str, Any]], run_id: Optional[int]) -> None:
     if not rows or run_id is None:
         return
@@ -2101,6 +2128,7 @@ def set_feed_decision(article_id: int, decision: str) -> dict[str, Any]:
             raise LookupError("Article not found")
 
         row_dict = row_to_dict(row)
+        prediction_snapshot = compute_feed_prediction_snapshot(row_dict)
         now = utc_now_iso()
         summary_status = row_dict["summary_status"]
         summary_requested_at = row_dict["summary_requested_at"]
@@ -2144,6 +2172,7 @@ def set_feed_decision(article_id: int, decision: str) -> dict[str, Any]:
             {
                 "previous_feed_decision": row_dict["feed_decision"],
                 "new_feed_decision": decision,
+                "prediction_snapshot": prediction_snapshot,
             },
         )
         deduplicated_ids = archive_pending_duplicates_for_article(conn, row_dict, decision)
@@ -2571,6 +2600,7 @@ def retraining_recommendation(target: str, latest_run: Optional[dict[str, Any]])
 
     delta = new_labels_since_training(target, latest_run["trained_at"])
     threshold = max(10, int(latest_run["labels_used"] * 0.15))
+    trained_at = latest_run["trained_at"]
     return {
         "recommended": delta >= threshold,
         "reason": "enough_new_labels" if delta >= threshold else "delta_too_small",
@@ -2580,7 +2610,7 @@ def retraining_recommendation(target: str, latest_run: Optional[dict[str, Any]])
             else "Mit Retraining noch warten"
         ),
         "detail": (
-            f"Seit dem letzten Training kamen {delta} neue Labels dazu. Ab etwa {threshold} lohnt sich der nächste Lauf."
+            f"Letzter Lauf: {trained_at}. Seitdem kamen {delta} neue Labels dazu. Ab etwa {threshold} lohnt sich der nächste Lauf."
         ),
     }
 
@@ -2644,10 +2674,72 @@ def model_quality_assessment(target: str, latest_run: Optional[dict[str, Any]]) 
     }
 
 
+def precision_at_k(probabilities: list[float], labels: list[int], k: int) -> dict[str, Any]:
+    if not probabilities or not labels:
+        return {"value": None, "evaluated_count": 0}
+    ranked = sorted(zip(probabilities, labels), key=lambda pair: pair[0], reverse=True)
+    top = ranked[: min(k, len(ranked))]
+    if not top:
+        return {"value": None, "evaluated_count": 0}
+    positives = sum(label for _, label in top)
+    return {
+        "value": round(positives / len(top), 4),
+        "evaluated_count": len(top),
+    }
+
+
+def select_feed_threshold(labels: list[int], probabilities: list[float]) -> tuple[float, dict[str, Any]]:
+    if not probabilities:
+        return 0.5, {
+            "strategy": "fixed_default",
+            "objective": "f1_5_with_precision_floor",
+            "candidate_count": 1,
+            "beta": 1.5,
+        }
+
+    candidate_thresholds = sorted({round(float(probability), 6) for probability in probabilities} | {0.5})
+    baseline_predicted = [1 if probability >= 0.5 else 0 for probability in probabilities]
+    baseline_precision = float(precision_score(labels, baseline_predicted, zero_division=0))
+    baseline_recall = float(recall_score(labels, baseline_predicted, zero_division=0))
+    beta = 1.5
+    precision_floor = max(0.18, baseline_precision * 0.85)
+
+    eligible_snapshots: list[tuple[float, float, float, float, float]] = []
+    fallback_snapshots: list[tuple[float, float, float, float, float]] = []
+
+    for threshold in candidate_thresholds:
+        predicted = [1 if probability >= threshold else 0 for probability in probabilities]
+        precision = float(precision_score(labels, predicted, zero_division=0))
+        recall = float(recall_score(labels, predicted, zero_division=0))
+        fbeta = float(fbeta_score(labels, predicted, beta=beta, zero_division=0))
+        snapshot = (fbeta, recall, precision, -abs(threshold - 0.5), threshold)
+        fallback_snapshots.append(snapshot)
+        if precision >= precision_floor:
+            eligible_snapshots.append(snapshot)
+
+    chosen_snapshot = max(eligible_snapshots or fallback_snapshots)
+    best_fbeta, best_recall, best_precision, _distance_bias, best_threshold = chosen_snapshot
+
+    return round(float(best_threshold), 4), {
+        "strategy": "auto_tuned",
+        "objective": "maximize_f1_5_with_precision_floor",
+        "candidate_count": len(candidate_thresholds),
+        "beta": beta,
+        "baseline_precision": round(baseline_precision, 4),
+        "baseline_recall": round(baseline_recall, 4),
+        "precision_floor": round(precision_floor, 4),
+        "best_fbeta": round(best_fbeta, 4),
+        "best_precision": round(best_precision, 4),
+        "best_recall": round(best_recall, 4),
+        "used_precision_floor": bool(eligible_snapshots),
+    }
+
+
 def train_model(target: str) -> dict[str, Any]:
     if target not in TARGET_CONFIG:
         raise ValueError(f"Unsupported target {target}")
 
+    training_started = time.perf_counter()
     config = TARGET_CONFIG[target]
     with db_connection() as conn:
         rows = conn.execute(config["query"]).fetchall()
@@ -2702,15 +2794,35 @@ def train_model(target: str) -> dict[str, Any]:
         ]
     )
     pipeline.fit(train_x, train_y)
-    predicted = pipeline.predict(test_x)
+    threshold_value = 0.5
+    evaluation_notes: dict[str, Any] = {}
+    if target == "feed_recommendation":
+        probabilities = [float(value) for value in pipeline.predict_proba(test_x)[:, 1]]
+        threshold_value, threshold_notes = select_feed_threshold(test_y, probabilities)
+        predicted = [1 if probability >= threshold_value else 0 for probability in probabilities]
+        evaluation_notes = {
+            "threshold_strategy": threshold_notes,
+            "precision_at_k": {
+                "10": precision_at_k(probabilities, test_y, 10),
+                "20": precision_at_k(probabilities, test_y, 20),
+                "50": precision_at_k(probabilities, test_y, 50),
+            },
+        }
+    else:
+        predicted = pipeline.predict(test_x)
     matrix = confusion_matrix(test_y, predicted, labels=[0, 1]).tolist()
     accuracy = float(accuracy_score(test_y, predicted))
     precision = float(precision_score(test_y, predicted, zero_division=0))
     recall = float(recall_score(test_y, predicted, zero_division=0))
     f1 = float(f1_score(test_y, predicted, zero_division=0))
+    training_duration_ms = int((time.perf_counter() - training_started) * 1000)
 
     trained_at = utc_now_iso()
     model_path = MODEL_DIR / config["artifact_name"]
+    notes_payload = {
+        "training_duration_ms": training_duration_ms,
+        **evaluation_notes,
+    }
     with db_connection() as conn:
         cursor = conn.execute(
             """
@@ -2734,9 +2846,9 @@ def train_model(target: str) -> dict[str, Any]:
                 precision,
                 recall,
                 f1,
-                0.5,
+                threshold_value,
                 json.dumps(matrix),
-                "",
+                json.dumps(notes_payload),
                 "trained",
             ),
         )
@@ -2746,7 +2858,7 @@ def train_model(target: str) -> dict[str, Any]:
         "target": target,
         "run_id": run_id,
         "trained_at": trained_at,
-        "threshold": 0.5,
+        "threshold": threshold_value,
         "pipeline": pipeline,
     }
     joblib.dump(artifact, model_path)
@@ -2771,6 +2883,9 @@ def train_model(target: str) -> dict[str, Any]:
         "precision": round(precision, 4),
         "recall": round(recall, 4),
         "f1": round(f1, 4),
+        "threshold_value": threshold_value,
+        "training_duration_ms": training_duration_ms,
+        "notes": notes_payload,
         "confusion_matrix": matrix,
     }
 
@@ -3257,6 +3372,16 @@ def api_model_ops():
             payload["targets"][target]["latest_run"]["confusion_matrix"] = json.loads(
                 latest_run["confusion_matrix_json"]
             )
+        if latest_run and latest_run.get("notes"):
+            try:
+                payload["targets"][target]["latest_run"]["notes_json"] = json.loads(latest_run["notes"])
+            except json.JSONDecodeError:
+                payload["targets"][target]["latest_run"]["notes_json"] = {}
+        if previous_run and previous_run.get("notes"):
+            try:
+                payload["targets"][target]["previous_run"]["notes_json"] = json.loads(previous_run["notes"])
+            except json.JSONDecodeError:
+                payload["targets"][target]["previous_run"]["notes_json"] = {}
     return jsonify(payload)
 
 
