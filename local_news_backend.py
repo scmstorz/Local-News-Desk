@@ -77,7 +77,7 @@ DEFAULT_SETTINGS = {
     "llm_compare": {
         "enabled": False,
         "export_dir": "compare_exports",
-        "request_timeout_seconds": 120,
+        "request_timeout_seconds": 600,
         "models": [
             "qwen3.5:35b",
             "gemma4:31b",
@@ -228,8 +228,10 @@ CREATE TABLE IF NOT EXISTS llm_compare_results (
     session_id INTEGER NOT NULL,
     article_id INTEGER NOT NULL,
     model_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ok',
     summary_title TEXT NOT NULL,
     summary_text TEXT NOT NULL,
+    error_text TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     FOREIGN KEY(session_id) REFERENCES llm_compare_sessions(id) ON DELETE CASCADE,
     FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE,
@@ -331,6 +333,19 @@ def init_db() -> None:
     ensure_dirs()
     with db_connection() as conn:
         conn.executescript(SCHEMA_SQL)
+        migrate_db(conn)
+
+
+def column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return any(row["name"] == column_name for row in rows)
+
+
+def migrate_db(conn: sqlite3.Connection) -> None:
+    if not column_exists(conn, "llm_compare_results", "status"):
+        conn.execute("ALTER TABLE llm_compare_results ADD COLUMN status TEXT NOT NULL DEFAULT 'ok'")
+    if not column_exists(conn, "llm_compare_results", "error_text"):
+        conn.execute("ALTER TABLE llm_compare_results ADD COLUMN error_text TEXT NOT NULL DEFAULT ''")
 
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -994,12 +1009,27 @@ def bootstrap_compare_mode() -> None:
         wake_compare_worker()
 
 
-def append_compare_export(
+def rewrite_compare_export_article(
     session: dict[str, Any],
     article: dict[str, Any],
     final_url: str,
-    summaries: list[dict[str, Any]],
 ) -> None:
+    with db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT model_name, status, summary_title, summary_text, error_text
+            FROM llm_compare_results
+            WHERE session_id = ? AND article_id = ?
+            """,
+            (session["id"], article["id"]),
+        ).fetchall()
+
+    summaries_by_model = {row["model_name"]: row_to_dict(row) for row in rows}
+    ordered_summaries: list[dict[str, Any]] = []
+    for model_name in json.loads(session["models_json"]):
+        if model_name in summaries_by_model:
+            ordered_summaries.append(summaries_by_model[model_name])
+
     export_path = Path(session["export_path"])
     lines = [
         f'<article_compare article_id="{article["id"]}" created_at="{html_lib.escape(utc_now_iso())}">',
@@ -1007,17 +1037,26 @@ def append_compare_export(
         f"  <source>{html_lib.escape(article.get('source_label', ''))}</source>",
         f"  <url>{html_lib.escape(final_url)}</url>",
     ]
-    for summary in summaries:
+    for summary in ordered_summaries:
         status = summary.get("status", "ok")
         lines.append(f'  <model_summary model="{html_lib.escape(summary["model_name"])}" status="{html_lib.escape(status)}">')
         lines.append(f"    <summary_title>{html_lib.escape(summary.get('summary_title', ''))}</summary_title>")
         lines.append(f"    <summary_text>{html_lib.escape(summary.get('summary_text', ''))}</summary_text>")
-        if summary.get("error"):
-            lines.append(f"    <error>{html_lib.escape(summary.get('error', ''))}</error>")
+        if summary.get("error_text"):
+            lines.append(f"    <error>{html_lib.escape(summary.get('error_text', ''))}</error>")
         lines.append("  </model_summary>")
     lines.extend(["</article_compare>", ""])
-    with open(export_path, "a", encoding="utf-8") as handle:
-        handle.write("\n".join(lines))
+    article_block = "\n".join(lines)
+    content = export_path.read_text(encoding="utf-8") if export_path.exists() else ""
+    pattern = re.compile(
+        rf'<article_compare article_id="{article["id"]}"[^>]*>.*?</article_compare>\n*',
+        re.DOTALL,
+    )
+    content = pattern.sub("", content).rstrip()
+    if content and not content.endswith("\n"):
+        content += "\n"
+    content = f"{content}\n{article_block}\n".lstrip()
+    export_path.write_text(content, encoding="utf-8")
 
 
 def store_compare_result(
@@ -1025,17 +1064,28 @@ def store_compare_result(
     session_id: int,
     article_id: int,
     model_name: str,
+    status: str,
     summary_title: str,
     summary_text: str,
+    error_text: str = "",
 ) -> None:
     conn.execute(
         """
         INSERT OR REPLACE INTO llm_compare_results(
-            session_id, article_id, model_name, summary_title, summary_text, created_at
+            session_id, article_id, model_name, status, summary_title, summary_text, error_text, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (session_id, article_id, model_name, summary_title, summary_text, utc_now_iso()),
+        (
+            session_id,
+            article_id,
+            model_name,
+            status,
+            summary_title,
+            summary_text,
+            error_text,
+            utc_now_iso(),
+        ),
     )
 
 
@@ -1058,17 +1108,17 @@ def run_compare_summaries(
     with db_connection() as conn:
         existing_rows = conn.execute(
             """
-            SELECT model_name
+            SELECT model_name, status
             FROM llm_compare_results
             WHERE session_id = ? AND article_id = ?
             """,
             (session["id"], article_id),
         ).fetchall()
         existing_models = {row["model_name"] for row in existing_rows}
+        existing_failed_models = sum(1 for row in existing_rows if row["status"] == "failed")
 
-    summaries_to_export: list[dict[str, Any]] = []
     completed_models = len(existing_models)
-    failed_models = 0
+    failed_models = existing_failed_models
     total_models = len(models)
     started_at = utc_now_iso()
 
@@ -1121,6 +1171,16 @@ def run_compare_summaries(
             except Exception as exc:
                 failed_models += 1
                 with db_connection() as conn:
+                    store_compare_result(
+                        conn,
+                        int(session["id"]),
+                        article_id,
+                        model_name,
+                        "failed",
+                        "",
+                        "",
+                        str(exc),
+                    )
                     log_event(
                         conn,
                         article_id,
@@ -1131,15 +1191,6 @@ def run_compare_summaries(
                             "error": str(exc),
                         },
                     )
-                summaries_to_export.append(
-                    {
-                        "model_name": model_name,
-                        "status": "failed",
-                        "error": str(exc),
-                        "summary_title": "",
-                        "summary_text": "",
-                    }
-                )
                 completed_models += 1
                 update_app_state(
                     "llm_compare_progress",
@@ -1164,6 +1215,7 @@ def run_compare_summaries(
                 int(session["id"]),
                 article_id,
                 model_name,
+                "ok",
                 compare_title,
                 compare_text,
             )
@@ -1177,14 +1229,6 @@ def run_compare_summaries(
                 },
             )
 
-        summaries_to_export.append(
-            {
-                "model_name": model_name,
-                "status": "ok",
-                "summary_title": compare_title,
-                "summary_text": compare_text,
-            }
-        )
         completed_models += 1
         update_app_state(
             "llm_compare_progress",
@@ -1202,8 +1246,8 @@ def run_compare_summaries(
             },
         )
 
-    if summaries_to_export:
-        append_compare_export(session, article, final_url, summaries_to_export)
+    if completed_models:
+        rewrite_compare_export_article(session, article, final_url)
 
     clear_compare_progress()
 
@@ -1738,7 +1782,7 @@ def fetch_next_compare_job() -> Optional[dict[str, Any]]:
             SELECT a.*
             FROM articles a
             WHERE a.summary_status = 'ready'
-              AND a.summary_feedback = 'unreviewed'
+              AND datetime(a.summarized_at) >= datetime(?)
               AND (
                 SELECT COUNT(DISTINCT model_name)
                 FROM llm_compare_results
@@ -1747,7 +1791,7 @@ def fetch_next_compare_job() -> Optional[dict[str, Any]]:
             ORDER BY datetime(a.summarized_at) ASC, a.id ASC
             LIMIT 1
             """,
-            (session["id"], model_count),
+            (session["enabled_at"], session["id"], model_count),
         ).fetchone()
     return row_to_dict(row) if row else None
 
@@ -2189,14 +2233,14 @@ def llm_compare_status() -> dict[str, Any]:
                 SELECT COUNT(*) AS pending_articles
                 FROM articles a
                 WHERE a.summary_status = 'ready'
-                  AND a.summary_feedback = 'unreviewed'
+                  AND datetime(a.summarized_at) >= datetime(?)
                   AND (
                     SELECT COUNT(DISTINCT model_name)
                     FROM llm_compare_results
                     WHERE session_id = ? AND article_id = a.id
                   ) < ?
                 """,
-                (session["id"], total_models),
+                (session["enabled_at"], session["id"], total_models),
             ).fetchone()
 
         result_count = int(rows["result_count"] if rows else 0)

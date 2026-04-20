@@ -14,7 +14,7 @@
   "llm_compare": {
     "enabled": false,
     "export_dir": "compare_exports",
-    "request_timeout_seconds": 120,
+    "request_timeout_seconds": 600,
     "models": [
       "qwen3.5:35b",
       "gemma4:31b",

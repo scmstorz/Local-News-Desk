@@ -107,6 +107,8 @@ Wenn `LLM Compare` in `Model Ops` eingeschaltet wird:
 - zeigt die UI zusätzlich laufenden Compare-Fortschritt im Header, in der Summary-Queue und in `Model Ops`
 - läuft der Compare-Teil in einem eigenen Hintergrund-Worker und blockiert den Summary-Worker nicht mehr
 - einzelne Compare-Timeouts werden als Fehler protokolliert und lassen die Session weiterlaufen
+- fehlgeschlagene Modellläufe zählen als erledigte Compare-Schritte und blockieren die Session nicht dauerhaft
+- verglichen werden nur Summaries, die während der aktiven Compare-Session entstanden sind
 
 Die Datei ist bewusst frontier-modell-freundlich formatiert:
 

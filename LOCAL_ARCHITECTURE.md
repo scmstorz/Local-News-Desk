@@ -128,6 +128,8 @@ Verhalten:
 - der laufende Compare-Fortschritt wird separat in `app_state` gehalten und in der UI sichtbar gemacht
 - Compare läuft in einem eigenen Hintergrund-Worker und blockiert den Summary-Worker nicht
 - einzelne Modell-Timeouts werden als Vergleichsfehler geloggt und die Session läuft weiter
+- fehlgeschlagene Modellläufe werden in `llm_compare_results` mit Status gespeichert und zählen als abgeschlossene Schritte
+- eine Compare-Session verarbeitet nur Summaries, die seit `enabled_at` dieser Session erzeugt wurden
 
 Gründe:
 
