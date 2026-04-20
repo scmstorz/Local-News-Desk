@@ -105,7 +105,9 @@ Wenn `LLM Compare` in `Model Ops` eingeschaltet wird:
 - laufen zusätzlich alle in `local_config.json` konfigurierten Compare-Modelle sequenziell
 - wird pro aktivierter Session genau eine Exportdatei in `compare_exports/` aufgebaut
 - zeigt die UI zusätzlich laufenden Compare-Fortschritt im Header, in der Summary-Queue und in `Model Ops`
+- `Model Ops` zeigt zusätzlich einen Compare-Diagnostics-Block mit letztem Status, letzter Dauer und letztem Fehler pro Modell
 - läuft der Compare-Teil in einem eigenen Hintergrund-Worker und blockiert den Summary-Worker nicht mehr
+- der Compare-Teil hat einen eigenen Timeout in `local_config.json`
 - einzelne Compare-Timeouts werden als Fehler protokolliert und lassen die Session weiterlaufen
 - fehlgeschlagene Modellläufe zählen als erledigte Compare-Schritte und blockieren die Session nicht dauerhaft
 - verglichen werden nur Summaries, die während der aktiven Compare-Session entstanden sind

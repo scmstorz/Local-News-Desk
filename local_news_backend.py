@@ -229,6 +229,7 @@ CREATE TABLE IF NOT EXISTS llm_compare_results (
     article_id INTEGER NOT NULL,
     model_name TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'ok',
+    duration_ms INTEGER NOT NULL DEFAULT 0,
     summary_title TEXT NOT NULL,
     summary_text TEXT NOT NULL,
     error_text TEXT NOT NULL DEFAULT '',
@@ -344,6 +345,8 @@ def column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -
 def migrate_db(conn: sqlite3.Connection) -> None:
     if not column_exists(conn, "llm_compare_results", "status"):
         conn.execute("ALTER TABLE llm_compare_results ADD COLUMN status TEXT NOT NULL DEFAULT 'ok'")
+    if not column_exists(conn, "llm_compare_results", "duration_ms"):
+        conn.execute("ALTER TABLE llm_compare_results ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0")
     if not column_exists(conn, "llm_compare_results", "error_text"):
         conn.execute("ALTER TABLE llm_compare_results ADD COLUMN error_text TEXT NOT NULL DEFAULT ''")
 
@@ -919,6 +922,22 @@ def current_compare_session() -> Optional[dict[str, Any]]:
     return row_to_dict(row) if row else None
 
 
+def latest_compare_session() -> Optional[dict[str, Any]]:
+    session = current_compare_session()
+    if session:
+        return session
+    with db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM llm_compare_sessions
+            ORDER BY datetime(enabled_at) DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
 def clear_compare_progress() -> None:
     update_app_state("llm_compare_progress", None)
 
@@ -1065,6 +1084,7 @@ def store_compare_result(
     article_id: int,
     model_name: str,
     status: str,
+    duration_ms: int,
     summary_title: str,
     summary_text: str,
     error_text: str = "",
@@ -1072,15 +1092,16 @@ def store_compare_result(
     conn.execute(
         """
         INSERT OR REPLACE INTO llm_compare_results(
-            session_id, article_id, model_name, status, summary_title, summary_text, error_text, created_at
+            session_id, article_id, model_name, status, duration_ms, summary_title, summary_text, error_text, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
             article_id,
             model_name,
             status,
+            duration_ms,
             summary_title,
             summary_text,
             error_text,
@@ -1159,8 +1180,11 @@ def run_compare_summaries(
         )
 
         if model_name == OLLAMA_MODEL:
+            model_started = time.perf_counter()
             compare_title, compare_text = primary_title, primary_summary
+            duration_ms = int((time.perf_counter() - model_started) * 1000)
         else:
+            model_started = time.perf_counter()
             try:
                 compare_title, compare_text = ollama_generate_summary(
                     article["title"],
@@ -1168,7 +1192,9 @@ def run_compare_summaries(
                     model_name=model_name,
                     timeout_seconds=get_compare_timeout_seconds(),
                 )
+                duration_ms = int((time.perf_counter() - model_started) * 1000)
             except Exception as exc:
+                duration_ms = int((time.perf_counter() - model_started) * 1000)
                 failed_models += 1
                 with db_connection() as conn:
                     store_compare_result(
@@ -1177,6 +1203,7 @@ def run_compare_summaries(
                         article_id,
                         model_name,
                         "failed",
+                        duration_ms,
                         "",
                         "",
                         str(exc),
@@ -1216,6 +1243,7 @@ def run_compare_summaries(
                 article_id,
                 model_name,
                 "ok",
+                duration_ms,
                 compare_title,
                 compare_text,
             )
@@ -2198,8 +2226,10 @@ def summary_counts() -> dict[str, int]:
 
 def llm_compare_status() -> dict[str, Any]:
     session = current_compare_session()
+    diagnostics_session = latest_compare_session()
     progress = get_app_state("llm_compare_progress")
     session_stats: Optional[dict[str, Any]] = None
+    diagnostics: Optional[dict[str, Any]] = None
 
     if session:
         models = json.loads(session["models_json"])
@@ -2256,12 +2286,80 @@ def llm_compare_status() -> dict[str, Any]:
             "total_models": total_models,
         }
 
+    if diagnostics_session:
+        models = json.loads(diagnostics_session["models_json"])
+        with db_connection() as conn:
+            aggregate_rows = conn.execute(
+                """
+                SELECT
+                    model_name,
+                    SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok_count,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count
+                FROM llm_compare_results
+                WHERE session_id = ?
+                GROUP BY model_name
+                """,
+                (diagnostics_session["id"],),
+            ).fetchall()
+            latest_rows = conn.execute(
+                """
+                SELECT
+                    r.model_name,
+                    r.status,
+                    r.duration_ms,
+                    r.error_text,
+                    r.created_at,
+                    r.article_id,
+                    a.title AS article_title
+                FROM llm_compare_results r
+                JOIN articles a ON a.id = r.article_id
+                WHERE r.session_id = ?
+                ORDER BY r.model_name ASC, datetime(r.created_at) DESC, r.id DESC
+                """,
+                (diagnostics_session["id"],),
+            ).fetchall()
+
+        aggregates = {row["model_name"]: row_to_dict(row) for row in aggregate_rows}
+        latest_by_model: dict[str, dict[str, Any]] = {}
+        for row in latest_rows:
+            if row["model_name"] not in latest_by_model:
+                latest_by_model[row["model_name"]] = row_to_dict(row)
+
+        diagnostics_models: list[dict[str, Any]] = []
+        for model_name in models:
+            latest = latest_by_model.get(model_name, {})
+            aggregate = aggregates.get(model_name, {})
+            diagnostics_models.append(
+                {
+                    "model_name": model_name,
+                    "last_status": latest.get("status"),
+                    "last_duration_ms": latest.get("duration_ms"),
+                    "last_error": latest.get("error_text") or "",
+                    "last_completed_at": latest.get("created_at"),
+                    "last_article_id": latest.get("article_id"),
+                    "last_article_title": latest.get("article_title") or "",
+                    "ok_count": int(aggregate.get("ok_count", 0) or 0),
+                    "failed_count": int(aggregate.get("failed_count", 0) or 0),
+                }
+            )
+
+        diagnostics = {
+            "session_id": diagnostics_session["id"],
+            "session_status": diagnostics_session["status"],
+            "enabled_at": diagnostics_session["enabled_at"],
+            "disabled_at": diagnostics_session.get("disabled_at"),
+            "export_path": diagnostics_session["export_path"],
+            "models": diagnostics_models,
+        }
+
     return {
         "enabled": get_compare_enabled(),
         "models": get_compare_models(),
         "session": session,
+        "last_session": diagnostics_session,
         "progress": progress,
         "session_stats": session_stats,
+        "diagnostics": diagnostics,
     }
 
 

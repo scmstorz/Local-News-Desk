@@ -817,6 +817,14 @@
             return `${Math.round(probability * 100)}%`;
         }
 
+        function formatDuration(durationMs) {
+            if (durationMs === null || durationMs === undefined) return '—';
+            const seconds = durationMs / 1000;
+            if (seconds < 1) return `${Math.round(durationMs)} ms`;
+            if (seconds < 60) return `${seconds.toFixed(1)} s`;
+            return `${(seconds / 60).toFixed(1)} min`;
+        }
+
         function basename(path) {
             if (!path) return '—';
             const parts = String(path).split(/[\\/]/);
@@ -1480,6 +1488,66 @@ Hier ist die zu bewertende Datei:
             `;
         }
 
+        function renderCompareDiagnostics(compare) {
+            const diagnostics = compare?.diagnostics;
+            if (!diagnostics) {
+                return `
+                    <div class="ops-card">
+                        <h3>Compare Diagnostics</h3>
+                        <p style="color: var(--ink-soft);">Noch keine Compare-Session vorhanden.</p>
+                    </div>
+                `;
+            }
+
+            const rows = (diagnostics.models || []).map(model => {
+                const status = model.last_status || 'noch kein Lauf';
+                const toneClass = model.last_status === 'ok'
+                    ? 'compare-on'
+                    : model.last_status === 'failed'
+                        ? 'compare-off'
+                        : '';
+                return `
+                    <tr>
+                        <th style="text-align:left;">${escapeHtml(model.model_name)}</th>
+                        <td><span class="data-pill ${toneClass}">${escapeHtml(status)}</span></td>
+                        <td>${escapeHtml(formatDuration(model.last_duration_ms))}</td>
+                        <td>${escapeHtml(model.last_completed_at ? formatRelativeTime(model.last_completed_at) : '—')}</td>
+                        <td>${escapeHtml(`${model.ok_count}/${model.failed_count}`)}</td>
+                        <td style="text-align:left;">${escapeHtml(model.last_article_title || '—')}</td>
+                        <td style="text-align:left;">${escapeHtml(model.last_error || '—')}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            return `
+                <div class="ops-card" style="grid-column: 1 / -1;">
+                    <h3>Compare Diagnostics</h3>
+                    <div class="data-points">
+                        <span class="data-pill">Session ${diagnostics.session_id}</span>
+                        <span class="data-pill ${diagnostics.session_status === 'active' ? 'compare-on' : 'compare-off'}">${escapeHtml(diagnostics.session_status)}</span>
+                        <span class="data-pill">Start ${escapeHtml(formatRelativeTime(diagnostics.enabled_at))}</span>
+                        <span class="data-pill">Export ${escapeHtml(basename(diagnostics.export_path))}</span>
+                    </div>
+                    <table class="matrix">
+                        <thead>
+                            <tr>
+                                <th style="text-align:left;">Modell</th>
+                                <th>Status</th>
+                                <th>Letzte Dauer</th>
+                                <th>Letzter Lauf</th>
+                                <th>OK/Fail</th>
+                                <th style="text-align:left;">Letzter Artikel</th>
+                                <th style="text-align:left;">Letzter Fehler</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${rows || '<tr><td colspan="7">Noch keine Compare-Daten.</td></tr>'}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+        }
+
         function renderOpsScreen() {
             const host = document.getElementById('screen-ops');
             const feedRun = state.modelOps?.targets?.feed_recommendation;
@@ -1558,6 +1626,7 @@ Hier ist die zu bewertende Datei:
                         <div class="ops-grid">
                             ${feedRun ? renderModelCard('Stufe 1 · Feed Recommendation', 'feed_recommendation', feedRun) : '<div class="ops-card"><h3>Stufe 1 · Feed Recommendation</h3><p>Wird geladen …</p></div>'}
                             ${summaryRun ? renderModelCard('Stufe 2 · Summary Interest', 'summary_interest', summaryRun) : '<div class="ops-card"><h3>Stufe 2 · Summary Interest</h3><p>Wird geladen …</p></div>'}
+                            ${renderCompareDiagnostics(compare)}
                         </div>
                     </div>
                 </div>

@@ -52,6 +52,7 @@ Die bestehende `claude-news-app.html` bleibt unverändert als Referenz erhalten.
 - explizite Einschätzung, ob Retraining aktuell sinnvoll ist
 - explizite Einschätzung, ob das Feed-Modell eher nur fürs Ranking oder schon fürs härtere Filtering taugt
 - manueller Retraining-Trigger
+- Compare-Diagnostics pro Modell mit letztem Status, letzter Dauer und letztem Fehler
 
 ## Architekturentscheidungen
 
@@ -117,12 +118,12 @@ Gründe:
 
 ### 5. Optionaler Mehrmodell-Vergleich
 
-`LLM Compare` hängt sich an den normalen Summary-Worker an.
+`LLM Compare` läuft getrennt vom normalen Summary-Worker in einem eigenen Background-Worker.
 
 Verhalten:
 
 - Primärmodell erzeugt die produktive Summary
-- zusätzliche Compare-Modelle laufen danach sequenziell
+- zusätzliche Compare-Modelle laufen danach sequenziell in einer separaten Compare-Queue
 - Compare-Fehler dürfen die produktive Summary nicht beschädigen
 - Ergebnisse werden sowohl in SQLite als auch in einer Exportdatei pro Compare-Session abgelegt
 - der laufende Compare-Fortschritt wird separat in `app_state` gehalten und in der UI sichtbar gemacht
@@ -130,6 +131,7 @@ Verhalten:
 - einzelne Modell-Timeouts werden als Vergleichsfehler geloggt und die Session läuft weiter
 - fehlgeschlagene Modellläufe werden in `llm_compare_results` mit Status gespeichert und zählen als abgeschlossene Schritte
 - eine Compare-Session verarbeitet nur Summaries, die seit `enabled_at` dieser Session erzeugt wurden
+- `Model Ops` liest Compare-Diagnostics aus den letzten gespeicherten Modellläufen einer Session
 
 Gründe:
 
@@ -429,8 +431,11 @@ Enthält:
 - Session
 - Artikel
 - Modellname
+- Status
+- Dauer des letzten Modelllaufs
 - Summary-Titel
 - Summary-Text
+- optionaler Fehlertext
 
 Grund:
 
@@ -455,7 +460,7 @@ Die Struktur ist bewusst simpel und paste-freundlich:
   <article_title>...</article_title>
   <source>...</source>
   <url>...</url>
-  <model_summary model="qwen3.5:35b">
+  <model_summary model="qwen3.5:35b" status="ok">
     <summary_title>...</summary_title>
     <summary_text>...</summary_text>
   </model_summary>
