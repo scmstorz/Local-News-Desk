@@ -53,6 +53,7 @@ Die bestehende `claude-news-app.html` bleibt unverändert als Referenz erhalten.
 - explizite Einschätzung, ob das Feed-Modell eher nur fürs Ranking oder schon fürs härtere Filtering taugt
 - manueller Retraining-Trigger
 - Compare-Diagnostics pro Modell mit letztem Status, letzter Dauer und letztem Fehler
+- Compare-Systembereich zeigt zusätzlich Primär-Summary-Zahlen der aktiven Session
 
 ## Architekturentscheidungen
 

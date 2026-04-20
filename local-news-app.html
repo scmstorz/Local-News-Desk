@@ -735,6 +735,7 @@
                     <div class="status-pill">Archiviert <strong id="feedArchivedCount">0</strong></div>
                     <div class="status-pill">Summary-Queue <strong id="summaryQueueCount">0</strong></div>
                     <div class="status-pill">Neue Summaries <strong id="summaryReadyCount">0</strong></div>
+                    <div class="status-pill">Not available <strong id="summaryFailedCount">0</strong></div>
                     <div class="status-pill compare-off" id="compareStatusPill">Compare <strong id="compareStatusValue">aus</strong></div>
                 </div>
             </div>
@@ -823,6 +824,10 @@
             if (seconds < 1) return `${Math.round(durationMs)} ms`;
             if (seconds < 60) return `${seconds.toFixed(1)} s`;
             return `${(seconds / 60).toFixed(1)} min`;
+        }
+
+        function formatSummaryUnavailableCount(count) {
+            return `${count ?? 0} Not available`;
         }
 
         function basename(path) {
@@ -964,6 +969,23 @@ Hier ist die zu bewertende Datei:
                 return `Aktueller Artikel: ${progress.completed_models}/${progress.total_models} Modelle fertig${failures}${currentModel}`;
             }
 
+            if (sessionStats?.requested_total) {
+                const parts = [
+                    `${sessionStats.requested_total} angefordert`,
+                    `${sessionStats.primary_ready ?? 0} primär bereit`,
+                ];
+                if (sessionStats.primary_failed) {
+                    parts.push(`${sessionStats.primary_failed} Not available`);
+                }
+                if (sessionStats.pending_articles) {
+                    parts.push(`${sessionStats.pending_articles} Compare-offen`);
+                }
+                if (!sessionStats.pending_articles && !sessionStats.primary_ready && sessionStats.primary_failed) {
+                    return `Primär-Summaries nicht verfügbar: ${parts.join(' · ')}`;
+                }
+                return `Session: ${parts.join(' · ')}`;
+            }
+
             if (sessionStats?.article_count) {
                 const pending = sessionStats.pending_articles ? ` · ${sessionStats.pending_articles} Artikel offen` : '';
                 return `Session: ${sessionStats.completed_articles}/${sessionStats.article_count} Artikel komplett verglichen${pending}`;
@@ -1044,6 +1066,7 @@ Hier ist die zu bewertende Datei:
             document.getElementById('summaryQueueCount').textContent =
                 (state.status.summaries.queued ?? 0) + (state.status.summaries.processing ?? 0);
             document.getElementById('summaryReadyCount').textContent = state.status.summaries.ready ?? 0;
+            document.getElementById('summaryFailedCount').textContent = state.status.summaries.failed ?? 0;
             document.getElementById('navSummaryCount').textContent = state.status.summaries.ready ? `(${state.status.summaries.ready})` : '';
             const compare = state.status.llm_compare || { enabled: false };
             const comparePill = document.getElementById('compareStatusPill');
@@ -1312,11 +1335,11 @@ Hier ist die zu bewertende Datei:
                         </div>
                         <div class="queue-banner">
                             <strong>${counts.ready} neue Summaries</strong>
-                            <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${counts.failed} fehlgeschlagen${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
+                            <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${formatSummaryUnavailableCount(counts.failed)}${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
                         </div>
                         <div class="empty-state">
                             <h3>Gerade nichts zu reviewen</h3>
-                            <p>Neue Summaries tauchen hier auf, sobald die lokale Queue fertig ist.</p>
+                            <p>Neue Summaries tauchen hier auf, sobald die lokale Queue fertig ist.${counts.failed ? ` ${formatSummaryUnavailableCount(counts.failed)}.` : ''}</p>
                         </div>
                     </div>
                 `;
@@ -1337,7 +1360,7 @@ Hier ist die zu bewertende Datei:
                     </div>
                     <div class="queue-banner">
                         <strong>${counts.ready} neue Summaries</strong>
-                        <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${counts.failed} fehlgeschlagen${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
+                        <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${formatSummaryUnavailableCount(counts.failed)}${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
                     </div>
                     <div class="summary-card">
                         <div class="summary-meta">
@@ -1592,7 +1615,8 @@ Hier ist die zu bewertende Datei:
                                         Modelle: ${escapeHtml((compare.models || []).join(', ') || '—')}
                                         ${compare.session?.export_path ? `<br>Export: ${escapeHtml(basename(compare.session.export_path))}` : ''}
                                         ${compare.enabled ? `<br>${escapeHtml(compareProgressText(compare))}` : ''}
-                                        ${compareStats.article_count ? `<br>Session: ${compareStats.completed_articles}/${compareStats.article_count} Artikel komplett · ${compareStats.result_count} Modellläufe gespeichert${compareStats.pending_articles ? ` · ${compareStats.pending_articles} offen` : ''}` : ''}
+                                        ${compareStats.requested_total ? `<br>Primär: ${compareStats.requested_total} angefordert · ${compareStats.primary_ready ?? 0} bereit · ${compareStats.primary_failed ?? 0} Not available · ${compareStats.primary_queued ?? 0} queued · ${compareStats.primary_processing ?? 0} in Arbeit` : ''}
+                                        ${compareStats.article_count ? `<br>Compare: ${compareStats.completed_articles}/${compareStats.article_count} Artikel komplett · ${compareStats.result_count} Modellläufe gespeichert${compareStats.pending_articles ? ` · ${compareStats.pending_articles} offen` : ''}` : ''}
                                         ${compareProgress?.current_model ? `<br>Aktuell läuft: ${escapeHtml(compareProgress.current_model)}` : ''}
                                     </p>
                                 </div>

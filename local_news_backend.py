@@ -2272,12 +2272,37 @@ def llm_compare_status() -> dict[str, Any]:
                 """,
                 (session["enabled_at"], session["id"], total_models),
             ).fetchone()
+            primary_rows = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS requested_total,
+                    SUM(CASE WHEN summary_status = 'queued' THEN 1 ELSE 0 END) AS queued_count,
+                    SUM(CASE WHEN summary_status = 'processing' THEN 1 ELSE 0 END) AS processing_count,
+                    SUM(CASE WHEN summary_status = 'ready' THEN 1 ELSE 0 END) AS ready_count,
+                    SUM(CASE WHEN summary_status = 'failed' THEN 1 ELSE 0 END) AS failed_count
+                FROM articles
+                WHERE feed_decision = 'summarize'
+                  AND summary_requested_at IS NOT NULL
+                  AND datetime(summary_requested_at) >= datetime(?)
+                """,
+                (session["enabled_at"],),
+            ).fetchone()
 
         result_count = int(rows["result_count"] if rows else 0)
         article_count = int(rows["article_count"] if rows else 0)
         completed_articles = int(completed_articles_row["completed_articles"] if completed_articles_row else 0)
         pending_articles = int(pending_articles_row["pending_articles"] if pending_articles_row else 0)
+        requested_total = int(primary_rows["requested_total"] if primary_rows and primary_rows["requested_total"] is not None else 0)
+        queued_count = int(primary_rows["queued_count"] if primary_rows and primary_rows["queued_count"] is not None else 0)
+        processing_count = int(primary_rows["processing_count"] if primary_rows and primary_rows["processing_count"] is not None else 0)
+        ready_count = int(primary_rows["ready_count"] if primary_rows and primary_rows["ready_count"] is not None else 0)
+        failed_count = int(primary_rows["failed_count"] if primary_rows and primary_rows["failed_count"] is not None else 0)
         session_stats = {
+            "requested_total": requested_total,
+            "primary_queued": queued_count,
+            "primary_processing": processing_count,
+            "primary_ready": ready_count,
+            "primary_failed": failed_count,
             "article_count": article_count,
             "completed_articles": completed_articles,
             "pending_articles": pending_articles,

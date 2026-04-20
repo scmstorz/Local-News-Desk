@@ -96,6 +96,7 @@ LOCAL_NEWS_REFRESH_SECONDS=300
 - `trafilatura` ist optional. Wenn es lokal nicht sauber importierbar ist, fällt die Textextraktion automatisch auf `BeautifulSoup` zurück.
 - `Inbox-Reset` archiviert alle aktuell offenen Feed-Einträge, ohne sie aus der Datenbank zu löschen.
 - `LLM Compare` erzeugt pro aktivierter Session eine eigene Markdown-Datei in `compare_exports/`.
+- Wenn ein Artikel wegen Paywall, Popup oder Blockade nicht sauber extrahiert werden kann, zeigt die UI nur den generischen Zustand `Not available`.
 
 ## LLM Compare
 
@@ -106,6 +107,7 @@ Wenn `LLM Compare` in `Model Ops` eingeschaltet wird:
 - wird pro aktivierter Session genau eine Exportdatei in `compare_exports/` aufgebaut
 - zeigt die UI zusätzlich laufenden Compare-Fortschritt im Header, in der Summary-Queue und in `Model Ops`
 - `Model Ops` zeigt zusätzlich einen Compare-Diagnostics-Block mit letztem Status, letzter Dauer und letztem Fehler pro Modell
+- der Compare-Bereich in `Model Ops` zeigt außerdem Primär-Summary-Zahlen der aktiven Session, damit `0` bei Compare verständlich bleibt
 - läuft der Compare-Teil in einem eigenen Hintergrund-Worker und blockiert den Summary-Worker nicht mehr
 - der Compare-Teil hat einen eigenen Timeout in `local_config.json`
 - einzelne Compare-Timeouts werden als Fehler protokolliert und lassen die Session weiterlaufen
