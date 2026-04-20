@@ -477,9 +477,11 @@ def title_similarity_metrics(title_a: str, title_b: str) -> dict[str, Any]:
     similar = False
     if overlap >= 0.9 and len(intersection) >= 3:
         similar = True
-    elif not numbers_conflict and overlap >= 0.74 and long_overlap >= 2 and (jaccard >= 0.45 or sequence >= 0.74):
+    elif not numbers_conflict and overlap >= 0.68 and long_overlap >= 2 and (jaccard >= 0.40 or sequence >= 0.72):
         similar = True
-    elif not numbers_conflict and overlap >= 0.64 and long_overlap >= 3 and sequence >= 0.84:
+    elif not numbers_conflict and overlap >= 0.58 and long_overlap >= 2 and sequence >= 0.80:
+        similar = True
+    elif not numbers_conflict and overlap >= 0.50 and long_overlap >= 2 and sequence >= 0.88:
         similar = True
 
     return {

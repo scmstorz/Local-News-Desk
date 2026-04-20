@@ -102,6 +102,9 @@ LOCAL_NEWS_REFRESH_SECONDS=300
 - hängengebliebene `processing`-Summaries werden nach einem Recovery-Timeout automatisch auf `failed` gesetzt.
 - Der Feed blendet sehr ähnliche Meldungen aus anderen Quellen standardmäßig zusammen und zeigt nur einen Hauptartikel pro Story.
 - Die Ähnlichkeitsgruppierung läuft als Hintergrund-Snapshot; der Feed-Request liest diesen Snapshot nur noch aus und bleibt dadurch beim Reload deutlich schneller.
+- Der Toggle `Empfohlen` filtert inzwischen client-seitig auf Basis bereits geladener Feed-Daten; das Umschalten erzeugt keinen zusätzlichen Backend-Request mehr.
+- Der Feed hält einen lokalen Verlauf, damit `Zurück` und Pfeil links auch nach `Weiter` oder `Zusammenfassen` weiter funktionieren.
+- `Model Ops` zeigt während eines Trainingslaufs sofort einen sichtbaren Laufstatus statt nur still auf neue Zahlen zu springen.
 
 ## LLM Compare
 
@@ -113,6 +116,8 @@ Wenn `LLM Compare` in `Model Ops` eingeschaltet wird:
 - zeigt die UI zusätzlich laufenden Compare-Fortschritt im Header, in der Summary-Queue und in `Model Ops`
 - `Model Ops` zeigt zusätzlich einen Compare-Diagnostics-Block mit letztem Status, letzter Dauer und letztem Fehler pro Modell
 - `Model Ops` zeigt bei trainierten Targets zusätzlich einen direkten Vorher/Nachher-Vergleich der letzten Metriken (`Accuracy`, `Precision`, `Recall`, `F1`)
+- `Model Ops` ergänzt diesen Vergleich inzwischen um eine kurze verbale Einschätzung wie `Eher besser`, `Gemischt` oder `Eher seitwaerts`
+- ein aufklappbarer Erklärbereich beschreibt für Laien, was `Precision`, `Recall` und `F1` in diesem Produktkontext bedeuten
 - der Compare-Bereich in `Model Ops` trennt Primär-Summary-Zahlen der aktiven Session sauber von Compare-Modellläufen
 - Primär-Fehler werden dort grob in `Quelle/Text` versus `Ollama` getrennt, Compare-Fehler separat als Modelllauf-Fehler gezählt
 - der sichtbare Hauptstatus in `Model Ops` ist bewusst in Klartext formuliert; technische Zähler liegen nur noch unter `Technische Details`
@@ -134,7 +139,7 @@ Der Compare-Modus ist absichtlich optional, weil er die Summary-Laufzeit deutlic
 
 ## Ähnliche Feed-Meldungen
 
-Der Feed gruppiert sehr ähnliche Headlines konservativ, damit dieselbe Story nicht mehrfach aus verschiedenen Quellen auftaucht.
+Der Feed gruppiert sehr ähnliche Headlines bewusst eher streng, aber inzwischen etwas toleranter gegen leichte Titelvarianten, damit dieselbe Story nicht mehrfach aus verschiedenen Quellen auftaucht.
 
 Verhalten:
 
@@ -147,11 +152,11 @@ Verhalten:
 
 Die Logik ist bewusst konservativ:
 
-- nur sehr ähnliche Headlines werden zusammengezogen
+- nur sehr ähnliche Headlines werden zusammengezogen, aber leichte Umformulierungen derselben Story werden inzwischen etwas eher erkannt
 - verwandte Follow-ups mit neuem Winkel sollen weiterhin durchkommen
 
 Performance:
 
 - die Similarity-Bildung über viele Pending-Artikel läuft nicht mehr direkt im Feed-Request
-- stattdessen wird ein Snapshot im Hintergrund vorbereitet und in `app_state` gespeichert
+- stattdessen wird ein Snapshot im Hintergrund vorbereitet und nur im laufenden Backend-Prozess im Speicher gehalten
 - der Feed fällt nur dann kurzfristig auf einen ungruppierten Zustand zurück, wenn noch kein aktueller Snapshot vorhanden ist

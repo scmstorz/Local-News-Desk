@@ -21,6 +21,8 @@ Die bestehende `claude-news-app.html` bleibt unverändert als Referenz erhalten.
 - linearer schneller Flow
 - sichtbar: `Titel`, `Quelle`, `Zeit`
 - sehr ähnliche Meldungen aus mehreren Quellen werden zu einer Story zusammengezogen
+- der Modus `Empfohlen` filtert lokal aus bereits geladenen Feed-Daten und braucht keinen zweiten Feed-Request
+- ein lokaler Feed-Verlauf hält bereits bearbeitete Artikel für `Zurück` weiter verfügbar
 - Aktionen:
   - `Weiter` -> negatives Label
   - `Zusammenfassen` -> positives Label
@@ -54,6 +56,10 @@ Die bestehende `claude-news-app.html` bleibt unverändert als Referenz erhalten.
 - explizite Einschätzung, ob Retraining aktuell sinnvoll ist
 - explizite Einschätzung, ob das Feed-Modell eher nur fürs Ranking oder schon fürs härtere Filtering taugt
 - manueller Retraining-Trigger
+- sichtbarer Laufstatus während eines Trainings
+- direkter Vergleich zum vorherigen Lauf mit Delta pro Kernmetrik
+- verbale Einordnung des letzten Laufs (`Eher besser`, `Gemischt`, `Eher seitwaerts`, `Eher schlechter`)
+- aufklappbare Laien-Erklärung für `Precision`, `Recall` und `F1`
 - Compare-Diagnostics pro Modell mit letztem Status, letzter Dauer und letztem Fehler
 - Compare-Systembereich zeigt zusätzlich Primär-Summary-Zahlen der aktiven Session
 - Primär-Summary-Status und Compare-Modellstatus werden im UI strikt getrennt dargestellt
@@ -209,6 +215,8 @@ Gründe:
 - die Entscheidung "jetzt retrainen oder nicht" soll direkt lesbar sein
 - der aktuelle Produktstatus des Modells wird klarer
 - der letzte Trainingslauf ist direkt gegen den vorherigen Lauf vergleichbar
+- ein ausgelöster Trainingslauf darf sich nicht wie ein toter Klick anfühlen
+- Metriken brauchen kurze Übersetzung für Nicht-ML-Spezialisten
 
 ### 9. Near-Duplicate-Filter im Feed
 
@@ -225,10 +233,11 @@ Verhalten:
 
 Technik:
 
-- konservative Titel-Ähnlichkeit auf Basis normalisierter Tokens und String-Ähnlichkeit
+- eher vorsichtige, aber inzwischen etwas gelockerte Titel-Ähnlichkeit auf Basis normalisierter Tokens und String-Ähnlichkeit
 - Zeitfenster von 48 Stunden
 - Gruppierung nur bei hoher Ähnlichkeit
 - die aufwendige Similarity-Bildung läuft als Hintergrund-Snapshot und nicht mehr im Hot Path des Feed-Requests
+- der Snapshot wird nur im laufenden Backend-Prozess im Speicher gehalten, nicht mehr zusätzlich in SQLite
 
 Gründe:
 
@@ -247,6 +256,16 @@ Gründe:
 - `feedparser` für RSS
 - `trafilatura` plus `BeautifulSoup` als Fallback für Textextraktion
 - `googlenewsdecoder` für Google-News-Links
+
+SQLite-Betrieb:
+
+- WAL wird einmalig bei der DB-Initialisierung gesetzt
+- Verbindungen laufen im Autocommit-Modus mit `busy_timeout`
+
+Gründe:
+
+- weniger lang gehaltene Schreibtransaktionen
+- deutlich weniger Risiko für `database is locked` bei mehreren Worker-Threads
 
 ### Konfigurationsdatei
 
