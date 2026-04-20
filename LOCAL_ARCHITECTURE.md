@@ -125,6 +125,7 @@ Verhalten:
 
 - Primärmodell erzeugt die produktive Summary
 - zusätzliche Compare-Modelle laufen danach sequenziell in einer separaten Compare-Queue
+- Summary-Worker und Compare-Worker teilen sich trotzdem einen gemeinsamen Ollama-Lock; lokal läuft nie mehr als eine Generierung gleichzeitig
 - Compare-Fehler dürfen die produktive Summary nicht beschädigen
 - Ergebnisse werden sowohl in SQLite als auch in einer Exportdatei pro Compare-Session abgelegt
 - der laufende Compare-Fortschritt wird separat in `app_state` gehalten und in der UI sichtbar gemacht
@@ -139,6 +140,7 @@ Gründe:
 - Modellvergleich ohne Eingriff in den normalen Lesefluss
 - spätere qualitative Bewertung durch ein Frontier-Modell
 - reproduzierbare lokale Benchmark-Sessions
+- kein RAM-/VRAM-Druck durch parallele lokale Modellaufrufe
 
 ### 6. Zwei Lernstufen statt eines unscharfen Gesamtsignals
 
@@ -222,6 +224,7 @@ Dort liegen die produktnahen Einstellungen:
 - RSS-Feed-Liste
 - Ollama-Modell
 - Ollama-Base-URL
+- Ollama-Summary-Timeout
 - Compare-Modelle und Exportpfad
 - Compare-Timeout pro Modellaufruf
 - Polling-Intervalle

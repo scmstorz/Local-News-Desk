@@ -73,6 +73,7 @@ DEFAULT_SETTINGS = {
     "ollama": {
         "base_url": "http://127.0.0.1:11434",
         "model": "qwen3.5:35b",
+        "summary_timeout_seconds": 600,
     },
     "llm_compare": {
         "enabled": False,
@@ -294,6 +295,7 @@ class RuntimeState:
         self.refresh_lock = threading.Lock()
         self.training_lock = threading.Lock()
         self.model_lock = threading.Lock()
+        self.ollama_lock = threading.Lock()
         self.compare_event = threading.Event()
         self.models: dict[str, dict[str, Any]] = {}
 
@@ -890,11 +892,19 @@ def get_compare_timeout_seconds() -> int:
     compare_settings = SETTINGS.get("llm_compare", {})
     timeout = compare_settings.get("request_timeout_seconds")
     if timeout is None:
-        timeout = SETTINGS.get("timing", {}).get("request_timeout_seconds", 120)
+        timeout = SETTINGS.get("ollama", {}).get("summary_timeout_seconds", 300)
     try:
         return max(30, int(timeout))
     except (TypeError, ValueError):
-        return 120
+        return 300
+
+
+def get_summary_timeout_seconds() -> int:
+    timeout = SETTINGS.get("ollama", {}).get("summary_timeout_seconds", 300)
+    try:
+        return max(30, int(timeout))
+    except (TypeError, ValueError):
+        return 300
 
 
 def get_request_timeout_seconds() -> int:
@@ -1311,18 +1321,21 @@ ARTIKELTEXT:
 {article_text}
 """.strip()
 
-    response = requests.post(
-        f"{OLLAMA_BASE_URL}/api/generate",
-        timeout=timeout_seconds or get_request_timeout_seconds(),
-        json={
-            "model": model_name or OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.2,
+    # Only one Ollama generation may run at a time. Large local models will
+    # otherwise compete for RAM/VRAM and trigger slowdowns or timeouts.
+    with STATE.ollama_lock:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            timeout=timeout_seconds or get_summary_timeout_seconds(),
+            json={
+                "model": model_name or OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.2,
+                },
             },
-        },
-    )
+        )
     response.raise_for_status()
     body = response.json()
     title, summary = parse_summary_response(body.get("response", ""))
@@ -2473,6 +2486,7 @@ def api_status():
                 "config_path": str(CONFIG_PATH),
                 "ollama_model": OLLAMA_MODEL,
                 "ollama_base_url": OLLAMA_BASE_URL,
+                "ollama_summary_timeout_seconds": get_summary_timeout_seconds(),
                 "feed_refresh_seconds": FEED_REFRESH_SECONDS,
                 "feed_count": len(RSS_FEED_URLS),
                 "llm_compare_models": get_compare_models(),

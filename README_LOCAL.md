@@ -44,6 +44,7 @@ Dort werden unter anderem gepflegt:
 - Google-News-RSS-Feeds
 - Ollama-Base-URL
 - Ollama-Modell
+- eigener Ollama-Summary-Timeout
 - optionale `LLM Compare`-Modelle
 - Compare-Timeout pro Modellaufruf
 - Polling-Intervalle
@@ -109,7 +110,9 @@ Wenn `LLM Compare` in `Model Ops` eingeschaltet wird:
 - `Model Ops` zeigt zusätzlich einen Compare-Diagnostics-Block mit letztem Status, letzter Dauer und letztem Fehler pro Modell
 - der Compare-Bereich in `Model Ops` zeigt außerdem Primär-Summary-Zahlen der aktiven Session, damit `0` bei Compare verständlich bleibt
 - läuft der Compare-Teil in einem eigenen Hintergrund-Worker und blockiert den Summary-Worker nicht mehr
+- die normale Primary-Summary nutzt einen deutlich höheren eigenen Ollama-Timeout als der Web-Fetch
 - der Compare-Teil hat einen eigenen Timeout in `local_config.json`
+- Summary und Compare teilen sich intern einen gemeinsamen Ollama-Lock; es läuft also nie mehr als ein lokaler Modell-Call gleichzeitig
 - einzelne Compare-Timeouts werden als Fehler protokolliert und lassen die Session weiterlaufen
 - fehlgeschlagene Modellläufe zählen als erledigte Compare-Schritte und blockieren die Session nicht dauerhaft
 - verglichen werden nur Summaries, die während der aktiven Compare-Session entstanden sind
