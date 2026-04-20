@@ -54,6 +54,9 @@ Die bestehende `claude-news-app.html` bleibt unverändert als Referenz erhalten.
 - manueller Retraining-Trigger
 - Compare-Diagnostics pro Modell mit letztem Status, letzter Dauer und letztem Fehler
 - Compare-Systembereich zeigt zusätzlich Primär-Summary-Zahlen der aktiven Session
+- Primär-Summary-Status und Compare-Modellstatus werden im UI strikt getrennt dargestellt
+- Primär-Fehler werden grob als `Quelle/Text` oder `Ollama` gezählt; Compare-Fehler bleiben separat auf Modellebene sichtbar
+- der primäre Compare-Status im UI ist absichtlich in Klartext gehalten; technische Detailzähler sind nachrangig einklappbar
 
 ## Architekturentscheidungen
 
@@ -245,7 +248,7 @@ Reihenfolge:
 ### LLM
 
 - Ollama lokal
-- Default-Modell: `qwen3.5:35b`
+- Default-Modell: `qwen3.6:latest`
 
 Grund:
 
@@ -452,10 +455,10 @@ Jede aktivierte Compare-Phase erzeugt genau eine Datei in `compare_exports/`.
 Die Struktur ist bewusst simpel und paste-freundlich:
 
 ```xml
-<compare_session enabled_at="..." primary_model="qwen3.5:35b">
+<compare_session enabled_at="..." primary_model="qwen3.6:latest">
 <models>
   <model>qwen3.5:35b</model>
-  <model>gemma4:31b</model>
+  <model>qwen3.6:latest</model>
   <model>gpt-oss:20b</model>
   <model>nemotron-3-nano:30b</model>
 </models>

@@ -72,7 +72,7 @@ DEFAULT_SETTINGS = {
     },
     "ollama": {
         "base_url": "http://127.0.0.1:11434",
-        "model": "qwen3.5:35b",
+        "model": "qwen3.6:latest",
         "summary_timeout_seconds": 600,
     },
     "llm_compare": {

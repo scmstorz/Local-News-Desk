@@ -732,10 +732,9 @@
                     <div class="status-pill"><span class="status-dot" id="ollamaDot"></span> Ollama <strong id="ollamaStatus">prüfe…</strong></div>
                     <div class="status-pill">Feed <strong id="feedPendingCount">0</strong></div>
                     <div class="status-pill">Empfohlen <strong id="feedRecommendedCount">0</strong></div>
-                    <div class="status-pill">Archiviert <strong id="feedArchivedCount">0</strong></div>
-                    <div class="status-pill">Summary-Queue <strong id="summaryQueueCount">0</strong></div>
-                    <div class="status-pill">Neue Summaries <strong id="summaryReadyCount">0</strong></div>
-                    <div class="status-pill">Not available <strong id="summaryFailedCount">0</strong></div>
+                    <div class="status-pill">Primär-Queue <strong id="summaryQueueCount">0</strong></div>
+                    <div class="status-pill">Primär bereit <strong id="summaryReadyCount">0</strong></div>
+                    <div class="status-pill">Primär N/A <strong id="summaryFailedCount">0</strong></div>
                     <div class="status-pill compare-off" id="compareStatusPill">Compare <strong id="compareStatusValue">aus</strong></div>
                 </div>
             </div>
@@ -826,8 +825,148 @@
             return `${(seconds / 60).toFixed(1)} min`;
         }
 
-        function formatSummaryUnavailableCount(count) {
-            return `${count ?? 0} Not available`;
+        function formatRefreshInterval(seconds) {
+            if (seconds === null || seconds === undefined) return '—';
+            const numeric = Number(seconds);
+            if (!Number.isFinite(numeric) || numeric <= 0) return '—';
+            if (numeric % 60 === 0) {
+                const minutes = numeric / 60;
+                return `${minutes} min`;
+            }
+            return `${numeric} s`;
+        }
+
+        function formatPrimaryUnavailableCount(count) {
+            return `${count ?? 0} Primär N/A`;
+        }
+
+        function formatPrimaryFailureBreakdown(sessionStats) {
+            if (!sessionStats?.primary_failed) {
+                return `${sessionStats?.primary_failed ?? 0} fehlgeschlagen`;
+            }
+            const parts = [];
+            if (sessionStats.primary_failed_source) {
+                parts.push(`${sessionStats.primary_failed_source} Quelle/Text`);
+            }
+            if (sessionStats.primary_failed_ollama) {
+                parts.push(`${sessionStats.primary_failed_ollama} Ollama`);
+            }
+            return `${sessionStats.primary_failed} fehlgeschlagen${parts.length ? ` (${parts.join(' · ')})` : ''}`;
+        }
+
+        function primaryFailureReasonText(sessionStats) {
+            const failed = sessionStats?.primary_failed ?? 0;
+            if (!failed) return '';
+            const sourceFailed = sessionStats?.primary_failed_source ?? 0;
+            const ollamaFailed = sessionStats?.primary_failed_ollama ?? 0;
+
+            if (sourceFailed && !ollamaFailed) {
+                return failed === 1
+                    ? 'Der Artikeltext konnte nicht zuverlässig geladen werden.'
+                    : `${failed} Artikeltexte konnten nicht zuverlässig geladen werden.`;
+            }
+
+            if (ollamaFailed && !sourceFailed) {
+                return failed === 1
+                    ? 'Das lokale Modell hat nicht rechtzeitig geantwortet.'
+                    : `${failed} Primär-Summaries sind am lokalen Modell gescheitert.`;
+            }
+
+            return failed === 1
+                ? 'Die Primär-Summary ist fehlgeschlagen.'
+                : `${failed} Primär-Summaries sind fehlgeschlagen.`;
+        }
+
+        function compareStatusDescriptor(compare) {
+            if (!compare?.enabled) {
+                return {
+                    headline: 'LLM Compare aus',
+                    detail: 'Der Mehrmodell-Vergleich ist gerade ausgeschaltet.',
+                };
+            }
+
+            const progress = compare.progress;
+            const sessionStats = compare.session_stats || {};
+
+            if (progress?.total_models) {
+                const currentModel = progress.current_model ? ` Gerade läuft ${progress.current_model}.` : '';
+                const failures = progress.failed_models ? ` ${progress.failed_models} Modellläufe sind bereits fehlgeschlagen.` : '';
+                return {
+                    headline: 'Compare läuft',
+                    detail: `Summary fertig. ${progress.completed_models} von ${progress.total_models} Modellen sind abgeschlossen.${failures}${currentModel}`.trim(),
+                };
+            }
+
+            if ((sessionStats.primary_processing ?? 0) > 0 || (sessionStats.primary_queued ?? 0) > 0) {
+                return {
+                    headline: 'Summary läuft',
+                    detail: 'Die Primär-Summary wird gerade erzeugt. Compare startet danach automatisch.',
+                };
+            }
+
+            if ((sessionStats.requested_total ?? 0) > 0 && (sessionStats.primary_failed ?? 0) > 0 && (sessionStats.primary_ready ?? 0) === 0) {
+                return {
+                    headline: 'Summary fehlgeschlagen',
+                    detail: `${primaryFailureReasonText(sessionStats)} Compare wurde deshalb nicht gestartet.`,
+                };
+            }
+
+            if ((sessionStats.compare_candidate_total ?? 0) > 0 && (sessionStats.pending_articles ?? 0) > 0) {
+                return {
+                    headline: 'Compare läuft',
+                    detail: `${sessionStats.completed_articles} von ${sessionStats.compare_candidate_total} Artikeln sind komplett verglichen. ${sessionStats.pending_articles} Artikel sind noch offen.`,
+                };
+            }
+
+            if ((sessionStats.compare_candidate_total ?? 0) > 0) {
+                return {
+                    headline: 'Compare abgeschlossen',
+                    detail: `${sessionStats.compare_candidate_total} Artikel sind vollständig verglichen.`,
+                };
+            }
+
+            if ((sessionStats.primary_ready ?? 0) > 0) {
+                return {
+                    headline: 'Summary fertig',
+                    detail: 'Die Primär-Summary ist bereit. Compare startet gleich.',
+                };
+            }
+
+            return {
+                headline: 'LLM Compare aktiv',
+                detail: 'LLM Compare wartet auf die nächste Summary.',
+            };
+        }
+
+        function compareTechDetailsMarkup(compare) {
+            if (!compare?.enabled) return '';
+
+            const sessionStats = compare.session_stats || {};
+            const lines = [];
+
+            if (compare.models?.length) {
+                lines.push(`Modelle: ${compare.models.join(', ')}`);
+            }
+            if (compare.session?.export_path) {
+                lines.push(`Export: ${basename(compare.session.export_path)}`);
+            }
+            if (sessionStats.requested_total) {
+                lines.push(`Primär: ${sessionStats.requested_total} angefordert · ${sessionStats.primary_ready ?? 0} bereit · ${formatPrimaryFailureBreakdown(sessionStats)} · ${sessionStats.primary_queued ?? 0} queued · ${sessionStats.primary_processing ?? 0} in Arbeit`);
+            }
+            if (sessionStats.compare_candidate_total) {
+                lines.push(`Compare: ${sessionStats.completed_articles}/${sessionStats.compare_candidate_total} Artikel komplett · ${sessionStats.compare_ok_results ?? 0} Modellläufe ok · ${sessionStats.compare_failed_results ?? 0} Modellläufe fehlgeschlagen${sessionStats.pending_articles ? ` · ${sessionStats.pending_articles} offen` : ''}`);
+            }
+
+            if (!lines.length) return '';
+
+            return `
+                <details style="margin-top: 12px;">
+                    <summary style="cursor: pointer; color: var(--accent); font-size: 0.92rem;">Technische Details</summary>
+                    <div style="margin-top: 10px; color: var(--ink-soft); line-height: 1.55;">
+                        ${lines.map(line => `<div>${escapeHtml(line)}</div>`).join('')}
+                    </div>
+                </details>
+            `;
         }
 
         function basename(path) {
@@ -937,9 +1076,7 @@ Beantworte abschließend klar:
 4. Welches Modell wäre für den praktischen Alltagseinsatz als lokaler Summarizer am sinnvollsten?
 5. Gibt es auffällige Unterschiede je nach Artikeltyp?
 
-Hier ist die zu bewertende Datei:
-
-[PASTE DIE GESAMTE LLM-COMPARE-MARKDOWN-DATEI HIER EIN]`;
+Die Markdown-Datei ist attached.`;
         }
 
         function compareProgressLabel(compare) {
@@ -950,48 +1087,14 @@ Hier ist die zu bewertende Datei:
                 return `${progress.completed_models}/${progress.total_models}${failed}`;
             }
             const sessionStats = compare.session_stats;
-            if (sessionStats?.article_count) {
-                return `${sessionStats.completed_articles}/${sessionStats.article_count} Artikel`;
+            if (sessionStats?.compare_candidate_total) {
+                return `${sessionStats.completed_articles}/${sessionStats.compare_candidate_total} Artikel`;
             }
             return 'an';
         }
 
         function compareProgressText(compare) {
-            if (!compare?.enabled) {
-                return 'LLM Compare ist gerade ausgeschaltet.';
-            }
-
-            const progress = compare.progress;
-            const sessionStats = compare.session_stats;
-            if (progress?.total_models) {
-                const currentModel = progress.current_model ? ` · gerade ${progress.current_model}` : '';
-                const failures = progress.failed_models ? ` · ${progress.failed_models} fehlgeschlagen` : '';
-                return `Aktueller Artikel: ${progress.completed_models}/${progress.total_models} Modelle fertig${failures}${currentModel}`;
-            }
-
-            if (sessionStats?.requested_total) {
-                const parts = [
-                    `${sessionStats.requested_total} angefordert`,
-                    `${sessionStats.primary_ready ?? 0} primär bereit`,
-                ];
-                if (sessionStats.primary_failed) {
-                    parts.push(`${sessionStats.primary_failed} Not available`);
-                }
-                if (sessionStats.pending_articles) {
-                    parts.push(`${sessionStats.pending_articles} Compare-offen`);
-                }
-                if (!sessionStats.pending_articles && !sessionStats.primary_ready && sessionStats.primary_failed) {
-                    return `Primär-Summaries nicht verfügbar: ${parts.join(' · ')}`;
-                }
-                return `Session: ${parts.join(' · ')}`;
-            }
-
-            if (sessionStats?.article_count) {
-                const pending = sessionStats.pending_articles ? ` · ${sessionStats.pending_articles} Artikel offen` : '';
-                return `Session: ${sessionStats.completed_articles}/${sessionStats.article_count} Artikel komplett verglichen${pending}`;
-            }
-
-            return 'LLM Compare ist aktiv und wartet auf die nächste Summary.';
+            return compareStatusDescriptor(compare).detail;
         }
 
         async function copyTextToClipboard(text) {
@@ -1062,7 +1165,6 @@ Hier ist die zu bewertende Datei:
             const ollama = state.status.ollama || {};
             document.getElementById('feedPendingCount').textContent = state.status.feed.pending ?? 0;
             document.getElementById('feedRecommendedCount').textContent = state.status.feed.recommended ?? 0;
-            document.getElementById('feedArchivedCount').textContent = state.status.feed.archived ?? 0;
             document.getElementById('summaryQueueCount').textContent =
                 (state.status.summaries.queued ?? 0) + (state.status.summaries.processing ?? 0);
             document.getElementById('summaryReadyCount').textContent = state.status.summaries.ready ?? 0;
@@ -1171,7 +1273,6 @@ Hier ist die zu bewertende Datei:
                         <div class="panel-header">
                             <div class="panel-title">
                                 <h2>Feed</h2>
-                                <p>Linearer Schnelllauf. Weiter oder zusammenfassen.</p>
                             </div>
                             <div class="toolbar">
                                 <div class="segmented">
@@ -1184,7 +1285,7 @@ Hier ist die zu bewertende Datei:
                         </div>
                         <div class="empty-state">
                             <h3>Inbox leer</h3>
-                            <p>Im aktuellen Modus gibt es gerade keine offenen Feed-Einträge. Neue Artikel tauchen automatisch nach dem nächsten Refresh auf. Letzter Feed-Refresh: ${escapeHtml(refreshLabel)}.</p>
+                            <p>Im aktuellen Modus gibt es gerade keine offenen Feed-Einträge. Neue Artikel tauchen automatisch nach dem nächsten Feed-Refresh auf. Letzter Feed-Refresh: ${escapeHtml(refreshLabel)}.</p>
                         </div>
                     </div>
                 `;
@@ -1267,7 +1368,7 @@ Hier ist die zu bewertende Datei:
 
             try {
                 const result = await api('/feed/reset', { method: 'POST' });
-                showToast(`Inbox-Reset: ${result.archived_count} Einträge archiviert.`, 'info');
+                showToast(`Inbox-Reset: ${result.archived_count} Einträge aus dem Feed entfernt.`, 'info');
                 state.feedItems = [];
                 state.feedIndex = 0;
                 await loadStatus();
@@ -1335,11 +1436,11 @@ Hier ist die zu bewertende Datei:
                         </div>
                         <div class="queue-banner">
                             <strong>${counts.ready} neue Summaries</strong>
-                            <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${formatSummaryUnavailableCount(counts.failed)}${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
+                            <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${formatPrimaryUnavailableCount(counts.failed)}${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
                         </div>
                         <div class="empty-state">
                             <h3>Gerade nichts zu reviewen</h3>
-                            <p>Neue Summaries tauchen hier auf, sobald die lokale Queue fertig ist.${counts.failed ? ` ${formatSummaryUnavailableCount(counts.failed)}.` : ''}</p>
+                            <p>Neue Summaries tauchen hier auf, sobald die lokale Queue fertig ist.${counts.failed ? ` ${formatPrimaryUnavailableCount(counts.failed)}.` : ''}</p>
                         </div>
                     </div>
                 `;
@@ -1360,7 +1461,7 @@ Hier ist die zu bewertende Datei:
                     </div>
                     <div class="queue-banner">
                         <strong>${counts.ready} neue Summaries</strong>
-                        <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${formatSummaryUnavailableCount(counts.failed)}${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
+                        <span>${counts.queued} in Queue · ${counts.processing} in Arbeit · ${formatPrimaryUnavailableCount(counts.failed)}${compare.enabled ? ` · ${escapeHtml(compareText)}` : ''}</span>
                     </div>
                     <div class="summary-card">
                         <div class="summary-meta">
@@ -1579,13 +1680,14 @@ Hier ist die zu bewertende Datei:
             const compare = status?.llm_compare || { enabled: false, models: [], session: null };
             const compareStats = compare.session_stats || {};
             const compareProgress = compare.progress;
+            const compareStatus = compareStatusDescriptor(compare);
 
             host.innerHTML = `
                 <div class="panel">
                     <div class="panel-header">
                         <div class="panel-title">
                             <h2>Model Ops</h2>
-                            <p>Konfusionsmatrix, Precision, Recall, F1 und Retraining-Trigger ohne Erklärungsballast.</p>
+                            <p>Konfusionsmatrix, Precision, Recall, F1 und Retraining-Trigger.</p>
                         </div>
                         <div class="toolbar">
                             <button class="inline-button" id="refreshOpsButton">Neu laden</button>
@@ -1601,24 +1703,20 @@ Hier ist die zu bewertende Datei:
                                     <span class="data-pill">Modell ${escapeHtml(status?.config?.ollama_model || '—')}</span>
                                     <span class="data-pill">Ollama-URL ${escapeHtml(status?.config?.ollama_base_url || '—')}</span>
                                     <span class="data-pill">Feeds ${status?.config?.feed_count ?? 0}</span>
-                                    <span class="data-pill">Refresh ${status?.config?.feed_refresh_seconds ?? '—'}s</span>
+                                    <span class="data-pill">Feed-Refresh ${formatRefreshInterval(status?.config?.feed_refresh_seconds)}</span>
                                     <span class="data-pill">Feed offen ${status?.feed?.pending ?? 0}</span>
-                                    <span class="data-pill">Archiviert ${status?.feed?.archived ?? 0}</span>
                                     <span class="data-pill">Queue ${((status?.summaries?.queued ?? 0) + (status?.summaries?.processing ?? 0))}</span>
                                     <span class="data-pill">Ready ${status?.summaries?.ready ?? 0}</span>
+                                    <span class="data-pill">Summary-Timeout ${status?.config?.ollama_summary_timeout_seconds ?? '—'}s</span>
                                     <span class="data-pill">Compare-Timeout ${status?.config?.llm_compare_timeout_seconds ?? '—'}s</span>
                                     <span class="data-pill ${compare.enabled ? 'compare-on' : 'compare-off'}">LLM Compare ${compare.enabled ? 'an' : 'aus'}</span>
                                 </div>
                                 <div class="ops-assessment">
-                                    <strong style="color: ${compare.enabled ? 'var(--accent-strong)' : '#a04a12'};">${compare.enabled ? 'LLM Compare aktiv' : 'LLM Compare aus'}</strong>
+                                    <strong style="color: ${compare.enabled ? 'var(--accent-strong)' : '#a04a12'};">${escapeHtml(compareStatus.headline)}</strong>
                                     <p>
-                                        Modelle: ${escapeHtml((compare.models || []).join(', ') || '—')}
-                                        ${compare.session?.export_path ? `<br>Export: ${escapeHtml(basename(compare.session.export_path))}` : ''}
-                                        ${compare.enabled ? `<br>${escapeHtml(compareProgressText(compare))}` : ''}
-                                        ${compareStats.requested_total ? `<br>Primär: ${compareStats.requested_total} angefordert · ${compareStats.primary_ready ?? 0} bereit · ${compareStats.primary_failed ?? 0} Not available · ${compareStats.primary_queued ?? 0} queued · ${compareStats.primary_processing ?? 0} in Arbeit` : ''}
-                                        ${compareStats.article_count ? `<br>Compare: ${compareStats.completed_articles}/${compareStats.article_count} Artikel komplett · ${compareStats.result_count} Modellläufe gespeichert${compareStats.pending_articles ? ` · ${compareStats.pending_articles} offen` : ''}` : ''}
-                                        ${compareProgress?.current_model ? `<br>Aktuell läuft: ${escapeHtml(compareProgress.current_model)}` : ''}
+                                        ${escapeHtml(compareStatus.detail)}
                                     </p>
+                                    ${compareTechDetailsMarkup(compare)}
                                 </div>
                                 <div class="ops-actions">
                                     <button class="inline-button" id="compareToggleButton">${compare.enabled ? 'LLM Compare ausschalten' : 'LLM Compare einschalten'}</button>
@@ -1681,6 +1779,14 @@ Hier ist die zu bewertende Datei:
 
         async function handleCompareToggle() {
             const enabled = !(state.status?.llm_compare?.enabled);
+            if (enabled) {
+                const confirmed = window.confirm(
+                    'LLM Compare erzeugt zusätzliche lokale Modellläufe. Wegen hoher CPU- und RAM-Belastung kann dein Rechner währenddessen spürbar langsamer werden. Trotzdem einschalten?'
+                );
+                if (!confirmed) {
+                    return;
+                }
+            }
             try {
                 const result = await api('/llm-compare', {
                     method: 'POST',

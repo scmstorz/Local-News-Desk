@@ -57,7 +57,7 @@ Umgebungsvariablen können die Werte weiterhin überschreiben.
 
 Default-Modell:
 
-`qwen3.5:35b`
+`qwen3.6:latest`
 
 Falls du ein anderes lokales Modell testen willst:
 
@@ -83,7 +83,7 @@ LOCAL_NEWS_MODEL_DIR=/tmp/local-news-models
 
 ```bash
 OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=qwen3.5:35b
+OLLAMA_MODEL=qwen3.6:latest
 LOCAL_NEWS_PORT=8765
 LOCAL_NEWS_REFRESH_SECONDS=300
 ```
@@ -108,7 +108,9 @@ Wenn `LLM Compare` in `Model Ops` eingeschaltet wird:
 - wird pro aktivierter Session genau eine Exportdatei in `compare_exports/` aufgebaut
 - zeigt die UI zusätzlich laufenden Compare-Fortschritt im Header, in der Summary-Queue und in `Model Ops`
 - `Model Ops` zeigt zusätzlich einen Compare-Diagnostics-Block mit letztem Status, letzter Dauer und letztem Fehler pro Modell
-- der Compare-Bereich in `Model Ops` zeigt außerdem Primär-Summary-Zahlen der aktiven Session, damit `0` bei Compare verständlich bleibt
+- der Compare-Bereich in `Model Ops` trennt Primär-Summary-Zahlen der aktiven Session sauber von Compare-Modellläufen
+- Primär-Fehler werden dort grob in `Quelle/Text` versus `Ollama` getrennt, Compare-Fehler separat als Modelllauf-Fehler gezählt
+- der sichtbare Hauptstatus in `Model Ops` ist bewusst in Klartext formuliert; technische Zähler liegen nur noch unter `Technische Details`
 - läuft der Compare-Teil in einem eigenen Hintergrund-Worker und blockiert den Summary-Worker nicht mehr
 - die normale Primary-Summary nutzt einen deutlich höheren eigenen Ollama-Timeout als der Web-Fetch
 - der Compare-Teil hat einen eigenen Timeout in `local_config.json`
