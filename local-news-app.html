@@ -761,7 +761,6 @@
             feedHistoryIndex: -1,
             feedLoading: false,
             feedError: '',
-            feedActionBusy: false,
             feedDeduplicating: false,
             lastFeedDeduplicateResult: null,
             summaries: [],
@@ -772,6 +771,7 @@
             trainingBusy: false,
             trainingState: null,
             trainingTickHandle: null,
+            feedMutationChain: Promise.resolve(),
         };
 
         function escapeHtml(value) {
@@ -1312,6 +1312,20 @@ Die Markdown-Datei ist attached.`;
             removeFeedItemsByIds([Number(currentItem.id)]);
         }
 
+        function queueFeedMutation(task) {
+            const runner = async () => {
+                try {
+                    await task();
+                } catch (error) {
+                    showToast(error.message, 'error');
+                    await loadStatus();
+                    await loadFeed(false);
+                }
+            };
+            state.feedMutationChain = state.feedMutationChain.then(runner, runner);
+            return state.feedMutationChain;
+        }
+
         async function loadFeed(reset = true) {
             state.feedLoading = true;
             state.feedError = '';
@@ -1518,8 +1532,8 @@ Die Markdown-Datei ist attached.`;
                                 <a class="action-button neutral" href="${escapeHtml(item.link_to_article)}" target="_blank" rel="noopener noreferrer">Original öffnen</a>
                             </div>
                             <div class="action-group">
-                                <button class="action-button cool" id="feedSkipButton" ${state.feedActionBusy || item.sessionAction === 'summarize' ? 'disabled' : ''}>${state.feedActionBusy ? 'Lade ...' : 'Weiter'}</button>
-                                <button class="action-button warm" id="feedSummarizeButton" ${state.feedActionBusy ? 'disabled' : ''}>${state.feedActionBusy ? 'Lade ...' : 'Zusammenfassen'}</button>
+                                <button class="action-button cool" id="feedSkipButton" ${item.sessionAction === 'summarize' ? 'disabled' : ''}>Weiter</button>
+                                <button class="action-button warm" id="feedSummarizeButton">Zusammenfassen</button>
                             </div>
                         </div>
                         <div class="action-note">${escapeHtml(viewingHistory
@@ -1610,95 +1624,59 @@ Die Markdown-Datei ist attached.`;
 
         async function handleFeedSkip() {
             const item = currentFeedItem();
-            if (!item || state.feedActionBusy) return;
+            if (!item) return;
             const wasViewingHistory = state.feedHistoryIndex >= 0;
-            const previousAllItems = state.allFeedItems.slice();
-            const previousFeedIndex = state.feedIndex;
-            const previousHistoryIndex = state.feedHistoryIndex;
-            const previousHistory = state.feedHistory.slice();
-            try {
-                state.feedActionBusy = true;
-                pushFeedHistoryItem(item, 'skip');
-                if (!wasViewingHistory) {
-                    removeOnlyCurrentFeedItem(item);
-                } else {
-                    exitFeedHistoryMode();
-                }
-                if (state.feedItems.length || wasViewingHistory) {
-                    renderFeedScreen();
-                }
+            pushFeedHistoryItem(item, 'skip');
+            if (!wasViewingHistory) {
+                removeOnlyCurrentFeedItem(item);
+            } else {
+                exitFeedHistoryMode();
+            }
+            if (state.feedItems.length || wasViewingHistory) {
+                renderFeedScreen();
+            }
+            queueFeedMutation(async () => {
                 const result = await api(`/articles/${item.id}/skip`, { method: 'POST' });
                 removeCurrentAndSimilarFeedItems(item, result.deduplicated_count);
                 if (result.deduplicated_count) {
                     showToast(`${result.deduplicated_count} ähnliche Meldung${result.deduplicated_count > 1 ? 'en' : ''} ebenfalls aus dem Feed entfernt.`, 'info');
                 }
-                if (state.feedItems.length) {
-                    renderFeedScreen();
-                } else {
-                    await loadFeed(true);
-                }
-                loadStatus();
-            } catch (error) {
-                state.allFeedItems = previousAllItems;
-                state.feedHistory = previousHistory;
-                applyFeedMode(false);
-                state.feedIndex = Math.min(previousFeedIndex, Math.max(state.feedItems.length - 1, 0));
-                state.feedHistoryIndex = previousHistoryIndex;
-                renderFeedScreen();
-                showToast(error.message, 'error');
-            } finally {
-                state.feedActionBusy = false;
                 if (state.screen === 'feed' && state.feedItems.length) {
                     renderFeedScreen();
+                } else if (!state.feedItems.length) {
+                    await loadFeed(true);
                 }
-            }
+                await loadStatus();
+            });
         }
 
         async function handleFeedSummarize() {
             const item = currentFeedItem();
-            if (!item || state.feedActionBusy) return;
+            if (!item) return;
             const wasViewingHistory = state.feedHistoryIndex >= 0;
-            const previousAllItems = state.allFeedItems.slice();
-            const previousFeedIndex = state.feedIndex;
-            const previousHistoryIndex = state.feedHistoryIndex;
-            const previousHistory = state.feedHistory.slice();
-            try {
-                state.feedActionBusy = true;
-                pushFeedHistoryItem(item, 'summarize');
-                if (!wasViewingHistory) {
-                    removeOnlyCurrentFeedItem(item);
-                } else {
-                    exitFeedHistoryMode();
-                }
-                if (state.feedItems.length || wasViewingHistory) {
-                    renderFeedScreen();
-                }
+            pushFeedHistoryItem(item, 'summarize');
+            if (!wasViewingHistory) {
+                removeOnlyCurrentFeedItem(item);
+            } else {
+                exitFeedHistoryMode();
+            }
+            if (state.feedItems.length || wasViewingHistory) {
+                renderFeedScreen();
+            }
+            queueFeedMutation(async () => {
                 const result = await api(`/articles/${item.id}/summarize`, { method: 'POST' });
                 removeCurrentAndSimilarFeedItems(item, result.deduplicated_count);
                 const duplicateText = result.deduplicated_count
                     ? ` ${result.deduplicated_count} ähnliche Meldung${result.deduplicated_count > 1 ? 'en wurden' : ' wurde'} ebenfalls aus dem Feed entfernt.`
                     : '';
                 showToast(`Summary läuft im Hintergrund.${duplicateText}`, 'info');
-                if (state.feedItems.length) {
-                    renderFeedScreen();
-                } else {
-                    await loadFeed(true);
-                }
-                loadStatus();
-            } catch (error) {
-                state.allFeedItems = previousAllItems;
-                state.feedHistory = previousHistory;
-                applyFeedMode(false);
-                state.feedIndex = Math.min(previousFeedIndex, Math.max(state.feedItems.length - 1, 0));
-                state.feedHistoryIndex = previousHistoryIndex;
-                renderFeedScreen();
-                showToast(error.message, 'error');
-            } finally {
-                state.feedActionBusy = false;
                 if (state.screen === 'feed' && state.feedItems.length) {
                     renderFeedScreen();
+                } else if (!state.feedItems.length) {
+                    await loadFeed(true);
                 }
-            }
+                await loadStatus();
+            });
         }
 
         function renderSummaryScreen() {
@@ -1946,6 +1924,7 @@ Die Markdown-Datei ist attached.`;
         function renderModelCard(title, targetKey, descriptor) {
             const latestRun = descriptor.latest_run;
             const previousRun = descriptor.previous_run;
+            const activeRun = descriptor.active_run;
             const counts = descriptor.label_counts || { total: 0, positive: 0, negative: 0 };
             const retraining = descriptor.retraining || { recommended: false, reason: 'unknown', headline: 'Noch warten', detail: '' };
             const quality = descriptor.quality || { headline: 'Keine Einschätzung', detail: '' };
@@ -1956,6 +1935,8 @@ Die Markdown-Datei ist attached.`;
             const precisionAt20 = precisionAtKDescriptor(notesJson, 20);
             const precisionAt50 = precisionAtKDescriptor(notesJson, 50);
             const thresholdStrategy = notesJson?.threshold_strategy;
+            const promotionDecision = notesJson?.promotion_decision;
+            const latestRejected = latestRun?.status === 'rejected';
             const trainingThisTarget = state.trainingBusy && (
                 state.trainingState?.target === targetKey || state.trainingState?.target === 'all'
             );
@@ -1977,6 +1958,12 @@ Die Markdown-Datei ist attached.`;
                         <strong>${escapeHtml(quality.headline || 'Keine Einschätzung')}</strong>
                         <p>${escapeHtml(quality.detail || '')}</p>
                     </div>
+                    ${latestRejected && activeRun ? `
+                        <div class="ops-assessment">
+                            <strong>Kandidat verworfen</strong>
+                            <p>Der letzte Trainingslauf war als neuer Kandidat schlechter als das aktive Modell. Aktiv bleibt der Lauf von ${escapeHtml(formatRelativeTime(activeRun.trained_at))}.</p>
+                        </div>
+                    ` : ''}
                     ${latestRun ? `
                         <div class="metric-grid">
                             ${renderMetricCard('Accuracy', latestRun.accuracy?.toFixed?.(3) || latestRun.accuracy)}
@@ -2022,11 +2009,21 @@ Die Markdown-Datei ist attached.`;
                             </tbody>
                         </table>
                         <div class="data-points">
+                            <span class="data-pill ${latestRejected ? 'compare-off' : 'compare-on'}">${latestRejected ? 'Status Kandidat verworfen' : 'Status aktiv'}</span>
                             <span class="data-pill">Trainiert ${escapeHtml(formatRelativeTime(latestRun.trained_at))}</span>
                             <span class="data-pill">Train ${latestRun.train_size}</span>
                             <span class="data-pill">Test ${latestRun.test_size}</span>
                             <span class="data-pill">Dauer ${escapeHtml(formatDuration(notesJson?.training_duration_ms))}</span>
+                            ${targetKey === 'feed_recommendation' && notesJson?.collapsed_cluster_count
+                                ? `<span class="data-pill">Story-Cluster ${escapeHtml(String(notesJson.collapsed_cluster_count))} statt ${escapeHtml(String(notesJson.raw_label_count || notesJson.collapsed_cluster_count))} Rohlabels</span>`
+                                : ''}
                         </div>
+                        ${latestRejected && promotionDecision ? `
+                            <div class="data-points" style="margin-top: 10px;">
+                                <span class="data-pill">Aktives F1 ${escapeHtml(formatMetric(promotionDecision.active_f1))}</span>
+                                <span class="data-pill">Kandidat F1 ${escapeHtml(formatMetric(promotionDecision.candidate_f1))}</span>
+                            </div>
+                        ` : ''}
                         ${previousRun ? `
                             <div class="ops-assessment">
                                 <strong>Vergleich zum vorherigen Lauf</strong>
@@ -2161,13 +2158,16 @@ Die Markdown-Datei ist attached.`;
                                 <div class="data-points">
                                     <span class="data-pill">Ollama ${status?.ollama?.reachable ? 'online' : 'offline'}</span>
                                     <span class="data-pill">Modell ${escapeHtml(status?.config?.ollama_model || '—')}</span>
+                                    <span class="data-pill">Embeddings ${escapeHtml(status?.config?.ollama_embedding_model || '—')}</span>
                                     <span class="data-pill">Ollama-URL ${escapeHtml(status?.config?.ollama_base_url || '—')}</span>
                                     <span class="data-pill">Feeds ${status?.config?.feed_count ?? 0}</span>
                                     <span class="data-pill">Feed-Refresh ${formatRefreshInterval(status?.config?.feed_refresh_seconds)}</span>
+                                    <span class="data-pill">Embedding-Worker ${formatRefreshInterval(status?.config?.embedding_poll_seconds)}</span>
                                     <span class="data-pill">Feed offen ${status?.feed?.pending ?? 0}</span>
                                     <span class="data-pill">Queue ${((status?.summaries?.queued ?? 0) + (status?.summaries?.processing ?? 0))}</span>
                                     <span class="data-pill">Ready ${status?.summaries?.ready ?? 0}</span>
                                     <span class="data-pill">Summary-Timeout ${status?.config?.ollama_summary_timeout_seconds ?? '—'}s</span>
+                                    <span class="data-pill">Embedding-Timeout ${status?.config?.ollama_embedding_timeout_seconds ?? '—'}s</span>
                                     <span class="data-pill">Compare-Timeout ${status?.config?.llm_compare_timeout_seconds ?? '—'}s</span>
                                     <span class="data-pill ${compare.enabled ? 'compare-on' : 'compare-off'}">LLM Compare ${compare.enabled ? 'an' : 'aus'}</span>
                                 </div>
@@ -2281,7 +2281,12 @@ Die Markdown-Datei ist attached.`;
                     body: JSON.stringify({ target }),
                 });
                 const resultText = (payload.results || [])
-                    .map(result => `${result.target}: ${result.status}`)
+                    .map(result => {
+                        if (result.status === 'rejected') {
+                            return `${result.target}: Kandidat verworfen`;
+                        }
+                        return `${result.target}: ${result.status}`;
+                    })
                     .join(' · ');
                 showToast(resultText || 'Training abgeschlossen', 'info');
                 await loadStatus();

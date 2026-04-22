@@ -45,7 +45,9 @@ Dort werden unter anderem gepflegt:
 - Google-News-RSS-Feeds
 - Ollama-Base-URL
 - Ollama-Modell
+- Ollama-Embedding-Modell fuer die Aehnlichkeitslogik
 - eigener Ollama-Summary-Timeout
+- eigener Ollama-Embedding-Timeout
 - optionale `LLM Compare`-Modelle
 - Compare-Timeout pro Modellaufruf
 - Polling-Intervalle
@@ -64,6 +66,12 @@ Falls du ein anderes lokales Modell testen willst:
 
 ```bash
 OLLAMA_MODEL=gemma3:27b python local_news_backend.py
+```
+
+Fuer die embedding-basierte Aehnlichkeit solltest du zusaetzlich einmal lokal verfuegbar haben:
+
+```bash
+ollama pull nomic-embed-text-v2-moe:latest
 ```
 
 ## Lokale Daten
@@ -102,6 +110,8 @@ LOCAL_NEWS_REFRESH_SECONDS=300
 - `Not available`-Fälle erscheinen in der Summary-Liste, damit der Originalartikel bei Bedarf noch geöffnet werden kann.
 - hängengebliebene `processing`-Summaries werden nach einem Recovery-Timeout automatisch auf `failed` gesetzt.
 - Der Feed blendet sehr ähnliche Meldungen aus anderen Quellen standardmäßig zusammen und zeigt nur einen Hauptartikel pro Story.
+- Das Feed-Training arbeitet cluster-bewusst: sehr ähnliche Story-Varianten werden vor dem Training zu einem Fall zusammengezogen; `Zusammenfassen` dominiert dabei mehrere `Weiter`-Varianten derselben Story.
+- Die Similarity-Logik nutzt zusaetzlich lokale Embeddings, aber nur im Hintergrund. Feed-Reload und Feed-Klicks fuehren selbst keine Embedding-Generierung aus.
 - Die Ähnlichkeitsgruppierung läuft als Hintergrund-Snapshot; der Feed-Request liest diesen Snapshot nur noch aus und bleibt dadurch beim Reload deutlich schneller.
 - Der Toggle `Empfohlen` filtert inzwischen client-seitig auf Basis bereits geladener Feed-Daten; das Umschalten erzeugt keinen zusätzlichen Backend-Request mehr.
 - Der Feed hält einen lokalen Verlauf, damit `Zurück` und Pfeil links auch nach `Weiter` oder `Zusammenfassen` weiter funktionieren.
@@ -109,6 +119,7 @@ LOCAL_NEWS_REFRESH_SECONDS=300
 - beim Feed-Retraining wird die Entscheidungsschwelle nicht starr auf `0.5` gelassen, sondern automatisch auf dem Testsplit recall-lastig optimiert, aber mit Schutz gegen zu starken Precision-Abfall
 - `Model Ops` zeigt fuer das Feed-Modell deshalb zusaetzlich die aktive `Threshold`-Schwelle sowie `Precision@10`, `Precision@20` und `Precision@50`
 - Feed-Entscheidungen loggen im Event-Store jetzt zusaetzlich einen Snapshot der damals aktiven Modellvorhersage mit
+- ein neuer Feed-Lauf wird nicht automatisch live geschaltet: schlechtere Kandidaten werden verworfen, das aktive Modell bleibt dann unveraendert
 
 ## LLM Compare
 
@@ -154,6 +165,8 @@ Verhalten:
 - über `Inbox kompaktieren` lässt sich die aktuelle Inbox optional einmalig konservativ aufräumen
 - wenn du den Hauptartikel `Weiter` klickst oder `Zusammenfassen` wählst, werden die sehr ähnlichen Pending-Dubletten ebenfalls aus dem aktiven Feed entfernt
 - nach einem bereits getroffenen Entscheid werden später eingehende, sehr ähnliche Nachzügler automatisch aus dem Feed genommen
+- die Aehnlichkeitsgruppierung vergleicht inzwischen nicht nur gegen einen kanonischen Titel, sondern gegen bereits erkannte Cluster-Mitglieder und erwischt dadurch leichte Varianten derselben Story robuster
+- wenn verfuegbar, fliesst zusaetzlich eine semantische Aehnlichkeit ueber lokale Ollama-Embeddings ein
 
 Die Logik ist bewusst konservativ:
 
@@ -165,3 +178,4 @@ Performance:
 - die Similarity-Bildung über viele Pending-Artikel läuft nicht mehr direkt im Feed-Request
 - stattdessen wird ein Snapshot im Hintergrund vorbereitet und nur im laufenden Backend-Prozess im Speicher gehalten
 - der Feed fällt nur dann kurzfristig auf einen ungruppierten Zustand zurück, wenn noch kein aktueller Snapshot vorhanden ist
+- ein separater Embedding-Worker erzeugt Titel-Embeddings im Hintergrund; auch diese Arbeit laeuft nie im Hot Path des Feed-Klickens

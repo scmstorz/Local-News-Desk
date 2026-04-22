@@ -10,7 +10,9 @@
   "ollama": {
     "base_url": "http://127.0.0.1:11434",
     "model": "qwen3.6:latest",
-    "summary_timeout_seconds": 600
+    "summary_timeout_seconds": 600,
+    "embedding_model": "nomic-embed-text-v2-moe:latest",
+    "embedding_timeout_seconds": 120
   },
   "llm_compare": {
     "enabled": false,
@@ -26,7 +28,8 @@
   "timing": {
     "feed_refresh_seconds": 300,
     "summary_poll_seconds": 3,
-    "request_timeout_seconds": 20
+    "request_timeout_seconds": 20,
+    "embedding_poll_seconds": 20
   },
   "feeds": [
     "https://news.google.com/rss/search?q=%22generative%20ai%22%20OR%20llm%20when%3A1h&hl=en-US&gl=US&ceid=US%3Aen",

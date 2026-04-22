@@ -233,6 +233,7 @@ Gründe:
 - ein ausgelöster Trainingslauf darf sich nicht wie ein toter Klick anfühlen
 - Metriken brauchen kurze Übersetzung für Nicht-ML-Spezialisten
 - fuer das Feed-Modell sind uebersehene interessante Artikel teurer als zu viele Empfehlungen; deshalb wird die Schwelle beim Retraining bewusst asymmetrisch optimiert
+- neue Feed-Laeufe arbeiten nach einem einfachen `challenger vs. champion`-Prinzip: ein schlechterer Kandidat wird gespeichert, aber nicht automatisch aktiviert
 
 ### 9. Near-Duplicate-Filter im Feed
 
@@ -246,14 +247,19 @@ Verhalten:
 - ein manueller Feed-Job `Inbox kompaktieren` kann die aktuelle Inbox einmalig mit derselben Logik aufräumen
 - sobald der Hauptartikel bearbeitet wird, werden die sehr ähnlichen Pending-Dubletten ebenfalls aus dem aktiven Feed entfernt
 - neue Nachzügler, die sehr ähnlich zu einer bereits bearbeiteten Story sind, werden beim nächsten Feed-Refresh automatisch entfernt
+- die Similarity-Bildung vergleicht neue Kandidaten inzwischen gegen komplette Cluster-Mitglieder statt nur gegen einen einzelnen kanonischen Titel
+- fuer das Feed-Training werden solche Story-Cluster ebenfalls zusammengezogen; wenn in einem Cluster mindestens ein Artikel `summarize` ist, zaehlt der Cluster insgesamt als positives Beispiel
 
 Technik:
 
 - eher vorsichtige, aber inzwischen etwas gelockerte Titel-Ähnlichkeit auf Basis normalisierter Tokens und String-Ähnlichkeit
+- zusaetzliche Robustheit gegen leicht variierte Headlines durch Cluster-Vergleich statt nur Canonical-Vergleich
+- wenn verfuegbar, zusaetzlich semantische Aehnlichkeit ueber lokale Ollama-Embeddings
 - Zeitfenster von 48 Stunden
 - Gruppierung nur bei hoher Ähnlichkeit
 - die aufwendige Similarity-Bildung läuft als Hintergrund-Snapshot und nicht mehr im Hot Path des Feed-Requests
 - der Snapshot wird nur im laufenden Backend-Prozess im Speicher gehalten, nicht mehr zusätzlich in SQLite
+- ein separater Embedding-Worker erzeugt Titel-Embeddings im Hintergrund; Feed-Reload und Feed-Klicks fuehren selbst keine Embedding-Generierung aus
 
 Gründe:
 
@@ -291,8 +297,10 @@ Dort liegen die produktnahen Einstellungen:
 
 - RSS-Feed-Liste
 - Ollama-Modell
+- Ollama-Embedding-Modell
 - Ollama-Base-URL
 - Ollama-Summary-Timeout
+- Ollama-Embedding-Timeout
 - Compare-Modelle und Exportpfad
 - Compare-Timeout pro Modellaufruf
 - Polling-Intervalle
@@ -314,6 +322,7 @@ Reihenfolge:
 
 - Ollama lokal
 - Default-Modell: `qwen3.6:latest`
+- Default-Embedding-Modell: `nomic-embed-text-v2-moe:latest`
 
 Grund:
 
@@ -347,7 +356,7 @@ Aktuelle Produktentscheidung:
 
 ## Warum zunächst **kein** Embedding-First-Ansatz?
 
-Embeddings sind fachlich interessant und wahrscheinlich später sinnvoll, aber nicht die beste erste Stufe.
+Embeddings waren fachlich interessant, aber nicht die beste erste Stufe fuer den Hot Path. Inzwischen werden sie deshalb nur noch gezielt im Hintergrund fuer die Aehnlichkeitslogik genutzt.
 
 ### Warum die aktuelle Baseline zuerst sinnvoll ist
 

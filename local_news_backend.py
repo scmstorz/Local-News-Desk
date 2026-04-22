@@ -18,6 +18,7 @@ import html as html_lib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -76,6 +77,8 @@ DEFAULT_SETTINGS = {
         "base_url": "http://127.0.0.1:11434",
         "model": "qwen3.6:latest",
         "summary_timeout_seconds": 600,
+        "embedding_model": "nomic-embed-text-v2-moe:latest",
+        "embedding_timeout_seconds": 120,
     },
     "llm_compare": {
         "enabled": False,
@@ -92,6 +95,7 @@ DEFAULT_SETTINGS = {
         "feed_refresh_seconds": 300,
         "summary_poll_seconds": 3,
         "request_timeout_seconds": 20,
+        "embedding_poll_seconds": 20,
     },
     "feeds": [
         "https://news.google.com/rss/search?q=%22generative%20ai%22%20OR%20llm%20when%3A1h&hl=en-US&gl=US&ceid=US%3Aen",
@@ -108,7 +112,8 @@ TITLE_SIMILARITY_STOPWORDS = {
     "his", "her", "they", "them", "this", "that", "these", "those", "new", "news",
     "report", "reports", "reportedly", "update", "updates", "says", "say", "said",
     "using", "used", "use", "will", "would", "could", "should", "how", "why", "what",
-    "when", "where", "who", "which", "you", "your",
+    "when", "where", "who", "which", "you", "your", "amid", "amidst", "faces",
+    "face", "slams", "warns", "warning", "latest", "via", "afterwards", "today",
 }
 SIMILARITY_LOOKBACK_HOURS = 48
 SUMMARY_PROCESSING_STALE_MINUTES = 20
@@ -156,6 +161,9 @@ SUMMARY_POLL_SECONDS = float(
 )
 REQUEST_TIMEOUT_SECONDS = int(
     os.environ.get("LOCAL_NEWS_REQUEST_TIMEOUT_SECONDS", str(SETTINGS["timing"]["request_timeout_seconds"]))
+)
+EMBEDDING_POLL_SECONDS = float(
+    os.environ.get("LOCAL_NEWS_EMBEDDING_POLL_SECONDS", str(SETTINGS["timing"].get("embedding_poll_seconds", 20)))
 )
 RSS_FEED_URLS = list(SETTINGS["feeds"])
 COMPARE_MODELS = list(SETTINGS["llm_compare"]["models"])
@@ -254,6 +262,16 @@ CREATE TABLE IF NOT EXISTS llm_compare_results (
     UNIQUE(session_id, article_id, model_name)
 );
 
+CREATE TABLE IF NOT EXISTS article_embeddings (
+    article_id INTEGER PRIMARY KEY,
+    embedding_model TEXT NOT NULL,
+    embedding_input_hash TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS app_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -272,6 +290,8 @@ CREATE INDEX IF NOT EXISTS idx_compare_sessions_status
     ON llm_compare_sessions(status, enabled_at DESC);
 CREATE INDEX IF NOT EXISTS idx_compare_results_article
     ON llm_compare_results(session_id, article_id);
+CREATE INDEX IF NOT EXISTS idx_article_embeddings_model
+    ON article_embeddings(embedding_model, updated_at DESC);
 """
 
 TARGET_CONFIG = {
@@ -411,6 +431,49 @@ def format_source_label(url: str) -> str:
     return host or "Unknown source"
 
 
+def build_embedding_input_text(article: dict[str, Any]) -> str:
+    title = html_lib.unescape(article.get("title", "") or "").strip()
+    return normalize_title_for_similarity(title)
+
+
+def build_embedding_input_hash(article: dict[str, Any]) -> str:
+    return hashlib.sha256(build_embedding_input_text(article).encode("utf-8")).hexdigest()
+
+
+def cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
+    if not vector_a or not vector_b or len(vector_a) != len(vector_b):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vector_a, vector_b))
+    norm_a = math.sqrt(sum(a * a for a in vector_a))
+    norm_b = math.sqrt(sum(b * b for b in vector_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def load_embeddings_for_article_ids(article_ids: list[int]) -> dict[int, list[float]]:
+    if not article_ids:
+        return {}
+    placeholders = ",".join("?" for _ in article_ids)
+    with db_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT article_id, embedding_json
+            FROM article_embeddings
+            WHERE embedding_model = ?
+              AND article_id IN ({placeholders})
+            """,
+            (get_embedding_model(), *article_ids),
+        ).fetchall()
+    embeddings: dict[int, list[float]] = {}
+    for row in rows:
+        try:
+            embeddings[int(row["article_id"])] = [float(value) for value in json.loads(row["embedding_json"])]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return embeddings
+
+
 def normalize_title_for_similarity(title: str) -> str:
     text = html_lib.unescape(title or "").strip().lower()
     if " - " in text:
@@ -484,6 +547,10 @@ def title_similarity_metrics(title_a: str, title_b: str) -> dict[str, Any]:
         similar = True
     elif not numbers_conflict and overlap >= 0.50 and long_overlap >= 2 and sequence >= 0.88:
         similar = True
+    elif not numbers_conflict and overlap >= 0.46 and long_overlap >= 3 and sequence >= 0.72:
+        similar = True
+    elif not numbers_conflict and len(intersection) >= 4 and long_overlap >= 3 and (jaccard >= 0.30 or sequence >= 0.68):
+        similar = True
 
     return {
         "similar": similar,
@@ -494,14 +561,59 @@ def title_similarity_metrics(title_a: str, title_b: str) -> dict[str, Any]:
     }
 
 
+def article_similarity_metrics(article_a: dict[str, Any], article_b: dict[str, Any]) -> dict[str, Any]:
+    title_metrics = title_similarity_metrics(article_a.get("title", ""), article_b.get("title", ""))
+    vector_a = article_a.get("embedding_vector")
+    vector_b = article_b.get("embedding_vector")
+    embedding_similarity = None
+    if vector_a and vector_b:
+        embedding_similarity = round(float(cosine_similarity(vector_a, vector_b)), 4)
+
+    similar = bool(title_metrics["similar"])
+    score = float(title_metrics["score"])
+    if embedding_similarity is not None:
+        if embedding_similarity >= 0.93:
+            similar = True
+            score = max(score, embedding_similarity)
+        elif embedding_similarity >= 0.89 and (
+            title_metrics["overlap"] >= 0.42 or title_metrics["sequence"] >= 0.72
+        ):
+            similar = True
+            score = max(score, embedding_similarity)
+
+    return {
+        **title_metrics,
+        "embedding_similarity": embedding_similarity,
+        "similar": similar,
+        "score": round(score, 4),
+    }
+
+
 def articles_within_similarity_window(article_a: dict[str, Any], article_b: dict[str, Any]) -> bool:
     published_a = parse_datetime(article_a.get("published_at") or article_a.get("created_at"))
     published_b = parse_datetime(article_b.get("published_at") or article_b.get("created_at"))
     return abs((published_a - published_b).total_seconds()) <= (SIMILARITY_LOOKBACK_HOURS * 3600)
 
 
-def summarize_pending_similarity(rows: list[sqlite3.Row | dict[str, Any]]) -> dict[str, Any]:
+def best_similarity_to_cluster(
+    item: dict[str, Any],
+    cluster_members: list[dict[str, Any]],
+) -> tuple[Optional[dict[str, Any]], float]:
+    best_metrics: Optional[dict[str, Any]] = None
+    best_score = 0.0
+    for member in cluster_members:
+        if not articles_within_similarity_window(item, member):
+            continue
+        metrics = article_similarity_metrics(item, member)
+        if metrics["similar"] and metrics["score"] > best_score:
+            best_metrics = metrics
+            best_score = metrics["score"]
+    return best_metrics, best_score
+
+
+def cluster_items_by_similarity(rows: list[sqlite3.Row | dict[str, Any]]) -> list[dict[str, Any]]:
     items = [row if isinstance(row, dict) else row_to_dict(row) for row in rows]
+    attach_embeddings_to_items(items)
     sorted_items = sorted(
         items,
         key=lambda item: (
@@ -516,17 +628,20 @@ def summarize_pending_similarity(rows: list[sqlite3.Row | dict[str, Any]]) -> di
         best_cluster: Optional[dict[str, Any]] = None
         best_score = 0.0
         for cluster in clusters:
-            canonical = cluster["canonical"]
-            if not articles_within_similarity_window(item, canonical):
-                continue
-            metrics = title_similarity_metrics(item.get("title", ""), canonical.get("title", ""))
-            if metrics["similar"] and metrics["score"] > best_score:
+            _metrics, score = best_similarity_to_cluster(item, cluster["members"])
+            if score > best_score:
                 best_cluster = cluster
-                best_score = metrics["score"]
+                best_score = score
         if best_cluster:
             best_cluster["members"].append(item)
         else:
             clusters.append({"canonical": item, "members": [item]})
+    return clusters
+
+
+def summarize_pending_similarity(rows: list[sqlite3.Row | dict[str, Any]]) -> dict[str, Any]:
+    items = [row if isinstance(row, dict) else row_to_dict(row) for row in rows]
+    clusters = cluster_items_by_similarity(items)
 
     visible_items: list[dict[str, Any]] = []
     for cluster in clusters:
@@ -626,13 +741,16 @@ def archive_pending_duplicates_for_article(
         (article["id"], cutoff),
     ).fetchall()
 
+    article_items = attach_embeddings_to_items([dict(article)])
+    source_article = article_items[0]
+    candidate_items = attach_embeddings_to_items([row_to_dict(candidate) for candidate in candidates])
+
     duplicate_ids: list[int] = []
-    for candidate in candidates:
-        candidate_dict = row_to_dict(candidate)
+    for candidate_dict in candidate_items:
         if not articles_within_similarity_window(article, candidate_dict):
             continue
-        metrics = title_similarity_metrics(article.get("title", ""), candidate_dict.get("title", ""))
-        if metrics["similar"]:
+        metrics = article_similarity_metrics(source_article, candidate_dict)
+        if metrics["similar"] and metrics["score"] >= 0.76:
             duplicate_ids.append(int(candidate_dict["id"]))
 
     if not duplicate_ids:
@@ -690,16 +808,15 @@ def auto_archive_pending_duplicates_of_handled_articles(conn: sqlite3.Connection
     ).fetchall()
 
     handled_articles = [row_to_dict(row) for row in handled_rows]
-    pending_articles = [row_to_dict(row) for row in pending_rows]
+    pending_articles = attach_embeddings_to_items([row_to_dict(row) for row in pending_rows])
     archive_map: dict[int, int] = {}
+    handled_clusters = cluster_items_by_similarity(handled_articles)
 
     for pending_article in pending_articles:
-        for handled_article in handled_articles:
-            if not articles_within_similarity_window(pending_article, handled_article):
-                continue
-            metrics = title_similarity_metrics(pending_article.get("title", ""), handled_article.get("title", ""))
-            if metrics["similar"] and metrics["score"] >= 0.82:
-                archive_map[int(pending_article["id"])] = int(handled_article["id"])
+        for cluster in handled_clusters:
+            metrics, score = best_similarity_to_cluster(pending_article, cluster["members"])
+            if metrics and score >= 0.76:
+                archive_map[int(pending_article["id"])] = int(cluster["canonical"]["id"])
                 break
 
     if not archive_map:
@@ -741,31 +858,8 @@ def deduplicate_current_pending_feed() -> dict[str, Any]:
             ORDER BY datetime(published_at) DESC, id DESC
             """
         ).fetchall()
-        clusters = []
         items = [row_to_dict(row) for row in rows]
-        sorted_items = sorted(
-            items,
-            key=lambda item: (
-                parse_datetime(item.get("published_at")),
-                int(item.get("id", 0)),
-            ),
-            reverse=True,
-        )
-        for item in sorted_items:
-            best_cluster: Optional[dict[str, Any]] = None
-            best_score = 0.0
-            for cluster in clusters:
-                canonical = cluster["canonical"]
-                if not articles_within_similarity_window(item, canonical):
-                    continue
-                metrics = title_similarity_metrics(item.get("title", ""), canonical.get("title", ""))
-                if metrics["similar"] and metrics["score"] > best_score:
-                    best_cluster = cluster
-                    best_score = metrics["score"]
-            if best_cluster:
-                best_cluster["members"].append(item)
-            else:
-                clusters.append({"canonical": item, "members": [item]})
+        clusters = cluster_items_by_similarity(items)
 
         before_pending = len(items)
         before_visible = len(clusters)
@@ -1382,12 +1476,151 @@ def get_summary_timeout_seconds() -> int:
         return 300
 
 
+def get_embedding_model() -> str:
+    return str(SETTINGS.get("ollama", {}).get("embedding_model", "nomic-embed-text-v2-moe:latest")).strip()
+
+
+def get_embedding_timeout_seconds() -> int:
+    timeout = SETTINGS.get("ollama", {}).get("embedding_timeout_seconds", 120)
+    try:
+        return max(15, int(timeout))
+    except (TypeError, ValueError):
+        return 120
+
+
 def get_request_timeout_seconds() -> int:
     timeout = SETTINGS.get("timing", {}).get("request_timeout_seconds", 20)
     try:
         return max(5, int(timeout))
     except (TypeError, ValueError):
         return 20
+
+
+def attach_embeddings_to_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not items:
+        return items
+    embedding_map = load_embeddings_for_article_ids(
+        [int(item["id"]) for item in items if item.get("id") is not None]
+    )
+    for item in items:
+        item["embedding_vector"] = embedding_map.get(int(item["id"])) if item.get("id") is not None else None
+    return items
+
+
+def ollama_embed_text(text: str) -> list[float]:
+    payload = {
+        "model": get_embedding_model(),
+        "input": text,
+    }
+    with STATE.ollama_lock:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/embed",
+            timeout=get_embedding_timeout_seconds(),
+            json=payload,
+        )
+        if response.status_code == 404:
+            response = requests.post(
+                f"{OLLAMA_BASE_URL}/api/embeddings",
+                timeout=get_embedding_timeout_seconds(),
+                json={
+                    "model": get_embedding_model(),
+                    "prompt": text,
+                },
+            )
+    response.raise_for_status()
+    body = response.json()
+    if isinstance(body.get("embedding"), list):
+        return [float(value) for value in body["embedding"]]
+    embeddings = body.get("embeddings")
+    if isinstance(embeddings, list) and embeddings and isinstance(embeddings[0], list):
+        return [float(value) for value in embeddings[0]]
+    raise RuntimeError("Ollama embedding response did not contain a usable vector")
+
+
+def select_article_for_embedding() -> Optional[dict[str, Any]]:
+    cutoff = (utc_now() - timedelta(hours=72)).isoformat()
+    with db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                a.id,
+                a.title,
+                a.published_at,
+                a.created_at,
+                a.updated_at,
+                ae.embedding_input_hash,
+                ae.embedding_model
+            FROM articles a
+            LEFT JOIN article_embeddings ae
+              ON ae.article_id = a.id
+             AND ae.embedding_model = ?
+            WHERE a.feed_decision IN ('pending', 'skip', 'summarize')
+              AND LENGTH(TRIM(COALESCE(a.title, ''))) > 0
+              AND datetime(a.published_at) >= datetime(?)
+            ORDER BY
+              CASE a.feed_decision
+                WHEN 'pending' THEN 0
+                WHEN 'summarize' THEN 1
+                ELSE 2
+              END,
+              datetime(a.published_at) DESC,
+              a.id DESC
+            LIMIT 250
+            """,
+            (get_embedding_model(), cutoff),
+        ).fetchall()
+
+    for row in rows:
+        item = row_to_dict(row)
+        expected_hash = build_embedding_input_hash(item)
+        if item.get("embedding_model") != get_embedding_model() or item.get("embedding_input_hash") != expected_hash:
+            item["expected_embedding_hash"] = expected_hash
+            return item
+    return None
+
+
+def store_article_embedding(article: dict[str, Any], vector: list[float]) -> None:
+    now = utc_now_iso()
+    with db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO article_embeddings(
+                article_id, embedding_model, embedding_input_hash, embedding_json, generated_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(article_id) DO UPDATE SET
+                embedding_model = excluded.embedding_model,
+                embedding_input_hash = excluded.embedding_input_hash,
+                embedding_json = excluded.embedding_json,
+                generated_at = excluded.generated_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                int(article["id"]),
+                get_embedding_model(),
+                article["expected_embedding_hash"],
+                json.dumps(vector),
+                now,
+                now,
+            ),
+        )
+
+
+def embedding_worker() -> None:
+    while not STATE.stop_event.is_set():
+        job = select_article_for_embedding()
+        if not job:
+            STATE.stop_event.wait(EMBEDDING_POLL_SECONDS)
+            continue
+
+        try:
+            vector = ollama_embed_text(build_embedding_input_text(job))
+            store_article_embedding(job, vector)
+            trigger_feed_similarity_refresh()
+            ensure_feed_similarity_snapshot_async()
+        except Exception as exc:  # pragma: no cover - runtime defensive
+            LOGGER.warning("Embedding generation failed for article %s: %s", job.get("id"), exc)
+            STATE.stop_event.wait(max(5, EMBEDDING_POLL_SECONDS))
 
 
 def current_compare_session() -> Optional[dict[str, Any]]:
@@ -1844,13 +2077,14 @@ def build_feature_text(target: str, row: sqlite3.Row | dict[str, Any]) -> str:
     )
 
 
-def latest_model_run(target: str) -> Optional[dict[str, Any]]:
+def latest_model_run(target: str, include_rejected: bool = True) -> Optional[dict[str, Any]]:
     with db_connection() as conn:
+        where_sql = "WHERE target = ?" if include_rejected else "WHERE target = ? AND status != 'rejected'"
         row = conn.execute(
-            """
+            f"""
             SELECT *
             FROM model_runs
-            WHERE target = ?
+            {where_sql}
             ORDER BY datetime(trained_at) DESC, id DESC
             LIMIT 1
             """,
@@ -1859,13 +2093,14 @@ def latest_model_run(target: str) -> Optional[dict[str, Any]]:
     return row_to_dict(row) if row else None
 
 
-def previous_model_run(target: str) -> Optional[dict[str, Any]]:
+def previous_model_run(target: str, include_rejected: bool = True) -> Optional[dict[str, Any]]:
     with db_connection() as conn:
+        where_sql = "WHERE target = ?" if include_rejected else "WHERE target = ? AND status != 'rejected'"
         row = conn.execute(
-            """
+            f"""
             SELECT *
             FROM model_runs
-            WHERE target = ?
+            {where_sql}
             ORDER BY datetime(trained_at) DESC, id DESC
             LIMIT 1 OFFSET 1
             """,
@@ -2674,6 +2909,47 @@ def model_quality_assessment(target: str, latest_run: Optional[dict[str, Any]]) 
     }
 
 
+def collapse_feed_training_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    clusters = cluster_items_by_similarity(list(rows))
+    collapsed_rows: list[dict[str, Any]] = []
+
+    for cluster in clusters:
+        members = [row if isinstance(row, dict) else row_to_dict(row) for row in cluster["members"]]
+        summarize_members = [member for member in members if member.get("feed_decision") == "summarize"]
+        skip_members = [member for member in members if member.get("feed_decision") == "skip"]
+
+        if summarize_members:
+            chosen = max(
+                summarize_members,
+                key=lambda item: (
+                    parse_datetime(item.get("feed_decision_at") or item.get("published_at")),
+                    int(item.get("id", 0)),
+                ),
+            )
+            chosen = dict(chosen)
+            chosen["feed_decision"] = "summarize"
+            chosen["story_variant_count"] = len(members)
+            chosen["story_label_strategy"] = "summarize_dominates_cluster"
+            collapsed_rows.append(chosen)
+            continue
+
+        if skip_members:
+            chosen = max(
+                skip_members,
+                key=lambda item: (
+                    parse_datetime(item.get("feed_decision_at") or item.get("published_at")),
+                    int(item.get("id", 0)),
+                ),
+            )
+            chosen = dict(chosen)
+            chosen["feed_decision"] = "skip"
+            chosen["story_variant_count"] = len(members)
+            chosen["story_label_strategy"] = "all_cluster_members_skipped"
+            collapsed_rows.append(chosen)
+
+    return collapsed_rows
+
+
 def precision_at_k(probabilities: list[float], labels: list[int], k: int) -> dict[str, Any]:
     if not probabilities or not labels:
         return {"value": None, "evaluated_count": 0}
@@ -2735,14 +3011,78 @@ def select_feed_threshold(labels: list[int], probabilities: list[float]) -> tupl
     }
 
 
+def should_promote_model(
+    target: str,
+    candidate_metrics: dict[str, float],
+    current_active_run: Optional[dict[str, Any]],
+) -> tuple[bool, dict[str, Any]]:
+    if current_active_run is None:
+        return True, {
+            "decision": "promote",
+            "reason": "no_existing_active_model",
+        }
+
+    if target != "feed_recommendation":
+        return True, {
+            "decision": "promote",
+            "reason": "non_feed_target",
+        }
+
+    active_f1 = float(current_active_run.get("f1", 0.0))
+    active_precision = float(current_active_run.get("precision", 0.0))
+    active_recall = float(current_active_run.get("recall", 0.0))
+
+    candidate_f1 = float(candidate_metrics.get("f1", 0.0))
+    candidate_precision = float(candidate_metrics.get("precision", 0.0))
+    candidate_recall = float(candidate_metrics.get("recall", 0.0))
+
+    if candidate_f1 >= active_f1 + 0.01:
+        return True, {
+            "decision": "promote",
+            "reason": "f1_improved_meaningfully",
+            "champion_run_id": current_active_run["id"],
+        }
+
+    if (
+        candidate_f1 >= active_f1
+        and candidate_precision >= active_precision
+        and candidate_recall >= active_recall - 0.02
+    ):
+        return True, {
+            "decision": "promote",
+            "reason": "no_regression_with_precision_hold",
+            "champion_run_id": current_active_run["id"],
+        }
+
+    return False, {
+        "decision": "reject",
+        "reason": "candidate_worse_than_active_model",
+        "champion_run_id": current_active_run["id"],
+        "active_f1": round(active_f1, 4),
+        "active_precision": round(active_precision, 4),
+        "active_recall": round(active_recall, 4),
+        "candidate_f1": round(candidate_f1, 4),
+        "candidate_precision": round(candidate_precision, 4),
+        "candidate_recall": round(candidate_recall, 4),
+    }
+
+
 def train_model(target: str) -> dict[str, Any]:
     if target not in TARGET_CONFIG:
         raise ValueError(f"Unsupported target {target}")
 
     training_started = time.perf_counter()
     config = TARGET_CONFIG[target]
+    current_active_run = latest_model_run(target, include_rejected=False)
     with db_connection() as conn:
         rows = conn.execute(config["query"]).fetchall()
+
+    raw_label_count = len(rows)
+    collapsed_cluster_count = None
+    if target == "feed_recommendation":
+        collapsed_rows = collapse_feed_training_rows(rows)
+        rows = collapsed_rows
+        collapsed_cluster_count = len(rows)
 
     if target == "feed_recommendation":
         labels = [1 if row["feed_decision"] == "summarize" else 0 for row in rows]
@@ -2819,9 +3159,27 @@ def train_model(target: str) -> dict[str, Any]:
 
     trained_at = utc_now_iso()
     model_path = MODEL_DIR / config["artifact_name"]
+    promotion_allowed, promotion_notes = should_promote_model(
+        target,
+        {
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+        },
+        current_active_run,
+    )
+    effective_model_path = model_path
+    if not promotion_allowed:
+        effective_model_path = model_path.with_name(
+            f"{model_path.stem}-candidate-{trained_at.replace(':', '').replace('-', '')}.joblib"
+        )
     notes_payload = {
         "training_duration_ms": training_duration_ms,
         **evaluation_notes,
+        "promotion_decision": promotion_notes,
+        "raw_label_count": raw_label_count,
+        "collapsed_cluster_count": collapsed_cluster_count,
     }
     with db_connection() as conn:
         cursor = conn.execute(
@@ -2835,7 +3193,7 @@ def train_model(target: str) -> dict[str, Any]:
             """,
             (
                 target,
-                str(model_path),
+                str(effective_model_path),
                 trained_at,
                 len(labels),
                 len(train_y),
@@ -2849,7 +3207,7 @@ def train_model(target: str) -> dict[str, Any]:
                 threshold_value,
                 json.dumps(matrix),
                 json.dumps(notes_payload),
-                "trained",
+                "active" if promotion_allowed else "rejected",
             ),
         )
         run_id = int(cursor.lastrowid)
@@ -2861,19 +3219,20 @@ def train_model(target: str) -> dict[str, Any]:
         "threshold": threshold_value,
         "pipeline": pipeline,
     }
-    joblib.dump(artifact, model_path)
+    joblib.dump(artifact, effective_model_path)
 
-    with STATE.model_lock:
-        STATE.models[target] = artifact
+    if promotion_allowed:
+        with STATE.model_lock:
+            STATE.models[target] = artifact
 
-    if target == "feed_recommendation":
-        rows_for_prediction = fetch_visible_pending_feed_articles()
-        predicted_rows, used_run_id = predict_feed_rows(rows_for_prediction)
-        update_cached_feed_predictions(predicted_rows, used_run_id)
+        if target == "feed_recommendation":
+            rows_for_prediction = fetch_visible_pending_feed_articles()
+            predicted_rows, used_run_id = predict_feed_rows(rows_for_prediction)
+            update_cached_feed_predictions(predicted_rows, used_run_id)
 
     return {
         "target": target,
-        "status": "trained",
+        "status": "trained" if promotion_allowed else "rejected",
         "run_id": run_id,
         "trained_at": trained_at,
         "labels_used": len(labels),
@@ -2886,6 +3245,7 @@ def train_model(target: str) -> dict[str, Any]:
         "threshold_value": threshold_value,
         "training_duration_ms": training_duration_ms,
         "notes": notes_payload,
+        "promoted": promotion_allowed,
         "confusion_matrix": matrix,
     }
 
@@ -3206,8 +3566,8 @@ def api_health():
 
 @APP.get("/api/status")
 def api_status():
-    latest_feed_run = latest_model_run("feed_recommendation")
-    latest_summary_run = latest_model_run("summary_interest")
+    latest_feed_run = latest_model_run("feed_recommendation", include_rejected=False)
+    latest_summary_run = latest_model_run("summary_interest", include_rejected=False)
     return jsonify(
         {
             "feed": feed_counts(),
@@ -3228,9 +3588,12 @@ def api_status():
             "config": {
                 "config_path": str(CONFIG_PATH),
                 "ollama_model": OLLAMA_MODEL,
+                "ollama_embedding_model": get_embedding_model(),
                 "ollama_base_url": OLLAMA_BASE_URL,
                 "ollama_summary_timeout_seconds": get_summary_timeout_seconds(),
+                "ollama_embedding_timeout_seconds": get_embedding_timeout_seconds(),
                 "feed_refresh_seconds": FEED_REFRESH_SECONDS,
+                "embedding_poll_seconds": EMBEDDING_POLL_SECONDS,
                 "feed_count": len(RSS_FEED_URLS),
                 "llm_compare_models": get_compare_models(),
                 "llm_compare_export_dir": str(COMPARE_EXPORT_DIR),
@@ -3356,17 +3719,19 @@ def api_model_ops():
     for target in TARGET_CONFIG:
         latest_run = latest_model_run(target)
         previous_run = previous_model_run(target)
+        active_run = latest_model_run(target, include_rejected=False)
         counts = latest_labels_count(target)
         payload["targets"][target] = {
             "latest_run": latest_run,
             "previous_run": previous_run,
+            "active_run": active_run,
             "label_counts": counts,
             "new_labels_since_training": new_labels_since_training(
                 target,
-                latest_run["trained_at"] if latest_run else None,
+                active_run["trained_at"] if active_run else None,
             ),
-            "retraining": retraining_recommendation(target, latest_run),
-            "quality": model_quality_assessment(target, latest_run),
+            "retraining": retraining_recommendation(target, active_run),
+            "quality": model_quality_assessment(target, active_run),
         }
         if latest_run and latest_run.get("confusion_matrix_json"):
             payload["targets"][target]["latest_run"]["confusion_matrix"] = json.loads(
@@ -3382,6 +3747,11 @@ def api_model_ops():
                 payload["targets"][target]["previous_run"]["notes_json"] = json.loads(previous_run["notes"])
             except json.JSONDecodeError:
                 payload["targets"][target]["previous_run"]["notes_json"] = {}
+        if active_run and active_run.get("notes"):
+            try:
+                payload["targets"][target]["active_run"]["notes_json"] = json.loads(active_run["notes"])
+            except json.JSONDecodeError:
+                payload["targets"][target]["active_run"]["notes_json"] = {}
     return jsonify(payload)
 
 
@@ -3413,6 +3783,7 @@ def start_background_threads() -> list[threading.Thread]:
         threading.Thread(target=summary_worker, name="summary-worker", daemon=True),
         threading.Thread(target=compare_worker, name="llm-compare-worker", daemon=True),
         threading.Thread(target=feed_refresh_worker, name="feed-refresh-worker", daemon=True),
+        threading.Thread(target=embedding_worker, name="embedding-worker", daemon=True),
     ]
     for thread in threads:
         thread.start()
