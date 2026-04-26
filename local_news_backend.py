@@ -2704,6 +2704,19 @@ def recover_stale_processing_jobs() -> int:
     return len(stale_ids)
 
 
+def mark_summary_processing(conn: sqlite3.Connection, article_id: int) -> None:
+    conn.execute(
+        """
+        UPDATE articles
+        SET summary_status = 'processing',
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (utc_now_iso(), article_id),
+    )
+    log_event(conn, article_id, "summary_processing_started", {})
+
+
 def claim_next_summary_job() -> Optional[dict[str, Any]]:
     recover_stale_processing_jobs()
     with db_connection() as conn:
@@ -2719,16 +2732,7 @@ def claim_next_summary_job() -> Optional[dict[str, Any]]:
         if not row:
             return None
         row_dict = row_to_dict(row)
-        conn.execute(
-            """
-            UPDATE articles
-            SET summary_status = 'processing',
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (utc_now_iso(), row_dict["id"]),
-        )
-        log_event(conn, row_dict["id"], "summary_processing_started", {})
+        mark_summary_processing(conn, row_dict["id"])
     return row_dict
 
 

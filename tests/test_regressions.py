@@ -210,6 +210,16 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(payloads[1]["model"], backend.OLLAMA_MODEL)
         self.assertEqual(payloads[1]["final_url"], "https://example.com/final")
 
+    def test_mark_summary_processing_updates_status_and_logs_event(self):
+        article_id = self.insert_article(feed_decision="summarize", summary_status="queued")
+
+        with backend.db_connection() as conn:
+            backend.mark_summary_processing(conn, article_id)
+
+        self.assertEqual(self.article_row(article_id)["summary_status"], "processing")
+        self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_processing_started"])
+        self.assertEqual(self.event_payloads(article_id), [{}])
+
     def test_legacy_summary_job_getter_delegates_to_claim_function(self):
         with mock.patch("local_news_backend.claim_next_summary_job", return_value={"id": 123}) as claim:
             self.assertEqual(backend.get_next_summary_job(), {"id": 123})
