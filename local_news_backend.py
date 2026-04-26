@@ -2353,6 +2353,34 @@ def update_cached_feed_predictions(rows: list[dict[str, Any]], run_id: Optional[
             )
 
 
+def feed_row_is_recommended(row: dict[str, Any]) -> bool:
+    return bool(row.get("prediction", {}).get("recommended"))
+
+
+def feed_row_is_maybe(row: dict[str, Any]) -> bool:
+    return row.get("prediction", {}).get("tier") == "maybe"
+
+
+def filter_predicted_feed_rows(rows: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
+    if mode == "recommended":
+        return [row for row in rows if feed_row_is_recommended(row)]
+    if mode == "maybe":
+        return [row for row in rows if feed_row_is_maybe(row)]
+    if mode == "maybe_plus":
+        return [row for row in rows if feed_row_is_recommended(row) or feed_row_is_maybe(row)]
+    return list(rows)
+
+
+def build_feed_response_counts(rows: list[dict[str, Any]], similarity: dict[str, int]) -> dict[str, int]:
+    return {
+        "total_pending": len(rows),
+        "recommended_pending": sum(1 for row in rows if feed_row_is_recommended(row)),
+        "maybe_pending": sum(1 for row in rows if feed_row_is_maybe(row)),
+        "similar_group_count": similarity["similar_group_count"],
+        "similar_hidden_count": similarity["similar_hidden_count"],
+    }
+
+
 def refresh_feeds() -> dict[str, Any]:
     if not STATE.refresh_lock.acquire(blocking=False):
         return {"status": "busy", "message": "Feed refresh already running"}
@@ -3921,35 +3949,13 @@ def api_feed():
 
     predicted_rows, run_id = predict_feed_rows(rows)
     update_cached_feed_predictions(predicted_rows, run_id)
-
-    if mode == "recommended":
-        filtered = [row for row in predicted_rows if row["prediction"]["recommended"]]
-    elif mode == "maybe":
-        filtered = [row for row in predicted_rows if row["prediction"].get("tier") == "maybe"]
-    elif mode == "maybe_plus":
-        filtered = [
-            row
-            for row in predicted_rows
-            if row["prediction"]["recommended"] or row["prediction"].get("tier") == "maybe"
-        ]
-    else:
-        filtered = predicted_rows
+    filtered = filter_predicted_feed_rows(predicted_rows, mode)
 
     return jsonify(
         {
             "mode": mode,
             "items": [serialize_article_for_feed(item) for item in filtered],
-            "counts": {
-                "total_pending": len(predicted_rows),
-                "recommended_pending": sum(
-                    1 for row in predicted_rows if row["prediction"]["recommended"]
-                ),
-                "maybe_pending": sum(
-                    1 for row in predicted_rows if row["prediction"].get("tier") == "maybe"
-                ),
-                "similar_group_count": similarity["similar_group_count"],
-                "similar_hidden_count": similarity["similar_hidden_count"],
-            },
+            "counts": build_feed_response_counts(predicted_rows, similarity),
         }
     )
 

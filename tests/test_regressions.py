@@ -179,6 +179,35 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(all_ids, {recommended_id, maybe_id, no_id})
         self.assertFalse(recommended_ids & maybe_ids)
 
+    def test_feed_mode_filtering_is_explicit_and_keeps_legacy_maybe_plus(self):
+        rows = [
+            {"id": 1, "prediction": {"recommended": True, "tier": "recommended"}},
+            {"id": 2, "prediction": {"recommended": False, "tier": "maybe"}},
+            {"id": 3, "prediction": {"recommended": False, "tier": "no"}},
+            {"id": 4, "prediction": {"recommended": None, "tier": None}},
+        ]
+
+        self.assertEqual(
+            [row["id"] for row in backend.filter_predicted_feed_rows(rows, "recommended")],
+            [1],
+        )
+        self.assertEqual(
+            [row["id"] for row in backend.filter_predicted_feed_rows(rows, "maybe")],
+            [2],
+        )
+        self.assertEqual(
+            [row["id"] for row in backend.filter_predicted_feed_rows(rows, "maybe_plus")],
+            [1, 2],
+        )
+        self.assertEqual(
+            [row["id"] for row in backend.filter_predicted_feed_rows(rows, "all")],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual(
+            [row["id"] for row in backend.filter_predicted_feed_rows(rows, "unknown")],
+            [1, 2, 3, 4],
+        )
+
     def test_embedding_input_preserves_unicode_title_fallback(self):
         article = {
             "title": "Сэм Альтман: «Хатоларимиз учун аҳолидан чуқур узр сўрайман» - Zamin.uz"
