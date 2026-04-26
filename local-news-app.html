@@ -762,7 +762,17 @@
     <div class="toast-stack" id="toastStack"></div>
 
     <script>
-        const API_BASE = 'http://127.0.0.1:8765/api';
+        function resolveApiBase() {
+            if (window.LOCAL_NEWS_API_BASE) {
+                return String(window.LOCAL_NEWS_API_BASE).replace(/\/$/, '');
+            }
+            if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+                return `${window.location.origin}/api`;
+            }
+            return 'http://127.0.0.1:8765/api';
+        }
+
+        const API_BASE = resolveApiBase();
         const state = {
             screen: 'feed',
             feedMode: 'all',

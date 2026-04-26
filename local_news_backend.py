@@ -8,8 +8,8 @@ Replaces the old Firebase + Cloud Function stack with:
 - Ollama-based summarization
 - simple local classifiers with model metrics
 
-The frontend can be opened directly as a local HTML file and talks to this
-backend via http://localhost:8765.
+The frontend can be served by this backend or opened directly as a local HTML
+file. In both modes it talks to the local API at http://localhost:8765.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ import feedparser
 import joblib
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from werkzeug.exceptions import HTTPException
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
@@ -64,6 +64,7 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 
 
 BASE_DIR = Path(__file__).resolve().parent
+APP_HTML_PATH = BASE_DIR / "local-news-app.html"
 CONFIG_PATH = Path(os.environ.get("LOCAL_NEWS_CONFIG_PATH", BASE_DIR / "local_config.json"))
 DEFAULT_SETTINGS = {
     "server": {
@@ -3814,6 +3815,12 @@ def handle_options():  # type: ignore[no-untyped-def]
     if request.method == "OPTIONS":
         return ("", 204)
     return None
+
+
+@APP.get("/")
+@APP.get("/app")
+def app_index():
+    return send_file(APP_HTML_PATH)
 
 
 @APP.get("/api/health")

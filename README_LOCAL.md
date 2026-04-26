@@ -15,7 +15,11 @@ Falls du das Environment bereits vorher installiert hattest, einmal nachziehen:
 pip install -r requirements.txt --upgrade
 ```
 
-Danach `local-news-app.html` direkt im Browser öffnen.
+Danach die App im Browser öffnen:
+
+`http://127.0.0.1:8765/`
+
+Alternativ kann `local-news-app.html` weiterhin direkt geöffnet werden.
 
 Das Frontend spricht standardmäßig mit:
 
@@ -33,7 +37,9 @@ Die kleine Regressionssuite laeuft ohne zusaetzliche Testdependency mit `unittes
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Sie nutzt temporaere SQLite-Datenbanken und deckt aktuell Feed-Aktionen, Feed-Modi, Embedding-Parsing, Summary-Priorisierung und den `S`-Shortcut im Frontend ab.
+Sie nutzt temporaere SQLite-Datenbanken und deckt aktuell Feed-Aktionen, Feed-Modi, Embedding-Parsing, Summary-Priorisierung, den `S`-Shortcut im Frontend und den HTTP-Auslieferungsvertrag der UI ab.
+
+Der fruehere selbstgebaute Chrome/CDP-Browser-Test wurde durch `tests/test_ui_http_contract.py` ersetzt. Die App wird nun vom Backend ueber `/` und `/app` ausgeliefert; direkte Datei-Nutzung bleibt als Fallback erhalten.
 
 Pflicht fuer weitere Aenderungen:
 
@@ -45,7 +51,7 @@ Empfohlener Abschlusscheck:
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
-PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m py_compile app.py local_news_backend.py tests/test_regressions.py
+PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m py_compile app.py local_news_backend.py tests/test_regressions.py tests/test_ui_http_contract.py
 perl -0ne 'while (m{<script>(.*?)</script>}sg) { print $1 }' local-news-app.html | node --check
 git diff --check
 ```
@@ -55,6 +61,7 @@ git diff --check
 - `local-news-app.html`
 - `local_news_backend.py`
 - `tests/test_regressions.py`
+- `tests/test_ui_http_contract.py`
 - `local_config.json`
 - `LOCAL_ARCHITECTURE.md`
 - `MODEL_OPTIMIZATION_GUIDE.md`
