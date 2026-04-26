@@ -179,7 +179,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
                 (backend.utc_now_iso(), article_id),
             )
 
-        job = backend.get_next_summary_job()
+        job = backend.claim_next_summary_job()
 
         self.assertIsNotNone(job)
         self.assertEqual(job["id"], article_id)
@@ -209,6 +209,11 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(payloads[0], {})
         self.assertEqual(payloads[1]["model"], backend.OLLAMA_MODEL)
         self.assertEqual(payloads[1]["final_url"], "https://example.com/final")
+
+    def test_legacy_summary_job_getter_delegates_to_claim_function(self):
+        with mock.patch("local_news_backend.claim_next_summary_job", return_value={"id": 123}) as claim:
+            self.assertEqual(backend.get_next_summary_job(), {"id": 123})
+        claim.assert_called_once_with()
 
     def test_summary_job_failure_marks_failed_and_logs_error(self):
         article_id = self.insert_article(feed_decision="summarize", summary_status="processing")

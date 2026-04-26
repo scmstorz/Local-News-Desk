@@ -2704,7 +2704,7 @@ def recover_stale_processing_jobs() -> int:
     return len(stale_ids)
 
 
-def get_next_summary_job() -> Optional[dict[str, Any]]:
+def claim_next_summary_job() -> Optional[dict[str, Any]]:
     recover_stale_processing_jobs()
     with db_connection() as conn:
         row = conn.execute(
@@ -2730,6 +2730,10 @@ def get_next_summary_job() -> Optional[dict[str, Any]]:
         )
         log_event(conn, row_dict["id"], "summary_processing_started", {})
     return row_dict
+
+
+def get_next_summary_job() -> Optional[dict[str, Any]]:
+    return claim_next_summary_job()
 
 
 def process_summary_job(job: dict[str, Any]) -> None:
@@ -2803,7 +2807,7 @@ def summary_worker() -> None:
     LOGGER.info("Summary worker started")
     while not STATE.stop_event.is_set():
         STATE.summary_event.clear()
-        job = get_next_summary_job()
+        job = claim_next_summary_job()
         if job is None:
             STATE.summary_event.wait(SUMMARY_POLL_SECONDS)
             continue
