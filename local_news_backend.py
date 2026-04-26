@@ -2222,6 +2222,42 @@ def get_loaded_model(target: str) -> Optional[dict[str, Any]]:
         return STATE.models.get(target)
 
 
+def build_unavailable_feed_prediction() -> dict[str, Any]:
+    return {
+        "available": False,
+        "recommended": None,
+        "maybe": None,
+        "tier": None,
+        "probability": None,
+        "run_id": None,
+    }
+
+
+def build_feed_prediction(recommended: bool, maybe: bool, probability: float, run_id: int) -> dict[str, Any]:
+    return {
+        "available": True,
+        "recommended": bool(recommended),
+        "maybe": bool(maybe),
+        "tier": "recommended" if recommended else ("maybe" if maybe else "no"),
+        "probability": round(float(probability), 4),
+        "run_id": run_id,
+    }
+
+
+def build_threshold_feed_prediction(
+    probability: float,
+    threshold: float,
+    maybe_threshold: float,
+    run_id: int,
+) -> dict[str, Any]:
+    return build_feed_prediction(
+        probability >= threshold,
+        probability >= maybe_threshold,
+        probability,
+        run_id,
+    )
+
+
 def build_cached_feed_prediction(item: dict[str, Any], run_id: int, maybe_threshold: Optional[float] = None) -> Optional[dict[str, Any]]:
     probability = item.get("predicted_probability")
     recommendation = item.get("predicted_recommendation")
@@ -2235,14 +2271,7 @@ def build_cached_feed_prediction(item: dict[str, Any], run_id: int, maybe_thresh
             maybe = float(probability) >= float(maybe_threshold)
         except (TypeError, ValueError):
             maybe = bool(recommendation)
-    return {
-        "available": True,
-        "recommended": bool(recommendation),
-        "maybe": bool(maybe),
-        "tier": "recommended" if bool(recommendation) else ("maybe" if bool(maybe) else "no"),
-        "probability": round(float(probability), 4),
-        "run_id": run_id,
-    }
+    return build_feed_prediction(bool(recommendation), bool(maybe), float(probability), run_id)
 
 
 def predict_feed_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[list[dict[str, Any]], Optional[int]]:
@@ -2254,14 +2283,7 @@ def predict_feed_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[list[di
         items = []
         for row in rows:
             item = row if isinstance(row, dict) else row_to_dict(row)
-            item["prediction"] = {
-                "available": False,
-                "recommended": None,
-                "maybe": None,
-                "tier": None,
-                "probability": None,
-                "run_id": None,
-            }
+            item["prediction"] = build_unavailable_feed_prediction()
             items.append(item)
         return items, None
 
@@ -2279,16 +2301,12 @@ def predict_feed_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[list[di
         features = [build_feature_text("feed_recommendation", row) for row in stale_items]
         probabilities = pipeline.predict_proba(features)[:, 1]
         for item, probability in zip(stale_items, probabilities):
-            recommended = bool(probability >= artifact["threshold"])
-            maybe = bool(probability >= artifact.get("maybe_threshold", artifact["threshold"]))
-            item["prediction"] = {
-                "available": True,
-                "recommended": recommended,
-                "maybe": maybe,
-                "tier": "recommended" if recommended else ("maybe" if maybe else "no"),
-                "probability": round(float(probability), 4),
-                "run_id": artifact["run_id"],
-            }
+            item["prediction"] = build_threshold_feed_prediction(
+                float(probability),
+                float(artifact["threshold"]),
+                float(artifact.get("maybe_threshold", artifact["threshold"])),
+                int(artifact["run_id"]),
+            )
 
     return items, artifact["run_id"]
 
@@ -2304,16 +2322,12 @@ def compute_feed_prediction_snapshot(row: sqlite3.Row | dict[str, Any]) -> Optio
         pipeline: Pipeline = artifact["pipeline"]
         feature = build_feature_text("feed_recommendation", item)
         probability = float(pipeline.predict_proba([feature])[0][1])
-        recommended = bool(probability >= artifact["threshold"])
-        maybe = bool(probability >= artifact.get("maybe_threshold", artifact["threshold"]))
-        cached_prediction = {
-            "available": True,
-            "recommended": recommended,
-            "maybe": maybe,
-            "tier": "recommended" if recommended else ("maybe" if maybe else "no"),
-            "probability": round(probability, 4),
-            "run_id": artifact["run_id"],
-        }
+        cached_prediction = build_threshold_feed_prediction(
+            probability,
+            float(artifact["threshold"]),
+            float(artifact.get("maybe_threshold", artifact["threshold"])),
+            int(artifact["run_id"]),
+        )
 
     return {
         "prediction_model_run_id": cached_prediction["run_id"],

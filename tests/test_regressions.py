@@ -208,6 +208,49 @@ class LocalNewsRegressionTests(unittest.TestCase):
             [1, 2, 3, 4],
         )
 
+    def test_feed_prediction_helpers_build_consistent_tiers(self):
+        self.assertEqual(
+            backend.build_unavailable_feed_prediction(),
+            {
+                "available": False,
+                "recommended": None,
+                "maybe": None,
+                "tier": None,
+                "probability": None,
+                "run_id": None,
+            },
+        )
+        self.assertEqual(
+            backend.build_threshold_feed_prediction(0.9, 0.7, 0.4, 42),
+            {
+                "available": True,
+                "recommended": True,
+                "maybe": True,
+                "tier": "recommended",
+                "probability": 0.9,
+                "run_id": 42,
+            },
+        )
+        self.assertEqual(
+            backend.build_threshold_feed_prediction(0.5, 0.7, 0.4, 42)["tier"],
+            "maybe",
+        )
+        self.assertEqual(
+            backend.build_threshold_feed_prediction(0.2, 0.7, 0.4, 42)["tier"],
+            "no",
+        )
+        self.assertEqual(
+            backend.build_feed_prediction(False, True, 0.45678, 42),
+            {
+                "available": True,
+                "recommended": False,
+                "maybe": True,
+                "tier": "maybe",
+                "probability": 0.4568,
+                "run_id": 42,
+            },
+        )
+
     def test_embedding_input_preserves_unicode_title_fallback(self):
         article = {
             "title": "Сэм Альтман: «Хатоларимиз учун аҳолидан чуқур узр сўрайман» - Zamin.uz"
