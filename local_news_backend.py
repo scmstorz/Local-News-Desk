@@ -2740,6 +2740,50 @@ def get_next_summary_job() -> Optional[dict[str, Any]]:
     return claim_next_summary_job()
 
 
+def mark_summary_ready(
+    conn: sqlite3.Connection,
+    article_id: int,
+    article_text: str,
+    final_url: str,
+    summary_title: str,
+    summary_text: str,
+) -> None:
+    now = utc_now_iso()
+    conn.execute(
+        """
+        UPDATE articles
+        SET link_to_article = ?,
+            article_text = ?,
+            article_text_extracted_at = ?,
+            summary_title = ?,
+            summary_text = ?,
+            summary_model = ?,
+            summary_status = 'ready',
+            summarized_at = ?,
+            updated_at = ?,
+            last_error = ''
+        WHERE id = ?
+        """,
+        (
+            final_url,
+            article_text,
+            now,
+            summary_title,
+            summary_text,
+            OLLAMA_MODEL,
+            now,
+            now,
+            article_id,
+        ),
+    )
+    log_event(
+        conn,
+        article_id,
+        "summary_generated",
+        {"model": OLLAMA_MODEL, "final_url": final_url},
+    )
+
+
 def process_summary_job(job: dict[str, Any]) -> None:
     article_id = int(job["id"])
     try:
@@ -2748,41 +2792,8 @@ def process_summary_job(job: dict[str, Any]) -> None:
             raise RuntimeError("Article extraction returned too little text")
 
         summary_title, summary_text = ollama_generate_summary(job["title"], article_text)
-        now = utc_now_iso()
         with db_connection() as conn:
-            conn.execute(
-                """
-                UPDATE articles
-                SET link_to_article = ?,
-                    article_text = ?,
-                    article_text_extracted_at = ?,
-                    summary_title = ?,
-                    summary_text = ?,
-                    summary_model = ?,
-                    summary_status = 'ready',
-                    summarized_at = ?,
-                    updated_at = ?,
-                    last_error = ''
-                WHERE id = ?
-                """,
-                (
-                    final_url,
-                    article_text,
-                    now,
-                    summary_title,
-                    summary_text,
-                    OLLAMA_MODEL,
-                    now,
-                    now,
-                    article_id,
-                ),
-            )
-            log_event(
-                conn,
-                article_id,
-                "summary_generated",
-                {"model": OLLAMA_MODEL, "final_url": final_url},
-            )
+            mark_summary_ready(conn, article_id, article_text, final_url, summary_title, summary_text)
 
         if get_compare_enabled():
             wake_compare_worker()

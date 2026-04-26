@@ -220,6 +220,34 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_processing_started"])
         self.assertEqual(self.event_payloads(article_id), [{}])
 
+    def test_mark_summary_ready_updates_article_and_logs_event(self):
+        article_id = self.insert_article(feed_decision="summarize", summary_status="processing")
+
+        with backend.db_connection() as conn:
+            backend.mark_summary_ready(
+                conn,
+                article_id,
+                "Article body",
+                "https://example.com/final",
+                "Ready title",
+                "Ready summary",
+            )
+
+        article = self.article_row(article_id)
+        self.assertEqual(article["summary_status"], "ready")
+        self.assertEqual(article["article_text"], "Article body")
+        self.assertEqual(article["link_to_article"], "https://example.com/final")
+        self.assertEqual(article["summary_title"], "Ready title")
+        self.assertEqual(article["summary_text"], "Ready summary")
+        self.assertEqual(article["summary_model"], backend.OLLAMA_MODEL)
+        self.assertEqual(article["last_error"], "")
+        self.assertIsNotNone(article["summarized_at"])
+        self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_generated"])
+        self.assertEqual(
+            self.event_payloads(article_id),
+            [{"model": backend.OLLAMA_MODEL, "final_url": "https://example.com/final"}],
+        )
+
     def test_legacy_summary_job_getter_delegates_to_claim_function(self):
         with mock.patch("local_news_backend.claim_next_summary_job", return_value={"id": 123}) as claim:
             self.assertEqual(backend.get_next_summary_job(), {"id": 123})
