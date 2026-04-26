@@ -35,6 +35,21 @@ Die kleine Regressionssuite laeuft ohne zusaetzliche Testdependency mit `unittes
 
 Sie nutzt temporaere SQLite-Datenbanken und deckt aktuell Feed-Aktionen, Feed-Modi, Embedding-Parsing, Summary-Priorisierung und den `S`-Shortcut im Frontend ab.
 
+Pflicht fuer weitere Aenderungen:
+
+- Nach jeder Codeaenderung an Backend, Frontend oder Datenmodell diese Suite ausfuehren.
+- Wenn ein Bug gefixt wird, nach Moeglichkeit einen passenden Regressionstest in `tests/test_regressions.py` ergaenzen.
+- Ein Stand gilt erst als fertig, wenn diese Suite und die einfachen Syntaxchecks gruen sind.
+
+Empfohlener Abschlusscheck:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m py_compile app.py local_news_backend.py tests/test_regressions.py
+perl -0ne 'while (m{<script>(.*?)</script>}sg) { print $1 }' local-news-app.html | node --check
+git diff --check
+```
+
 ## Wichtige Dateien
 
 - `local-news-app.html`
