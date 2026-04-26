@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import local_news_backend as backend
 
@@ -117,6 +118,96 @@ class LocalNewsRegressionTests(unittest.TestCase):
 
         events = self.event_rows(article_id)
         self.assertEqual([event["event_type"] for event in events], ["summary_requested"])
+
+    def test_summarize_endpoint_requeues_failed_article_and_clears_error(self):
+        article_id = self.insert_article(summary_status="failed")
+        with backend.db_connection() as conn:
+            conn.execute("UPDATE articles SET last_error = ? WHERE id = ?", ("previous failure", article_id))
+
+        response = self.client.post(f"/api/articles/{article_id}/summarize")
+
+        self.assertEqual(response.status_code, 200)
+        article = self.article_row(article_id)
+        self.assertEqual(article["feed_decision"], "summarize")
+        self.assertEqual(article["summary_status"], "queued")
+        self.assertEqual(article["last_error"], "")
+        self.assertIsNotNone(article["summary_requested_at"])
+
+    def test_skip_endpoint_rejects_article_already_in_summary_flow(self):
+        article_id = self.insert_article(summary_status="queued")
+
+        response = self.client.post(f"/api/articles/{article_id}/skip")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["message"], "Article is already in summary flow")
+        self.assertEqual(self.article_row(article_id)["feed_decision"], "pending")
+
+    def test_summary_job_transitions_from_queued_to_processing_to_ready(self):
+        article_id = self.insert_article(feed_decision="summarize", summary_status="queued")
+        with backend.db_connection() as conn:
+            conn.execute(
+                "UPDATE articles SET summary_requested_at = ? WHERE id = ?",
+                (backend.utc_now_iso(), article_id),
+            )
+
+        job = backend.get_next_summary_job()
+
+        self.assertIsNotNone(job)
+        self.assertEqual(job["id"], article_id)
+        self.assertEqual(self.article_row(article_id)["summary_status"], "processing")
+
+        with mock.patch(
+            "local_news_backend.fetch_and_extract_article_text",
+            return_value=("Article body " * 40, "https://example.com/final"),
+        ), mock.patch(
+            "local_news_backend.ollama_generate_summary",
+            return_value=("Generated title", "Generated summary"),
+        ), mock.patch("local_news_backend.get_compare_enabled", return_value=False):
+            backend.process_summary_job(job)
+
+        article = self.article_row(article_id)
+        self.assertEqual(article["summary_status"], "ready")
+        self.assertEqual(article["summary_title"], "Generated title")
+        self.assertEqual(article["summary_text"], "Generated summary")
+        self.assertEqual(article["link_to_article"], "https://example.com/final")
+        self.assertEqual(article["last_error"], "")
+        self.assertIsNotNone(article["summarized_at"])
+        self.assertEqual(
+            [event["event_type"] for event in self.event_rows(article_id)],
+            ["summary_processing_started", "summary_generated"],
+        )
+
+    def test_summary_job_failure_marks_failed_and_logs_error(self):
+        article_id = self.insert_article(feed_decision="summarize", summary_status="processing")
+        job = self.article_row(article_id)
+
+        with mock.patch(
+            "local_news_backend.fetch_and_extract_article_text",
+            side_effect=RuntimeError("extraction failed"),
+        ), mock.patch("local_news_backend.LOGGER.warning"):
+            backend.process_summary_job(job)
+
+        article = self.article_row(article_id)
+        self.assertEqual(article["summary_status"], "failed")
+        self.assertEqual(article["last_error"], "extraction failed")
+        self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_failed"])
+
+    def test_stale_processing_summary_job_is_recovered_to_failed(self):
+        old_timestamp = (
+            backend.utc_now() - backend.timedelta(minutes=backend.SUMMARY_PROCESSING_STALE_MINUTES + 1)
+        ).isoformat()
+        article_id = self.insert_article(summary_status="processing", updated_at=old_timestamp)
+
+        recovered = backend.recover_stale_processing_jobs()
+
+        self.assertEqual(recovered, 1)
+        article = self.article_row(article_id)
+        self.assertEqual(article["summary_status"], "failed")
+        self.assertIn("recovery timeout", article["last_error"])
+        self.assertEqual(
+            [event["event_type"] for event in self.event_rows(article_id)],
+            ["summary_processing_recovered"],
+        )
 
     def test_skip_endpoint_marks_article_and_logs_event(self):
         article_id = self.insert_article()
@@ -280,6 +371,16 @@ class LocalNewsRegressionTests(unittest.TestCase):
 
         self.insert_article(guid="queued", summary_status="queued")
         self.assertTrue(backend.summary_work_pending())
+
+    def test_embedding_worker_step_pauses_when_summary_work_is_pending(self):
+        with mock.patch("local_news_backend.summary_work_pending", return_value=True), mock.patch(
+            "local_news_backend.select_article_for_embedding"
+        ) as select_article, mock.patch.object(backend.STATE.stop_event, "wait", return_value=False) as wait:
+            result = backend.run_embedding_worker_once()
+
+        self.assertEqual(result, "summary_pending")
+        select_article.assert_not_called()
+        wait.assert_called_once()
 
     def test_frontend_s_shortcut_is_bound_in_capture_phase(self):
         html = Path("local-news-app.html").read_text(encoding="utf-8")

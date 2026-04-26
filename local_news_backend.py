@@ -1695,25 +1695,31 @@ def summary_work_pending() -> bool:
     return row is not None
 
 
+def run_embedding_worker_once() -> str:
+    if summary_work_pending():
+        STATE.stop_event.wait(max(1, min(5, EMBEDDING_POLL_SECONDS)))
+        return "summary_pending"
+
+    job = select_article_for_embedding()
+    if not job:
+        STATE.stop_event.wait(EMBEDDING_POLL_SECONDS)
+        return "idle"
+
+    try:
+        vector = ollama_embed_text(build_embedding_input_text(job))
+        store_article_embedding(job, vector)
+        trigger_feed_similarity_refresh()
+        ensure_feed_similarity_snapshot_async()
+        return "embedded"
+    except Exception as exc:  # pragma: no cover - runtime defensive
+        LOGGER.warning("Embedding generation failed for article %s: %s", job.get("id"), exc)
+        STATE.stop_event.wait(max(5, EMBEDDING_POLL_SECONDS))
+        return "failed"
+
+
 def embedding_worker() -> None:
     while not STATE.stop_event.is_set():
-        if summary_work_pending():
-            STATE.stop_event.wait(max(1, min(5, EMBEDDING_POLL_SECONDS)))
-            continue
-
-        job = select_article_for_embedding()
-        if not job:
-            STATE.stop_event.wait(EMBEDDING_POLL_SECONDS)
-            continue
-
-        try:
-            vector = ollama_embed_text(build_embedding_input_text(job))
-            store_article_embedding(job, vector)
-            trigger_feed_similarity_refresh()
-            ensure_feed_similarity_snapshot_async()
-        except Exception as exc:  # pragma: no cover - runtime defensive
-            LOGGER.warning("Embedding generation failed for article %s: %s", job.get("id"), exc)
-            STATE.stop_event.wait(max(5, EMBEDDING_POLL_SECONDS))
+        run_embedding_worker_once()
 
 
 def current_compare_session() -> Optional[dict[str, Any]]:
