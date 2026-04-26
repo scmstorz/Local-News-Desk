@@ -209,6 +209,40 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(payloads[0], {})
         self.assertEqual(payloads[1]["model"], backend.OLLAMA_MODEL)
         self.assertEqual(payloads[1]["final_url"], "https://example.com/final")
+        self.assertFalse(payloads[1]["extraction_fallback"])
+
+    def test_summary_job_uses_metadata_fallback_when_extraction_is_too_short(self):
+        article_id = self.insert_article(
+            feed_decision="summarize",
+            summary_status="processing",
+            title="Important AI headline from feed",
+            source_label="example.com",
+            source_url="https://example.com",
+        )
+        job = self.article_row(article_id)
+
+        def summarize_stub(title, text):
+            self.assertEqual(title, "Important AI headline from feed")
+            self.assertIn("Volltext konnte nicht zuverlässig extrahiert werden", text)
+            self.assertIn("Titel: Important AI headline from feed", text)
+            self.assertIn("Vorhandener Textauszug: Too short", text)
+            return "Fallback title", "Fallback summary"
+
+        with mock.patch(
+            "local_news_backend.fetch_and_extract_article_text",
+            return_value=("Too short", "https://example.com/final"),
+        ), mock.patch("local_news_backend.ollama_generate_summary", side_effect=summarize_stub), mock.patch(
+            "local_news_backend.get_compare_enabled", return_value=False
+        ):
+            backend.process_summary_job(job)
+
+        article = self.article_row(article_id)
+        self.assertEqual(article["summary_status"], "ready")
+        self.assertEqual(article["summary_title"], "Fallback title")
+        self.assertEqual(article["summary_text"], "Fallback summary")
+        self.assertIn("Volltext konnte nicht zuverlässig extrahiert werden", article["article_text"])
+        self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_generated"])
+        self.assertTrue(self.event_payloads(article_id)[0]["extraction_fallback"])
 
     def test_mark_summary_processing_updates_status_and_logs_event(self):
         article_id = self.insert_article(feed_decision="summarize", summary_status="queued")
@@ -245,7 +279,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_generated"])
         self.assertEqual(
             self.event_payloads(article_id),
-            [{"model": backend.OLLAMA_MODEL, "final_url": "https://example.com/final"}],
+            [{"model": backend.OLLAMA_MODEL, "final_url": "https://example.com/final", "extraction_fallback": False}],
         )
 
     def test_legacy_summary_job_getter_delegates_to_claim_function(self):

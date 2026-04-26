@@ -164,6 +164,7 @@ SUMMARY_POLL_SECONDS = float(
 REQUEST_TIMEOUT_SECONDS = int(
     os.environ.get("LOCAL_NEWS_REQUEST_TIMEOUT_SECONDS", str(SETTINGS["timing"]["request_timeout_seconds"]))
 )
+MIN_EXTRACTED_ARTICLE_CHARS = 300
 EMBEDDING_POLL_SECONDS = float(
     os.environ.get("LOCAL_NEWS_EMBEDDING_POLL_SECONDS", str(SETTINGS["timing"].get("embedding_poll_seconds", 20)))
 )
@@ -1397,6 +1398,7 @@ def decode_google_news_url(url: str) -> str:
         decoded = gnewsdecoder(url, interval=1)
         if decoded.get("status") and decoded.get("decoded_url"):
             return decoded["decoded_url"]
+        LOGGER.info("Google News URL decoder returned no decoded URL for %s: %s", url, decoded)
     except Exception as exc:  # pragma: no cover - defensive runtime handling
         LOGGER.warning("Could not decode Google News URL %s: %s", url, exc)
     return url
@@ -1442,6 +1444,36 @@ def fetch_and_extract_article_text(initial_url: str) -> tuple[str, str]:
         extracted = fallback_extract_text(response.text)
     cleaned = (extracted or "").strip()
     return cleaned[:24000], final_url
+
+
+def build_summary_fallback_text(job: dict[str, Any], extracted_text: str, final_url: str) -> str:
+    title = (job.get("title") or "").strip()
+    source_label = (job.get("source_label") or "").strip()
+    source_url = (job.get("source_url") or "").strip()
+    published_at = (job.get("published_at") or "").strip()
+    short_excerpt = (extracted_text or "").strip()
+    if len(short_excerpt) > 1200:
+        short_excerpt = short_excerpt[:1200].rsplit(" ", 1)[0].strip()
+
+    parts = [
+        "Der Volltext konnte nicht zuverlässig extrahiert werden.",
+        "Fasse deshalb ausschließlich die folgenden Metadaten und vorhandenen Textauszüge zusammen.",
+        "Erfinde keine zusätzlichen Details, Zahlen, Zitate oder Hintergründe.",
+        f"Titel: {title}" if title else "",
+        f"Quelle: {source_label}" if source_label else "",
+        f"Quell-URL: {source_url}" if source_url else "",
+        f"Finale URL: {final_url}" if final_url else "",
+        f"Veröffentlicht: {published_at}" if published_at else "",
+        f"Vorhandener Textauszug: {short_excerpt}" if short_excerpt else "",
+    ]
+    return "\n".join(part for part in parts if part).strip()
+
+
+def summary_source_text(job: dict[str, Any], extracted_text: str, final_url: str) -> tuple[str, bool]:
+    cleaned = (extracted_text or "").strip()
+    if len(cleaned) >= MIN_EXTRACTED_ARTICLE_CHARS:
+        return cleaned, False
+    return build_summary_fallback_text(job, cleaned, final_url), True
 
 
 def extract_json_blob(text: str) -> Optional[dict[str, Any]]:
@@ -2113,6 +2145,7 @@ Regeln:
 - kein Verweis auf Zeitung, Portal oder Quelle
 - der Titel soll wie eine kurze News-Headline klingen
 - die Zusammenfassung soll 3 bis 5 Sätze lang sein
+- wenn der Artikeltext nur Metadaten oder kurze Auszüge enthält: nur diese Fakten zusammenfassen und nichts ergänzen
 - liefere nur JSON
 
 JSON-Format:
@@ -2747,6 +2780,7 @@ def mark_summary_ready(
     final_url: str,
     summary_title: str,
     summary_text: str,
+    extraction_fallback: bool = False,
 ) -> None:
     now = utc_now_iso()
     conn.execute(
@@ -2780,7 +2814,7 @@ def mark_summary_ready(
         conn,
         article_id,
         "summary_generated",
-        {"model": OLLAMA_MODEL, "final_url": final_url},
+        {"model": OLLAMA_MODEL, "final_url": final_url, "extraction_fallback": bool(extraction_fallback)},
     )
 
 
@@ -2788,12 +2822,19 @@ def process_summary_job(job: dict[str, Any]) -> None:
     article_id = int(job["id"])
     try:
         article_text, final_url = fetch_and_extract_article_text(job["rss_source_url"] or job["link_to_article"])
-        if not article_text or len(article_text.strip()) < 300:
-            raise RuntimeError("Article extraction returned too little text")
+        source_text, extraction_fallback = summary_source_text(job, article_text, final_url)
 
-        summary_title, summary_text = ollama_generate_summary(job["title"], article_text)
+        summary_title, summary_text = ollama_generate_summary(job["title"], source_text)
         with db_connection() as conn:
-            mark_summary_ready(conn, article_id, article_text, final_url, summary_title, summary_text)
+            mark_summary_ready(
+                conn,
+                article_id,
+                source_text,
+                final_url,
+                summary_title,
+                summary_text,
+                extraction_fallback=extraction_fallback,
+            )
 
         if get_compare_enabled():
             wake_compare_worker()
