@@ -25,10 +25,21 @@ Ein separater Cronjob ist nicht nötig.
 
 Der Backend-Prozess läuft dauerhaft und zieht standardmäßig alle 5 Minuten neue RSS-Einträge nach.
 
+## Tests
+
+Die kleine Regressionssuite laeuft ohne zusaetzliche Testdependency mit `unittest`:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Sie nutzt temporaere SQLite-Datenbanken und deckt aktuell Feed-Aktionen, Feed-Modi, Embedding-Parsing, Summary-Priorisierung und den `S`-Shortcut im Frontend ab.
+
 ## Wichtige Dateien
 
 - `local-news-app.html`
 - `local_news_backend.py`
+- `tests/test_regressions.py`
 - `local_config.json`
 - `LOCAL_ARCHITECTURE.md`
 - `MODEL_OPTIMIZATION_GUIDE.md`
