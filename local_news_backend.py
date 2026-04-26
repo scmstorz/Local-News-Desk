@@ -1476,6 +1476,7 @@ def fetch_best_article_text(article: dict[str, Any]) -> tuple[str, str]:
 
     best_text = ""
     best_url = candidates[0]
+    fetched_any_candidate = False
     errors: list[str] = []
     for url in candidates:
         try:
@@ -1483,13 +1484,14 @@ def fetch_best_article_text(article: dict[str, Any]) -> tuple[str, str]:
         except Exception as exc:
             errors.append(f"{url}: {exc}")
             continue
+        fetched_any_candidate = True
         if len(text.strip()) >= MIN_EXTRACTED_ARTICLE_CHARS:
             return text, final_url
         if len(text.strip()) > len(best_text.strip()):
             best_text = text
             best_url = final_url
 
-    if best_text.strip():
+    if best_text.strip() or fetched_any_candidate:
         return best_text, best_url
     raise RuntimeError("Article extraction failed for all URL candidates: " + "; ".join(errors))
 

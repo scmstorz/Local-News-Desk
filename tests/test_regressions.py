@@ -285,6 +285,22 @@ class LocalNewsRegressionTests(unittest.TestCase):
             ["https://news.google.com/rss/articles/token", "https://publisher.example/story"],
         )
 
+    def test_fetch_best_article_text_returns_empty_text_for_metadata_fallback(self):
+        article = {
+            "link_to_article": "https://news.google.com/rss/articles/token",
+            "rss_source_url": "",
+            "source_url": "https://example.com",
+        }
+
+        with mock.patch("local_news_backend.decode_google_news_url", side_effect=lambda url: url), mock.patch(
+            "local_news_backend.fetch_and_extract_article_text",
+            return_value=("", "https://news.google.com/rss/articles/token"),
+        ):
+            text, final_url = backend.fetch_best_article_text(article)
+
+        self.assertEqual(text, "")
+        self.assertEqual(final_url, "https://news.google.com/rss/articles/token")
+
     def test_mark_summary_processing_updates_status_and_logs_event(self):
         article_id = self.insert_article(feed_decision="summarize", summary_status="queued")
 
