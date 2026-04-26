@@ -1404,6 +1404,29 @@ def decode_google_news_url(url: str) -> str:
     return url
 
 
+def is_probable_homepage_url(url: str) -> bool:
+    if not url:
+        return False
+    parsed = urlparse(url)
+    path = (parsed.path or "").strip("/")
+    return bool(parsed.scheme and parsed.netloc and not path)
+
+
+def article_fetch_url_candidates(article: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for key in ("link_to_article", "rss_source_url", "source_url"):
+        url = (article.get(key) or "").strip()
+        if not url:
+            continue
+        if key == "source_url" and is_probable_homepage_url(url):
+            continue
+        decoded_url = decode_google_news_url(url)
+        for candidate in (decoded_url, url):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
 def fallback_extract_text(html_text: str) -> str:
     soup = BeautifulSoup(html_text, "html.parser")
     pieces = []
@@ -1444,6 +1467,31 @@ def fetch_and_extract_article_text(initial_url: str) -> tuple[str, str]:
         extracted = fallback_extract_text(response.text)
     cleaned = (extracted or "").strip()
     return cleaned[:24000], final_url
+
+
+def fetch_best_article_text(article: dict[str, Any]) -> tuple[str, str]:
+    candidates = article_fetch_url_candidates(article)
+    if not candidates:
+        raise RuntimeError("No article URL available for extraction")
+
+    best_text = ""
+    best_url = candidates[0]
+    errors: list[str] = []
+    for url in candidates:
+        try:
+            text, final_url = fetch_and_extract_article_text(url)
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+            continue
+        if len(text.strip()) >= MIN_EXTRACTED_ARTICLE_CHARS:
+            return text, final_url
+        if len(text.strip()) > len(best_text.strip()):
+            best_text = text
+            best_url = final_url
+
+    if best_text.strip():
+        return best_text, best_url
+    raise RuntimeError("Article extraction failed for all URL candidates: " + "; ".join(errors))
 
 
 def build_summary_fallback_text(job: dict[str, Any], extracted_text: str, final_url: str) -> str:
@@ -2821,7 +2869,7 @@ def mark_summary_ready(
 def process_summary_job(job: dict[str, Any]) -> None:
     article_id = int(job["id"])
     try:
-        article_text, final_url = fetch_and_extract_article_text(job["rss_source_url"] or job["link_to_article"])
+        article_text, final_url = fetch_best_article_text(job)
         source_text, extraction_fallback = summary_source_text(job, article_text, final_url)
 
         summary_title, summary_text = ollama_generate_summary(job["title"], source_text)

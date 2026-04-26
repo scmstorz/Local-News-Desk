@@ -186,7 +186,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(self.article_row(article_id)["summary_status"], "processing")
 
         with mock.patch(
-            "local_news_backend.fetch_and_extract_article_text",
+            "local_news_backend.fetch_best_article_text",
             return_value=("Article body " * 40, "https://example.com/final"),
         ), mock.patch(
             "local_news_backend.ollama_generate_summary",
@@ -229,7 +229,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
             return "Fallback title", "Fallback summary"
 
         with mock.patch(
-            "local_news_backend.fetch_and_extract_article_text",
+            "local_news_backend.fetch_best_article_text",
             return_value=("Too short", "https://example.com/final"),
         ), mock.patch("local_news_backend.ollama_generate_summary", side_effect=summarize_stub), mock.patch(
             "local_news_backend.get_compare_enabled", return_value=False
@@ -243,6 +243,47 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertIn("Volltext konnte nicht zuverlässig extrahiert werden", article["article_text"])
         self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_generated"])
         self.assertTrue(self.event_payloads(article_id)[0]["extraction_fallback"])
+
+    def test_article_fetch_url_candidates_decode_and_skip_source_homepage(self):
+        article = {
+            "link_to_article": "https://news.google.com/rss/articles/token",
+            "rss_source_url": "https://news.google.com/rss/articles/token",
+            "source_url": "https://example.com",
+        }
+
+        with mock.patch("local_news_backend.decode_google_news_url", return_value="https://example.com/story"):
+            candidates = backend.article_fetch_url_candidates(article)
+
+        self.assertEqual(
+            candidates,
+            ["https://example.com/story", "https://news.google.com/rss/articles/token"],
+        )
+
+    def test_fetch_best_article_text_tries_candidates_until_enough_text(self):
+        article = {
+            "link_to_article": "https://news.google.com/rss/articles/token",
+            "rss_source_url": "https://news.google.com/rss/articles/token",
+            "source_url": "https://publisher.example/story",
+        }
+
+        def fetch_stub(url):
+            if url == "https://news.google.com/rss/articles/token":
+                return "short", url
+            if url == "https://publisher.example/story":
+                return "Long article text " * 30, url
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        with mock.patch("local_news_backend.decode_google_news_url", side_effect=lambda url: url), mock.patch(
+            "local_news_backend.fetch_and_extract_article_text", side_effect=fetch_stub
+        ) as fetch:
+            text, final_url = backend.fetch_best_article_text(article)
+
+        self.assertEqual(final_url, "https://publisher.example/story")
+        self.assertGreaterEqual(len(text), backend.MIN_EXTRACTED_ARTICLE_CHARS)
+        self.assertEqual(
+            [call.args[0] for call in fetch.call_args_list],
+            ["https://news.google.com/rss/articles/token", "https://publisher.example/story"],
+        )
 
     def test_mark_summary_processing_updates_status_and_logs_event(self):
         article_id = self.insert_article(feed_decision="summarize", summary_status="queued")
@@ -292,7 +333,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
         job = self.article_row(article_id)
 
         with mock.patch(
-            "local_news_backend.fetch_and_extract_article_text",
+            "local_news_backend.fetch_best_article_text",
             side_effect=RuntimeError("extraction failed"),
         ), mock.patch("local_news_backend.LOGGER.warning"):
             backend.process_summary_job(job)
