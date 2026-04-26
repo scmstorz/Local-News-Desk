@@ -24,6 +24,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -328,14 +329,24 @@ class RuntimeState:
         self.stop_event = threading.Event()
         self.refresh_lock = threading.Lock()
         self.training_lock = threading.Lock()
+        self.training_status_lock = threading.Lock()
         self.model_lock = threading.Lock()
         self.ollama_lock = threading.Lock()
+        self.summary_event = threading.Event()
         self.compare_event = threading.Event()
         self.feed_similarity_lock = threading.Lock()
         self.feed_similarity_snapshot: dict[str, Any] = {}
         self.feed_similarity_dirty = True
         self.feed_similarity_building = False
         self.models: dict[str, dict[str, Any]] = {}
+        self.training_status: dict[str, Any] = {
+            "active": False,
+            "target": None,
+            "started_at": None,
+            "finished_at": None,
+            "results": None,
+            "error": None,
+        }
 
 
 STATE = RuntimeState()
@@ -433,7 +444,21 @@ def format_source_label(url: str) -> str:
 
 def build_embedding_input_text(article: dict[str, Any]) -> str:
     title = html_lib.unescape(article.get("title", "") or "").strip()
-    return normalize_title_for_similarity(title)
+    normalized_for_similarity = normalize_title_for_similarity(title)
+    if normalized_for_similarity:
+        return normalized_for_similarity
+
+    fallback = unicodedata.normalize("NFKC", title)
+    if " - " in fallback:
+        head, tail = fallback.rsplit(" - ", 1)
+        if len(head.split()) >= 4 and 1 <= len(tail.split()) <= 6:
+            fallback = head
+    fallback = re.sub(r"https?://\S+", " ", fallback)
+    fallback = "".join(
+        " " if unicodedata.category(character).startswith("C") else character
+        for character in fallback
+    )
+    return re.sub(r"\s+", " ", fallback).strip()
 
 
 def build_embedding_input_hash(article: dict[str, Any]) -> str:
@@ -577,6 +602,11 @@ def article_similarity_metrics(article_a: dict[str, Any], article_b: dict[str, A
             score = max(score, embedding_similarity)
         elif embedding_similarity >= 0.89 and (
             title_metrics["overlap"] >= 0.42 or title_metrics["sequence"] >= 0.72
+        ):
+            similar = True
+            score = max(score, embedding_similarity)
+        elif embedding_similarity >= 0.86 and (
+            title_metrics["overlap"] >= 0.50 or title_metrics["sequence"] >= 0.78
         ):
             similar = True
             score = max(score, embedding_similarity)
@@ -1306,6 +1336,20 @@ def get_app_state(key: str, default: Any = None) -> Any:
         return default
 
 
+def get_training_status() -> dict[str, Any]:
+    with STATE.training_status_lock:
+        return dict(STATE.training_status)
+
+
+def set_training_status(**updates: Any) -> None:
+    with STATE.training_status_lock:
+        STATE.training_status.update(updates)
+
+
+def wake_summary_worker() -> None:
+    STATE.summary_event.set()
+
+
 def log_event(
     conn: sqlite3.Connection,
     article_id: int,
@@ -1507,7 +1551,37 @@ def attach_embeddings_to_items(items: list[dict[str, Any]]) -> list[dict[str, An
     return items
 
 
+def coerce_embedding_vector(value: Any) -> Optional[list[float]]:
+    if not isinstance(value, list) or not value:
+        return None
+    if all(isinstance(item, (int, float)) and math.isfinite(float(item)) for item in value):
+        return [float(item) for item in value]
+    if isinstance(value[0], list):
+        return coerce_embedding_vector(value[0])
+    return None
+
+
+def extract_ollama_embedding_vector(body: dict[str, Any]) -> Optional[list[float]]:
+    vector = coerce_embedding_vector(body.get("embedding"))
+    if vector:
+        return vector
+
+    vector = coerce_embedding_vector(body.get("embeddings"))
+    if vector:
+        return vector
+
+    data = body.get("data")
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return coerce_embedding_vector(data[0].get("embedding"))
+
+    return None
+
+
 def ollama_embed_text(text: str) -> list[float]:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if not text:
+        raise ValueError("Embedding input is empty after normalization")
+
     payload = {
         "model": get_embedding_model(),
         "input": text,
@@ -1529,12 +1603,11 @@ def ollama_embed_text(text: str) -> list[float]:
             )
     response.raise_for_status()
     body = response.json()
-    if isinstance(body.get("embedding"), list):
-        return [float(value) for value in body["embedding"]]
-    embeddings = body.get("embeddings")
-    if isinstance(embeddings, list) and embeddings and isinstance(embeddings[0], list):
-        return [float(value) for value in embeddings[0]]
-    raise RuntimeError("Ollama embedding response did not contain a usable vector")
+    vector = extract_ollama_embedding_vector(body)
+    if vector:
+        return vector
+    response_keys = ", ".join(sorted(str(key) for key in body.keys())) or "none"
+    raise RuntimeError(f"Ollama embedding response did not contain a usable vector; keys={response_keys}")
 
 
 def select_article_for_embedding() -> Optional[dict[str, Any]]:
@@ -1572,6 +1645,8 @@ def select_article_for_embedding() -> Optional[dict[str, Any]]:
 
     for row in rows:
         item = row_to_dict(row)
+        if not build_embedding_input_text(item):
+            continue
         expected_hash = build_embedding_input_hash(item)
         if item.get("embedding_model") != get_embedding_model() or item.get("embedding_input_hash") != expected_hash:
             item["expected_embedding_hash"] = expected_hash
@@ -1606,8 +1681,25 @@ def store_article_embedding(article: dict[str, Any], vector: list[float]) -> Non
         )
 
 
+def summary_work_pending() -> bool:
+    with db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM articles
+            WHERE summary_status IN ('queued', 'processing')
+            LIMIT 1
+            """
+        ).fetchone()
+    return row is not None
+
+
 def embedding_worker() -> None:
     while not STATE.stop_event.is_set():
+        if summary_work_pending():
+            STATE.stop_event.wait(max(1, min(5, EMBEDDING_POLL_SECONDS)))
+            continue
+
         job = select_article_for_embedding()
         if not job:
             STATE.stop_event.wait(EMBEDDING_POLL_SECONDS)
@@ -2129,16 +2221,24 @@ def get_loaded_model(target: str) -> Optional[dict[str, Any]]:
         return STATE.models.get(target)
 
 
-def build_cached_feed_prediction(item: dict[str, Any], run_id: int) -> Optional[dict[str, Any]]:
+def build_cached_feed_prediction(item: dict[str, Any], run_id: int, maybe_threshold: Optional[float] = None) -> Optional[dict[str, Any]]:
     probability = item.get("predicted_probability")
     recommendation = item.get("predicted_recommendation")
     if item.get("prediction_model_run_id") != run_id:
         return None
     if probability is None or recommendation is None:
         return None
+    maybe = False
+    if maybe_threshold is not None:
+        try:
+            maybe = float(probability) >= float(maybe_threshold)
+        except (TypeError, ValueError):
+            maybe = bool(recommendation)
     return {
         "available": True,
         "recommended": bool(recommendation),
+        "maybe": bool(maybe),
+        "tier": "recommended" if bool(recommendation) else ("maybe" if bool(maybe) else "no"),
         "probability": round(float(probability), 4),
         "run_id": run_id,
     }
@@ -2156,6 +2256,8 @@ def predict_feed_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[list[di
             item["prediction"] = {
                 "available": False,
                 "recommended": None,
+                "maybe": None,
+                "tier": None,
                 "probability": None,
                 "run_id": None,
             }
@@ -2166,7 +2268,7 @@ def predict_feed_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[list[di
     items = [row if isinstance(row, dict) else row_to_dict(row) for row in rows]
     stale_items: list[dict[str, Any]] = []
     for item in items:
-        cached_prediction = build_cached_feed_prediction(item, artifact["run_id"])
+        cached_prediction = build_cached_feed_prediction(item, artifact["run_id"], artifact.get("maybe_threshold"))
         if cached_prediction is not None:
             item["prediction"] = cached_prediction
         else:
@@ -2177,9 +2279,12 @@ def predict_feed_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[list[di
         probabilities = pipeline.predict_proba(features)[:, 1]
         for item, probability in zip(stale_items, probabilities):
             recommended = bool(probability >= artifact["threshold"])
+            maybe = bool(probability >= artifact.get("maybe_threshold", artifact["threshold"]))
             item["prediction"] = {
                 "available": True,
                 "recommended": recommended,
+                "maybe": maybe,
+                "tier": "recommended" if recommended else ("maybe" if maybe else "no"),
                 "probability": round(float(probability), 4),
                 "run_id": artifact["run_id"],
             }
@@ -2193,14 +2298,18 @@ def compute_feed_prediction_snapshot(row: sqlite3.Row | dict[str, Any]) -> Optio
         return None
 
     item = row if isinstance(row, dict) else row_to_dict(row)
-    cached_prediction = build_cached_feed_prediction(item, artifact["run_id"])
+    cached_prediction = build_cached_feed_prediction(item, artifact["run_id"], artifact.get("maybe_threshold"))
     if cached_prediction is None:
         pipeline: Pipeline = artifact["pipeline"]
         feature = build_feature_text("feed_recommendation", item)
         probability = float(pipeline.predict_proba([feature])[0][1])
+        recommended = bool(probability >= artifact["threshold"])
+        maybe = bool(probability >= artifact.get("maybe_threshold", artifact["threshold"]))
         cached_prediction = {
             "available": True,
-            "recommended": bool(probability >= artifact["threshold"]),
+            "recommended": recommended,
+            "maybe": maybe,
+            "tier": "recommended" if recommended else ("maybe" if maybe else "no"),
             "probability": round(probability, 4),
             "run_id": artifact["run_id"],
         }
@@ -2209,7 +2318,10 @@ def compute_feed_prediction_snapshot(row: sqlite3.Row | dict[str, Any]) -> Optio
         "prediction_model_run_id": cached_prediction["run_id"],
         "predicted_probability": cached_prediction["probability"],
         "predicted_recommendation": bool(cached_prediction["recommended"]),
+        "predicted_maybe": bool(cached_prediction.get("maybe")),
+        "predicted_tier": cached_prediction.get("tier"),
         "threshold": round(float(artifact["threshold"]), 4),
+        "maybe_threshold": round(float(artifact.get("maybe_threshold", artifact["threshold"])), 4),
     }
 
 
@@ -2411,6 +2523,8 @@ def set_feed_decision(article_id: int, decision: str) -> dict[str, Any]:
             },
         )
         deduplicated_ids = archive_pending_duplicates_for_article(conn, row_dict, decision)
+    if decision == "summarize":
+        wake_summary_worker()
     trigger_feed_similarity_refresh()
     ensure_feed_similarity_snapshot_async()
     return {
@@ -2639,9 +2753,10 @@ def process_summary_job(job: dict[str, Any]) -> None:
 def summary_worker() -> None:
     LOGGER.info("Summary worker started")
     while not STATE.stop_event.is_set():
+        STATE.summary_event.clear()
         job = get_next_summary_job()
         if job is None:
-            STATE.stop_event.wait(SUMMARY_POLL_SECONDS)
+            STATE.summary_event.wait(SUMMARY_POLL_SECONDS)
             continue
         process_summary_job(job)
 
@@ -2870,24 +2985,24 @@ def model_quality_assessment(target: str, latest_run: Optional[dict[str, Any]]) 
             return {
                 "level": "early",
                 "headline": "Nur als Ranking-Signal nutzen",
-                "detail": "Es gibt noch zu wenig aktuelle positive Beispiele für verlässliches hartes Filtering.",
+                "detail": "Es gibt noch zu wenig aktuelle positive Beispiele fuer ein wirklich treffsicheres strenges Filtering.",
             }
-        if f1 < 0.35 or precision < 0.35 or recall < 0.35:
+        if precision < 0.28:
             return {
                 "level": "weak",
-                "headline": "Noch nicht für hartes Filtering geeignet",
-                "detail": "Die Trefferqualität ist noch zu schwach. Im Feed besser weiterhin alle Einträge sehen und den Score nur zur Priorisierung nutzen.",
+                "headline": "Noch zu viele falsch Positive",
+                "detail": "Fuer deinen Use Case ist das Modell noch nicht selektiv genug. Im Feed besser weiter alle Eintraege sehen und nur hohe Signale ernst nehmen.",
             }
-        if f1 < 0.55:
+        if precision < 0.4 or f1 < 0.35:
             return {
                 "level": "usable",
-                "headline": "Vorsichtig nutzbar",
-                "detail": "Das Modell taugt als Priorisierung und für experimentelles Filtern, aber noch nicht für aggressive Automatik.",
+                "headline": "Vorsichtig selektiv nutzbar",
+                "detail": "Das Modell wird brauchbarer, sollte aber weiter eher wenige starke Empfehlungen liefern statt breit zu filtern.",
             }
         return {
             "level": "strong",
-            "headline": "Für selektiveres Filtering brauchbar",
-            "detail": "Das Modell zeigt inzwischen genug Balance zwischen Precision und Recall für vorsichtigeren produktiven Einsatz.",
+            "headline": "Fuer strengeres Filtering brauchbar",
+            "detail": "Die Trefferqualitaet ist inzwischen hoch genug, um nur noch die staerkeren Empfehlungen ernsthafter zu beachten.",
         }
 
     if labels_used < 100:
@@ -2906,6 +3021,53 @@ def model_quality_assessment(target: str, latest_run: Optional[dict[str, Any]]) 
         "level": "usable",
         "headline": "Brauchbare erste Orientierung",
         "detail": "Das Summary-Modell liefert eine erste nutzbare Signalqualität.",
+    }
+
+
+def feed_prediction_outcome_stats(limit: int = 1500) -> dict[str, Any]:
+    buckets: dict[str, dict[str, int]] = {
+        "recommended": {"skip": 0, "summarize": 0},
+        "maybe": {"skip": 0, "summarize": 0},
+        "no": {"skip": 0, "summarize": 0},
+        "unknown": {"skip": 0, "summarize": 0},
+    }
+
+    with db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT event_type, event_payload, created_at
+            FROM article_events
+            WHERE event_type IN ('article_skipped', 'summary_requested')
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    considered = 0
+    for row in rows:
+        try:
+            payload = json.loads(row["event_payload"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        snapshot = payload.get("prediction_snapshot") or {}
+        tier = snapshot.get("predicted_tier")
+        if tier not in buckets:
+            tier = "recommended" if snapshot.get("predicted_recommendation") else "unknown"
+        action = "summarize" if row["event_type"] == "summary_requested" else "skip"
+        buckets[tier][action] += 1
+        considered += 1
+
+    return {
+        "considered_events": considered,
+        "recommended_skip": buckets["recommended"]["skip"],
+        "recommended_summarize": buckets["recommended"]["summarize"],
+        "maybe_skip": buckets["maybe"]["skip"],
+        "maybe_summarize": buckets["maybe"]["summarize"],
+        "no_skip": buckets["no"]["skip"],
+        "no_summarize": buckets["no"]["summarize"],
+        "unknown_skip": buckets["unknown"]["skip"],
+        "unknown_summarize": buckets["unknown"]["summarize"],
     }
 
 
@@ -2964,21 +3126,22 @@ def precision_at_k(probabilities: list[float], labels: list[int], k: int) -> dic
     }
 
 
-def select_feed_threshold(labels: list[int], probabilities: list[float]) -> tuple[float, dict[str, Any]]:
+def select_feed_threshold(labels: list[int], probabilities: list[float]) -> tuple[float, float, dict[str, Any]]:
     if not probabilities:
-        return 0.5, {
+        return 0.5, 0.35, {
             "strategy": "fixed_default",
-            "objective": "f1_5_with_precision_floor",
+            "objective": "precision_first_two_stage",
             "candidate_count": 1,
-            "beta": 1.5,
+            "beta": 0.5,
         }
 
     candidate_thresholds = sorted({round(float(probability), 6) for probability in probabilities} | {0.5})
     baseline_predicted = [1 if probability >= 0.5 else 0 for probability in probabilities]
     baseline_precision = float(precision_score(labels, baseline_predicted, zero_division=0))
     baseline_recall = float(recall_score(labels, baseline_predicted, zero_division=0))
-    beta = 1.5
-    precision_floor = max(0.18, baseline_precision * 0.85)
+    beta = 0.5
+    precision_floor = max(0.22, baseline_precision * 1.05)
+    recall_floor = max(0.10, baseline_recall * 0.55)
 
     eligible_snapshots: list[tuple[float, float, float, float, float]] = []
     fallback_snapshots: list[tuple[float, float, float, float, float]] = []
@@ -2988,32 +3151,61 @@ def select_feed_threshold(labels: list[int], probabilities: list[float]) -> tupl
         precision = float(precision_score(labels, predicted, zero_division=0))
         recall = float(recall_score(labels, predicted, zero_division=0))
         fbeta = float(fbeta_score(labels, predicted, beta=beta, zero_division=0))
-        snapshot = (fbeta, recall, precision, -abs(threshold - 0.5), threshold)
+        snapshot = (fbeta, precision, recall, -abs(threshold - 0.6), threshold)
         fallback_snapshots.append(snapshot)
-        if precision >= precision_floor:
+        if precision >= precision_floor and recall >= recall_floor:
             eligible_snapshots.append(snapshot)
 
     chosen_snapshot = max(eligible_snapshots or fallback_snapshots)
-    best_fbeta, best_recall, best_precision, _distance_bias, best_threshold = chosen_snapshot
+    best_fbeta, best_precision, best_recall, _distance_bias, best_threshold = chosen_snapshot
 
-    return round(float(best_threshold), 4), {
+    maybe_beta = 1.0
+    maybe_precision_floor = max(0.16, best_precision * 0.72)
+    maybe_recall_floor = max(best_recall, baseline_recall * 0.95)
+    maybe_candidates: list[tuple[float, float, float, float, float]] = []
+    for threshold in candidate_thresholds:
+        if threshold > best_threshold:
+            continue
+        predicted = [1 if probability >= threshold else 0 for probability in probabilities]
+        precision = float(precision_score(labels, predicted, zero_division=0))
+        recall = float(recall_score(labels, predicted, zero_division=0))
+        fbeta = float(fbeta_score(labels, predicted, beta=maybe_beta, zero_division=0))
+        if precision >= maybe_precision_floor and recall >= maybe_recall_floor:
+            maybe_candidates.append((fbeta, recall, precision, -abs(threshold - (best_threshold - 0.08)), threshold))
+    if maybe_candidates:
+        _maybe_fbeta, maybe_recall, maybe_precision, _bias, maybe_threshold = max(maybe_candidates)
+    else:
+        maybe_threshold = max(0.0, round(best_threshold - 0.10, 4))
+        maybe_predicted = [1 if probability >= maybe_threshold else 0 for probability in probabilities]
+        maybe_precision = float(precision_score(labels, maybe_predicted, zero_division=0))
+        maybe_recall = float(recall_score(labels, maybe_predicted, zero_division=0))
+
+    maybe_threshold = round(float(min(maybe_threshold, best_threshold)), 4)
+
+    return round(float(best_threshold), 4), maybe_threshold, {
         "strategy": "auto_tuned",
-        "objective": "maximize_f1_5_with_precision_floor",
+        "objective": "precision_first_two_stage",
         "candidate_count": len(candidate_thresholds),
         "beta": beta,
         "baseline_precision": round(baseline_precision, 4),
         "baseline_recall": round(baseline_recall, 4),
         "precision_floor": round(precision_floor, 4),
+        "recall_floor": round(recall_floor, 4),
         "best_fbeta": round(best_fbeta, 4),
         "best_precision": round(best_precision, 4),
         "best_recall": round(best_recall, 4),
         "used_precision_floor": bool(eligible_snapshots),
+        "maybe_threshold": maybe_threshold,
+        "maybe_precision": round(maybe_precision, 4),
+        "maybe_recall": round(maybe_recall, 4),
+        "maybe_precision_floor": round(maybe_precision_floor, 4),
     }
 
 
 def should_promote_model(
     target: str,
     candidate_metrics: dict[str, float],
+    candidate_notes: Optional[dict[str, Any]],
     current_active_run: Optional[dict[str, Any]],
 ) -> tuple[bool, dict[str, Any]]:
     if current_active_run is None:
@@ -3028,6 +3220,12 @@ def should_promote_model(
             "reason": "non_feed_target",
         }
 
+    active_notes = {}
+    try:
+        active_notes = json.loads(current_active_run.get("notes") or "{}")
+    except json.JSONDecodeError:
+        active_notes = {}
+
     active_f1 = float(current_active_run.get("f1", 0.0))
     active_precision = float(current_active_run.get("precision", 0.0))
     active_recall = float(current_active_run.get("recall", 0.0))
@@ -3035,6 +3233,22 @@ def should_promote_model(
     candidate_f1 = float(candidate_metrics.get("f1", 0.0))
     candidate_precision = float(candidate_metrics.get("precision", 0.0))
     candidate_recall = float(candidate_metrics.get("recall", 0.0))
+    candidate_p20 = float((candidate_notes or {}).get("precision_at_k", {}).get("20", {}).get("value") or 0.0)
+    active_p20 = float((active_notes or {}).get("precision_at_k", {}).get("20", {}).get("value") or 0.0)
+
+    if candidate_precision >= active_precision + 0.02 and candidate_f1 >= active_f1 - 0.01:
+        return True, {
+            "decision": "promote",
+            "reason": "precision_improved_with_stable_f1",
+            "champion_run_id": current_active_run["id"],
+        }
+
+    if candidate_p20 >= active_p20 + 0.05 and candidate_precision >= active_precision - 0.01:
+        return True, {
+            "decision": "promote",
+            "reason": "precision_at_20_improved",
+            "champion_run_id": current_active_run["id"],
+        }
 
     if candidate_f1 >= active_f1 + 0.01:
         return True, {
@@ -3064,6 +3278,8 @@ def should_promote_model(
         "candidate_f1": round(candidate_f1, 4),
         "candidate_precision": round(candidate_precision, 4),
         "candidate_recall": round(candidate_recall, 4),
+        "active_p20": round(active_p20, 4),
+        "candidate_p20": round(candidate_p20, 4),
     }
 
 
@@ -3135,13 +3351,15 @@ def train_model(target: str) -> dict[str, Any]:
     )
     pipeline.fit(train_x, train_y)
     threshold_value = 0.5
+    maybe_threshold_value = 0.35
     evaluation_notes: dict[str, Any] = {}
     if target == "feed_recommendation":
         probabilities = [float(value) for value in pipeline.predict_proba(test_x)[:, 1]]
-        threshold_value, threshold_notes = select_feed_threshold(test_y, probabilities)
+        threshold_value, maybe_threshold_value, threshold_notes = select_feed_threshold(test_y, probabilities)
         predicted = [1 if probability >= threshold_value else 0 for probability in probabilities]
         evaluation_notes = {
             "threshold_strategy": threshold_notes,
+            "maybe_threshold_value": maybe_threshold_value,
             "precision_at_k": {
                 "10": precision_at_k(probabilities, test_y, 10),
                 "20": precision_at_k(probabilities, test_y, 20),
@@ -3167,6 +3385,7 @@ def train_model(target: str) -> dict[str, Any]:
             "recall": recall,
             "f1": f1,
         },
+        evaluation_notes,
         current_active_run,
     )
     effective_model_path = model_path
@@ -3217,6 +3436,7 @@ def train_model(target: str) -> dict[str, Any]:
         "run_id": run_id,
         "trained_at": trained_at,
         "threshold": threshold_value,
+        "maybe_threshold": maybe_threshold_value,
         "pipeline": pipeline,
     }
     joblib.dump(artifact, effective_model_path)
@@ -3243,6 +3463,7 @@ def train_model(target: str) -> dict[str, Any]:
         "recall": round(recall, 4),
         "f1": round(f1, 4),
         "threshold_value": threshold_value,
+        "maybe_threshold_value": maybe_threshold_value,
         "training_duration_ms": training_duration_ms,
         "notes": notes_payload,
         "promoted": promotion_allowed,
@@ -3253,8 +3474,39 @@ def train_model(target: str) -> dict[str, Any]:
 def train_targets(targets: list[str]) -> list[dict[str, Any]]:
     results = []
     with STATE.training_lock:
-        for target in targets:
-            results.append(train_model(target))
+        started_at = utc_now_iso()
+        with STATE.training_status_lock:
+            STATE.training_status = {
+                "active": True,
+                "target": "all" if len(targets) > 1 else targets[0],
+                "started_at": started_at,
+                "finished_at": None,
+                "results": None,
+                "error": None,
+            }
+        try:
+            for target in targets:
+                results.append(train_model(target))
+            with STATE.training_status_lock:
+                STATE.training_status = {
+                    "active": False,
+                    "target": "all" if len(targets) > 1 else targets[0],
+                    "started_at": started_at,
+                    "finished_at": utc_now_iso(),
+                    "results": results,
+                    "error": None,
+                }
+        except Exception as exc:
+            with STATE.training_status_lock:
+                STATE.training_status = {
+                    "active": False,
+                    "target": "all" if len(targets) > 1 else targets[0],
+                    "started_at": started_at,
+                    "finished_at": utc_now_iso(),
+                    "results": None,
+                    "error": str(exc),
+                }
+            raise
     return results
 
 
@@ -3505,10 +3757,22 @@ def feed_counts() -> dict[str, int]:
     pending = int(snapshot.get("visible_total", count_rows("feed_decision = 'pending'")))
     similar_groups = int(snapshot.get("similar_group_count", 0))
     similar_hidden = int(snapshot.get("similar_hidden_count", 0))
-    recommended = count_rows("feed_decision = 'pending' AND predicted_recommendation = 1")
+    with db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM articles
+            WHERE feed_decision = 'pending'
+            ORDER BY datetime(published_at) DESC, id DESC
+            """
+        ).fetchall()
+    predicted_rows, _run_id = predict_feed_rows(list(rows))
+    recommended = sum(1 for row in predicted_rows if row["prediction"]["recommended"])
+    maybe = sum(1 for row in predicted_rows if row["prediction"].get("tier") == "maybe")
     return {
         "pending": pending,
         "recommended": recommended,
+        "maybe": maybe,
         "similar_groups": similar_groups,
         "similar_hidden": similar_hidden,
         "labeled_skip": count_rows("feed_decision = 'skip'"),
@@ -3653,6 +3917,14 @@ def api_feed():
 
     if mode == "recommended":
         filtered = [row for row in predicted_rows if row["prediction"]["recommended"]]
+    elif mode == "maybe":
+        filtered = [row for row in predicted_rows if row["prediction"].get("tier") == "maybe"]
+    elif mode == "maybe_plus":
+        filtered = [
+            row
+            for row in predicted_rows
+            if row["prediction"]["recommended"] or row["prediction"].get("tier") == "maybe"
+        ]
     else:
         filtered = predicted_rows
 
@@ -3664,6 +3936,9 @@ def api_feed():
                 "total_pending": len(predicted_rows),
                 "recommended_pending": sum(
                     1 for row in predicted_rows if row["prediction"]["recommended"]
+                ),
+                "maybe_pending": sum(
+                    1 for row in predicted_rows if row["prediction"].get("tier") == "maybe"
                 ),
                 "similar_group_count": similarity["similar_group_count"],
                 "similar_hidden_count": similarity["similar_hidden_count"],
@@ -3688,6 +3963,8 @@ def api_summarize_article(article_id: int):
         return jsonify(set_feed_decision(article_id, "summarize"))
     except LookupError:
         return jsonify({"status": "error", "message": "Article not found"}), 404
+    except RuntimeError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 409
 
 
 @APP.get("/api/summaries")
@@ -3715,7 +3992,7 @@ def api_summary_feedback(article_id: int):
 
 @APP.get("/api/model-ops")
 def api_model_ops():
-    payload: dict[str, Any] = {"targets": {}}
+    payload: dict[str, Any] = {"targets": {}, "training": get_training_status()}
     for target in TARGET_CONFIG:
         latest_run = latest_model_run(target)
         previous_run = previous_model_run(target)
@@ -3733,6 +4010,8 @@ def api_model_ops():
             "retraining": retraining_recommendation(target, active_run),
             "quality": model_quality_assessment(target, active_run),
         }
+        if target == "feed_recommendation":
+            payload["targets"][target]["prediction_outcomes"] = feed_prediction_outcome_stats()
         if latest_run and latest_run.get("confusion_matrix_json"):
             payload["targets"][target]["latest_run"]["confusion_matrix"] = json.loads(
                 latest_run["confusion_matrix_json"]

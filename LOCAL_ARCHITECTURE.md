@@ -27,6 +27,7 @@ fuer Nicht-Statistiker steht zusaetzlich in:
 - sichtbar: `Titel`, `Quelle`, `Zeit`
 - sehr ähnliche Meldungen aus mehreren Quellen werden zu einer Story zusammengezogen
 - der Modus `Empfohlen` filtert lokal aus bereits geladenen Feed-Daten und braucht keinen zweiten Feed-Request
+- der Modus `Vielleicht` ist getrennt von `Empfohlen` und zeigt nur Grenzfaelle unterhalb der Hauptschwelle
 - ein lokaler Feed-Verlauf hält bereits bearbeitete Artikel für `Zurück` weiter verfügbar
 - Aktionen:
   - `Weiter` -> negatives Label
@@ -129,6 +130,8 @@ Summaries werden nicht im UI-Thread erzeugt, sondern im Backend asynchron:
 - Text wird extrahiert
 - Ollama erzeugt Titel und Summary
 - Ergebnis landet als `ready` in der DB
+- `Zusammenfassen` weckt den Summary-Worker sofort ueber ein Event, statt nur auf das naechste Polling zu warten
+- solange Summary-Jobs `queued` oder `processing` sind, pausiert der Embedding-Worker kurz, damit Ollama-Kapazitaet zuerst fuer produktive Summaries frei bleibt
 
 Gründe:
 
@@ -136,6 +139,7 @@ Gründe:
 - UI blockiert nicht
 - Queue ist sichtbar und nachvollziehbar
 - hängengebliebene `processing`-Jobs werden per Recovery-Timeout automatisch freigeräumt
+- lokale Embedding-Arbeit darf den sichtbaren Summary-Flow nicht verhungern lassen
 
 ### 5. Optionaler Mehrmodell-Vergleich
 
@@ -179,7 +183,9 @@ Training:
 
 - `TF-IDF + LogisticRegression`
 - automatische Threshold-Optimierung beim Retraining statt starrem `0.5`
-- die Schwelle wird recall-lastig ueber ein milderes `F1.5`-Ziel gesucht, aber nur solange die Precision nicht zu stark einbricht
+- die Schwelle wird precision-first gesucht; klare Empfehlungen sollen moeglichst wenige falsch Positive erzeugen
+- zusaetzlich gibt es eine zweite, weichere `vielleicht`-Schwelle fuer Grenzfaelle unterhalb der Hauptschwelle
+- die UI-Modi `Empfohlen` und `Vielleicht` sind disjunkt; `Vielleicht` enthaelt nicht erneut die klar empfohlenen Artikel
 - `Precision@K` dient zusaetzlich als alltagsnahe Ranking-Metrik fuer die obersten Empfehlungen
 
 Zusätzlicher nicht-trainierender Zustand:
@@ -255,11 +261,13 @@ Technik:
 - eher vorsichtige, aber inzwischen etwas gelockerte Titel-Ähnlichkeit auf Basis normalisierter Tokens und String-Ähnlichkeit
 - zusaetzliche Robustheit gegen leicht variierte Headlines durch Cluster-Vergleich statt nur Canonical-Vergleich
 - wenn verfuegbar, zusaetzlich semantische Aehnlichkeit ueber lokale Ollama-Embeddings
+- Embedding-Input nutzt fuer nicht-lateinische Titel einen Unicode-erhaltenden Fallback, damit solche Headlines nicht leer normalisiert werden
 - Zeitfenster von 48 Stunden
 - Gruppierung nur bei hoher Ähnlichkeit
 - die aufwendige Similarity-Bildung läuft als Hintergrund-Snapshot und nicht mehr im Hot Path des Feed-Requests
 - der Snapshot wird nur im laufenden Backend-Prozess im Speicher gehalten, nicht mehr zusätzlich in SQLite
 - ein separater Embedding-Worker erzeugt Titel-Embeddings im Hintergrund; Feed-Reload und Feed-Klicks fuehren selbst keine Embedding-Generierung aus
+- der Embedding-Worker laeuft bewusst nachrangig gegenueber Summary-Jobs, weil beide ueber den lokalen Ollama-Lock konkurrieren koennen
 
 Gründe:
 
@@ -323,6 +331,7 @@ Reihenfolge:
 - Ollama lokal
 - Default-Modell: `qwen3.6:latest`
 - Default-Embedding-Modell: `nomic-embed-text-v2-moe:latest`
+- Summary-, Compare- und Embedding-Aufrufe teilen sich intern einen lokalen Ollama-Lock; produktive Summaries werden gegenueber Embeddings priorisiert
 
 Grund:
 

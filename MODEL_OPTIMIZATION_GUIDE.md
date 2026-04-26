@@ -179,12 +179,17 @@ Wahrscheinlichkeit, zum Beispiel:
 Erst der **Threshold** macht daraus eine Entscheidung:
 
 - ueber dem Threshold -> `Empfohlen`
+- zwischen Hauptschwelle und zweiter Schwelle -> `Vielleicht`
 - darunter -> `nicht empfohlen`
+
+`Empfohlen` und `Vielleicht` sind in der UI bewusst getrennte Listen.
+Wenn du zuerst `Empfohlen` und danach `Vielleicht` durcharbeitest, soll
+derselbe Artikel nicht nochmal in der zweiten Liste auftauchen.
 
 Beispiel:
 
-- Threshold `0.50`: nur deutlich positive Artikel werden empfohlen
-- Threshold `0.35`: auch grenzwertige Artikel werden noch empfohlen
+- Hauptschwelle `0.50`: nur deutlich positive Artikel werden empfohlen
+- zweite Schwelle `0.35`: grenzwertige Artikel werden als `Vielleicht` markiert
 
 Konsequenz:
 
@@ -217,19 +222,22 @@ In dieser App wird die Schwelle beim Retraining deshalb automatisch angepasst.
 
 Die aktuelle Strategie ist:
 
-- eher recall-lastig als precision-lastig
-- aber mit Schutz davor, dass Precision zu stark abstuerzt
+- eher precision-lastig als recall-lastig
+- mit einer zweiten, weicheren `Vielleicht`-Stufe fuer Grenzfaelle
 
 Konkret:
 
 - es wird nicht nur nach maximalem Recall gesucht
 - es wird auch nicht nur blind nach F1 gesucht
-- stattdessen wird eine mild recall-lastige Balance gesucht
+- stattdessen wird zuerst eine moeglichst treffsichere Hauptschwelle gesucht
+- darunter wird eine zweite Schwelle fuer `Vielleicht` gesetzt
+- diese zweite Stufe ist kein `Empfohlen + Vielleicht`, sondern nur der
+  unsichere Grenzbereich
 
 Das ist noetig, weil fuer diesen Use Case gilt:
 
 - gute Artikel nicht verpassen
-- aber `Empfohlen` trotzdem alltagstauglich halten
+- aber `Empfohlen` trotzdem alltagstauglich und moeglichst selektiv halten
 
 ## Woran man Fortschritt erkennt
 
@@ -314,6 +322,7 @@ Spaetere sinnvolle Ausbaustufen sind:
 
 - bessere Features
 - Embeddings im Hintergrund
+- robustere Embedding-Eingaben fuer unterschiedliche Sprachen und Schriftsysteme
 - differenziertere Schwellenstrategie
 - Auswertung harter Fehlfaelle wie:
   - `nicht empfohlen, aber trotzdem zusammenfassen lassen`

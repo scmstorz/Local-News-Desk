@@ -109,15 +109,22 @@ LOCAL_NEWS_REFRESH_SECONDS=300
 - Wenn ein Artikel wegen Paywall, Popup oder Blockade nicht sauber extrahiert werden kann, zeigt die UI nur den generischen Zustand `Not available`.
 - `Not available`-Fälle erscheinen in der Summary-Liste, damit der Originalartikel bei Bedarf noch geöffnet werden kann.
 - hängengebliebene `processing`-Summaries werden nach einem Recovery-Timeout automatisch auf `failed` gesetzt.
+- `Zusammenfassen` weckt den Summary-Worker sofort; neue Summary-Jobs muessen nicht erst auf das naechste Polling warten.
 - Der Feed blendet sehr ähnliche Meldungen aus anderen Quellen standardmäßig zusammen und zeigt nur einen Hauptartikel pro Story.
 - Das Feed-Training arbeitet cluster-bewusst: sehr ähnliche Story-Varianten werden vor dem Training zu einem Fall zusammengezogen; `Zusammenfassen` dominiert dabei mehrere `Weiter`-Varianten derselben Story.
 - Die Similarity-Logik nutzt zusaetzlich lokale Embeddings, aber nur im Hintergrund. Feed-Reload und Feed-Klicks fuehren selbst keine Embedding-Generierung aus.
+- Embeddings behalten Unicode-Titel als Fallback bei; nicht-lateinische Headlines werden dadurch nicht mehr zu leerem Embedding-Input normalisiert.
+- Der Embedding-Worker pausiert, solange Summary-Jobs `queued` oder `processing` sind, damit lokale Ollama-Kapazitaet zuerst fuer produktive Summaries genutzt wird.
 - Die Ähnlichkeitsgruppierung läuft als Hintergrund-Snapshot; der Feed-Request liest diesen Snapshot nur noch aus und bleibt dadurch beim Reload deutlich schneller.
 - Der Toggle `Empfohlen` filtert inzwischen client-seitig auf Basis bereits geladener Feed-Daten; das Umschalten erzeugt keinen zusätzlichen Backend-Request mehr.
+- `Empfohlen` und `Vielleicht` sind im Feed getrennte Modi ohne Ueberschneidung; `Vielleicht` zeigt nur Grenzfaelle unterhalb der strengen Empfehlungsschwelle.
 - Der Feed hält einen lokalen Verlauf, damit `Zurück` und Pfeil links auch nach `Weiter` oder `Zusammenfassen` weiter funktionieren.
 - `Model Ops` zeigt während eines Trainingslaufs sofort einen sichtbaren Laufstatus statt nur still auf neue Zahlen zu springen.
-- beim Feed-Retraining wird die Entscheidungsschwelle nicht starr auf `0.5` gelassen, sondern automatisch auf dem Testsplit recall-lastig optimiert, aber mit Schutz gegen zu starken Precision-Abfall
-- `Model Ops` zeigt fuer das Feed-Modell deshalb zusaetzlich die aktive `Threshold`-Schwelle sowie `Precision@10`, `Precision@20` und `Precision@50`
+- beim Feed-Retraining wird die Entscheidungsschwelle nicht starr auf `0.5` gelassen, sondern automatisch precision-first optimiert
+- das Feed-Modell hat jetzt zwei Stufen:
+  - `empfohlen` fuer die strengeren, treffsichereren Treffer
+  - `vielleicht` fuer grenzwertige Kandidaten unterhalb der Hauptschwelle
+- `Model Ops` zeigt fuer das Feed-Modell deshalb zusaetzlich die aktive `Threshold`-Schwelle, die `Vielleicht`-Schwelle sowie `Precision@10`, `Precision@20` und `Precision@50`
 - Feed-Entscheidungen loggen im Event-Store jetzt zusaetzlich einen Snapshot der damals aktiven Modellvorhersage mit
 - ein neuer Feed-Lauf wird nicht automatisch live geschaltet: schlechtere Kandidaten werden verworfen, das aktive Modell bleibt dann unveraendert
 
@@ -141,6 +148,7 @@ Wenn `LLM Compare` in `Model Ops` eingeschaltet wird:
 - die normale Primary-Summary nutzt einen deutlich höheren eigenen Ollama-Timeout als der Web-Fetch
 - der Compare-Teil hat einen eigenen Timeout in `local_config.json`
 - Summary und Compare teilen sich intern einen gemeinsamen Ollama-Lock; es läuft also nie mehr als ein lokaler Modell-Call gleichzeitig
+- Summary-Jobs haben operativ Vorrang vor Embedding-Jobs; Compare bleibt optional und blockiert den produktiven Summary-Worker nicht
 - einzelne Compare-Timeouts werden als Fehler protokolliert und lassen die Session weiterlaufen
 - fehlgeschlagene Modellläufe zählen als erledigte Compare-Schritte und blockieren die Session nicht dauerhaft
 - verglichen werden nur Summaries, die während der aktiven Compare-Session entstanden sind

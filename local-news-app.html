@@ -385,6 +385,18 @@
             color: var(--ink);
         }
 
+        .prediction-value.prediction-high {
+            color: var(--accent-strong);
+        }
+
+        .prediction-value.prediction-maybe {
+            color: #a16207;
+        }
+
+        .prediction-value.prediction-low {
+            color: var(--ink-soft);
+        }
+
         .prediction-subtle {
             font-size: 14px;
             color: var(--ink-soft);
@@ -731,6 +743,7 @@
                 <div class="status-row">
                     <div class="status-pill">Feed <strong id="feedPendingCount">0</strong></div>
                     <div class="status-pill">Empfohlen <strong id="feedRecommendedCount">0</strong></div>
+                    <div class="status-pill">Vielleicht <strong id="feedMaybeCount">0</strong></div>
                     <div class="status-pill" id="feedSimilarPill" style="display:none;">Ähnliche <strong id="feedSimilarCount">0 in 0 Gruppen</strong></div>
                     <div class="status-pill">Primär-Queue <strong id="summaryQueueCount">0</strong></div>
                     <div class="status-pill">Primär bereit <strong id="summaryReadyCount">0</strong></div>
@@ -763,6 +776,7 @@
             feedError: '',
             feedDeduplicating: false,
             lastFeedDeduplicateResult: null,
+            lastFeedActionStatus: '',
             summaries: [],
             summaryIndex: 0,
             status: null,
@@ -770,6 +784,7 @@
             lastReadyCount: 0,
             trainingBusy: false,
             trainingState: null,
+            trainingLastResult: null,
             trainingTickHandle: null,
             feedMutationChain: Promise.resolve(),
         };
@@ -1186,10 +1201,15 @@ Die Markdown-Datei ist attached.`;
 
         function renderHeaderStatus() {
             if (!state.status) return;
-            document.getElementById('feedPendingCount').textContent = state.status.feed.pending ?? 0;
-            document.getElementById('feedRecommendedCount').textContent = state.status.feed.recommended ?? 0;
-            const similarHidden = state.status.feed.similar_hidden ?? 0;
-            const similarGroups = state.status.feed.similar_groups ?? 0;
+            const feedTotals = currentVisibleFeedCounts();
+            document.getElementById('feedPendingCount').textContent = feedTotals.total_pending;
+            document.getElementById('feedRecommendedCount').textContent = feedTotals.recommended_pending;
+            const maybeCountEl = document.getElementById('feedMaybeCount');
+            if (maybeCountEl) {
+                maybeCountEl.textContent = feedTotals.maybe_pending ?? 0;
+            }
+            const similarHidden = feedTotals.similar_hidden_count;
+            const similarGroups = feedTotals.similar_group_count;
             const similarPill = document.getElementById('feedSimilarPill');
             document.getElementById('feedSimilarCount').textContent = `${similarHidden} in ${similarGroups} Gruppen`;
             if (similarPill) {
@@ -1207,11 +1227,38 @@ Die Markdown-Datei ist attached.`;
             document.getElementById('compareStatusValue').textContent = compareProgressLabel(compare);
         }
 
+        function currentVisibleFeedCounts() {
+            const localItems = state.allFeedItems || [];
+            const localTotals = localItems.length
+                ? {
+                    total_pending: localItems.length,
+                    recommended_pending: localItems.filter(item => item.prediction?.recommended).length,
+                    maybe_pending: localItems.filter(item => item.prediction?.tier === 'maybe').length,
+                    similar_group_count: state.feedCounts?.similar_group_count ?? state.status?.feed?.similar_groups ?? 0,
+                    similar_hidden_count: state.feedCounts?.similar_hidden_count ?? state.status?.feed?.similar_hidden ?? 0,
+                }
+                : null;
+
+            if (localTotals) {
+                return localTotals;
+            }
+
+            return {
+                total_pending: state.feedCounts?.total_pending ?? state.status?.feed?.pending ?? 0,
+                recommended_pending: state.feedCounts?.recommended_pending ?? state.status?.feed?.recommended ?? 0,
+                maybe_pending: state.feedCounts?.maybe_pending ?? state.status?.feed?.maybe ?? 0,
+                similar_group_count: state.feedCounts?.similar_group_count ?? state.status?.feed?.similar_groups ?? 0,
+                similar_hidden_count: state.feedCounts?.similar_hidden_count ?? state.status?.feed?.similar_hidden ?? 0,
+            };
+        }
+
         function applyFeedMode(reset = false, currentId = null) {
             const sourceItems = state.allFeedItems || [];
             const filteredItems = state.feedMode === 'recommended'
                 ? sourceItems.filter(item => item.prediction?.recommended)
-                : sourceItems.slice();
+                : state.feedMode === 'maybe'
+                    ? sourceItems.filter(item => item.prediction?.tier === 'maybe')
+                    : sourceItems.slice();
             state.feedItems = filteredItems;
 
             if (reset) {
@@ -1286,6 +1333,7 @@ Die Markdown-Datei ist attached.`;
             if (!idSet.size) return;
             state.allFeedItems = (state.allFeedItems || []).filter(item => !idSet.has(Number(item.id)));
             applyFeedMode(false);
+            renderHeaderStatus();
         }
 
         function removeCurrentAndSimilarFeedItems(currentItem, deduplicatedCount) {
@@ -1342,6 +1390,7 @@ Die Markdown-Datei ist attached.`;
                 state.feedCounts = payload.counts || null;
                 applyFeedMode(reset, currentId);
                 state.feedLoading = false;
+                renderHeaderStatus();
                 renderFeedScreen(state.feedCounts);
             } catch (error) {
                 state.feedLoading = false;
@@ -1400,12 +1449,18 @@ Die Markdown-Datei ist attached.`;
                 `;
             }
 
-            const recommended = Boolean(prediction.recommended);
+            const tier = prediction.tier || (prediction.recommended ? 'recommended' : 'no');
+            const label = tier === 'recommended'
+                ? 'empfohlen'
+                : (tier === 'maybe' ? 'vielleicht' : 'eher nein');
+            const tierClass = tier === 'recommended'
+                ? 'prediction-high'
+                : (tier === 'maybe' ? 'prediction-maybe' : 'prediction-low');
             return `
                 <div class="prediction-strip">
                     <div class="prediction-main">
                         <div class="prediction-label">Feed-Modell</div>
-                        <div class="prediction-value">${recommended ? 'empfohlen' : 'eher nein'}</div>
+                        <div class="prediction-value ${tierClass}">${label}</div>
                         <div class="prediction-subtle">Wahrscheinlichkeit: ${formatProbability(prediction.probability)}</div>
                     </div>
                 </div>
@@ -1416,11 +1471,11 @@ Die Markdown-Datei ist attached.`;
             const host = document.getElementById('screen-feed');
             const item = currentFeedItem();
             const viewingHistory = state.feedHistoryIndex >= 0;
-            const totals = counts || {
-                total_pending: state.allFeedItems.length,
-                recommended_pending: state.allFeedItems.filter(row => row.prediction?.recommended).length,
-            };
+            const totals = counts || currentVisibleFeedCounts();
             const lastDeduplicate = state.lastFeedDeduplicateResult;
+            const actionStatus = state.lastFeedActionStatus
+                ? `<div class="ops-assessment" style="margin: 0 22px 18px;"><strong>${escapeHtml(state.lastFeedActionStatus)}</strong></div>`
+                : '';
             const deduplicateBanner = lastDeduplicate
                 ? `
                     <div class="ops-assessment" style="margin: 0 22px 18px;">
@@ -1457,8 +1512,9 @@ Die Markdown-Datei ist attached.`;
                 const refreshLabel = state.status?.last_feed_refresh?.finished_at
                     ? formatRelativeTime(state.status.last_feed_refresh.finished_at)
                     : 'unbekannt';
-                const emptyRecommended = state.feedMode === 'recommended' && (totals.total_pending ?? 0) > 0;
+                const emptyRecommended = (state.feedMode === 'recommended' || state.feedMode === 'maybe') && (totals.total_pending ?? 0) > 0;
                 const hasFeedError = Boolean(state.feedError);
+                const emptyModeLabel = state.feedMode === 'maybe' ? '„Vielleicht“' : '„Empfohlen“';
                 host.innerHTML = `
                     <div class="panel">
                         <div class="panel-header">
@@ -1469,6 +1525,7 @@ Die Markdown-Datei ist attached.`;
                                 <div class="segmented">
                                     <button class="segment-button ${state.feedMode === 'all' ? 'active' : ''}" data-feed-mode="all">Alle</button>
                                     <button class="segment-button ${state.feedMode === 'recommended' ? 'active' : ''}" data-feed-mode="recommended">Empfohlen</button>
+                                    <button class="segment-button ${state.feedMode === 'maybe' ? 'active' : ''}" data-feed-mode="maybe">Vielleicht</button>
                                 </div>
                                 <button class="inline-button" id="feedDeduplicateButton" ${state.feedDeduplicating ? 'disabled' : ''}>${state.feedDeduplicating ? 'Kompaktiere …' : 'Inbox kompaktieren'}</button>
                                 <button class="inline-button" id="feedResetButton">Inbox-Reset</button>
@@ -1476,12 +1533,13 @@ Die Markdown-Datei ist attached.`;
                             </div>
                         </div>
                         ${deduplicateBanner}
+                        ${actionStatus}
                         <div class="empty-state">
-                            <h3>${hasFeedError ? 'Feed derzeit nicht verfügbar' : (emptyRecommended ? 'Keine zeigenswerten Treffer' : 'Inbox leer')}</h3>
+                            <h3>${hasFeedError ? 'Feed derzeit nicht verfügbar' : (emptyRecommended ? 'Keine empfohlenen Treffer' : 'Inbox leer')}</h3>
                             <p>${hasFeedError
                                 ? `Der Feed konnte nicht geladen werden: ${escapeHtml(state.feedError)}`
                                 : emptyRecommended
-                                    ? `Im Modus „Empfohlen“ gibt es gerade keine Treffer. Insgesamt sind aber noch ${totals.total_pending ?? 0} offene Feed-Einträge vorhanden.`
+                                    ? `Im Modus ${emptyModeLabel} gibt es gerade keine Treffer. Insgesamt sind aber noch ${totals.total_pending ?? 0} offene Feed-Einträge vorhanden.`
                                     : `Im aktuellen Modus gibt es gerade keine offenen Feed-Einträge. Neue Artikel tauchen automatisch nach dem nächsten Feed-Refresh auf.`}
                                 ${hasFeedError ? '' : `Letzter Feed-Refresh: ${escapeHtml(refreshLabel)}.`}</p>
                             ${emptyRecommended ? '<div class="ops-actions" style="justify-content: center; margin-top: 14px;"><button class="inline-button" id="showAllFeedButton">Alle Feed-Einträge zeigen</button></div>' : ''}
@@ -1503,21 +1561,23 @@ Die Markdown-Datei ist attached.`;
                             <div class="panel-title">
                                 <h2>Feed</h2>
                                 <p>${viewingHistory
-                                    ? `Verlauf ${state.feedHistoryIndex + 1} / ${state.feedHistory.length} · ${totals.total_pending ?? state.feedItems.length} offen · ${totals.recommended_pending ?? 0} empfohlen`
-                                    : `${state.feedIndex + 1} / ${state.feedItems.length} in dieser Session · ${totals.total_pending ?? state.feedItems.length} offen · ${totals.recommended_pending ?? 0} empfohlen`}</p>
+                                    ? `Verlauf ${state.feedHistoryIndex + 1} / ${state.feedHistory.length} · ${totals.total_pending ?? state.feedItems.length} offen · ${totals.recommended_pending ?? 0} empfohlen · ${totals.maybe_pending ?? 0} vielleicht`
+                                    : `${state.feedIndex + 1} / ${state.feedItems.length} in dieser Session · ${totals.total_pending ?? state.feedItems.length} offen · ${totals.recommended_pending ?? 0} empfohlen · ${totals.maybe_pending ?? 0} vielleicht`}</p>
                             </div>
                         <div class="toolbar">
                                 <div class="segmented">
                                     <button class="segment-button ${state.feedMode === 'all' ? 'active' : ''}" data-feed-mode="all">Alle</button>
                                     <button class="segment-button ${state.feedMode === 'recommended' ? 'active' : ''}" data-feed-mode="recommended">Empfohlen</button>
+                                    <button class="segment-button ${state.feedMode === 'maybe' ? 'active' : ''}" data-feed-mode="maybe">Vielleicht</button>
                                 </div>
                                 <button class="inline-button" id="feedDeduplicateButton" ${state.feedDeduplicating ? 'disabled' : ''}>${state.feedDeduplicating ? 'Kompaktiere …' : 'Inbox kompaktieren'}</button>
                                 <button class="inline-button" id="feedResetButton">Inbox-Reset</button>
                                 <button class="inline-button" id="refreshFeedButton">Feeds aktualisieren</button>
                             </div>
                         </div>
-                    ${deduplicateBanner}
-                    <div class="feed-card">
+	                    ${deduplicateBanner}
+	                    ${actionStatus}
+	                    <div class="feed-card">
                         <div class="feed-meta">
                             <a class="meta-chip" href="${escapeHtml(item.source_url)}" target="_blank" rel="noopener noreferrer">Quelle · ${escapeHtml(item.source_label)}</a>
                             <span class="meta-chip">Zeit · ${escapeHtml(formatRelativeTime(item.published_at))}</span>
@@ -1624,17 +1684,19 @@ Die Markdown-Datei ist attached.`;
 
         async function handleFeedSkip() {
             const item = currentFeedItem();
-            if (!item) return;
+            if (!item) {
+                showToast('Kein aktiver Feed-Artikel zum Ueberspringen.', 'info');
+                return;
+            }
             const wasViewingHistory = state.feedHistoryIndex >= 0;
             pushFeedHistoryItem(item, 'skip');
+            state.lastFeedActionStatus = `Uebersprungen: ${item.title}`;
             if (!wasViewingHistory) {
                 removeOnlyCurrentFeedItem(item);
             } else {
                 exitFeedHistoryMode();
             }
-            if (state.feedItems.length || wasViewingHistory) {
-                renderFeedScreen();
-            }
+            renderFeedScreen();
             queueFeedMutation(async () => {
                 const result = await api(`/articles/${item.id}/skip`, { method: 'POST' });
                 removeCurrentAndSimilarFeedItems(item, result.deduplicated_count);
@@ -1652,17 +1714,20 @@ Die Markdown-Datei ist attached.`;
 
         async function handleFeedSummarize() {
             const item = currentFeedItem();
-            if (!item) return;
+            if (!item) {
+                showToast('Kein aktiver Feed-Artikel zum Zusammenfassen.', 'info');
+                return;
+            }
             const wasViewingHistory = state.feedHistoryIndex >= 0;
             pushFeedHistoryItem(item, 'summarize');
+            state.lastFeedActionStatus = `Summary vorgemerkt: ${item.title}`;
+            showToast('Summary vorgemerkt.', 'info');
             if (!wasViewingHistory) {
                 removeOnlyCurrentFeedItem(item);
             } else {
                 exitFeedHistoryMode();
             }
-            if (state.feedItems.length || wasViewingHistory) {
-                renderFeedScreen();
-            }
+            renderFeedScreen();
             queueFeedMutation(async () => {
                 const result = await api(`/articles/${item.id}/summarize`, { method: 'POST' });
                 removeCurrentAndSimilarFeedItems(item, result.deduplicated_count);
@@ -1900,7 +1965,8 @@ Die Markdown-Datei ist attached.`;
                         <div><strong>Precision</strong>: Wenn das Modell "interessant" sagt, wie oft stimmt das dann?</div>
                         <div><strong>Recall</strong>: Von allen wirklich interessanten Faellen, wie viele findet das Modell?</div>
                         <div><strong>F1</strong>: Ein gemeinsamer Wert fuer die Balance aus Precision und Recall. Fuer diese App ist das meist die wichtigste Kurzmetrik.</div>
-                        <div><strong>Threshold</strong>: Ab welcher Modell-Wahrscheinlichkeit ein Artikel als empfohlen gilt. Niedriger bedeutet meist weniger uebersehene Treffer, aber mehr zusaetzliche Lese-Arbeit.</div>
+                        <div><strong>Threshold</strong>: Ab welcher Modell-Wahrscheinlichkeit ein Artikel als empfohlen gilt. Hoeher bedeutet meist weniger falsch Positive, aber auch mehr verpasste gute Treffer.</div>
+                        <div><strong>Vielleicht</strong>: Das ist die mittlere Zone zwischen klar empfohlen und eher nein. Sie zeigt brauchbare Kandidaten, die aber noch nicht stark genug fuer die strenge Empfehlung sind.</div>
                         <div><strong>Precision@10 / @20 / @50</strong>: Wie viele der obersten Empfehlungen wirklich gut waren. Fuer den Alltag ist das oft aussagekraeftiger als nur eine globale Accuracy.</div>
                     </div>
                 </details>
@@ -1921,6 +1987,81 @@ Die Markdown-Datei ist attached.`;
             return `seit ${Math.round(elapsedSeconds / 60)} min`;
         }
 
+        function summarizeTrainingResults(results) {
+            const items = Array.isArray(results) ? results : [];
+            const rejected = items.filter(item => item.status === 'rejected').length;
+            const trained = items.filter(item => item.status === 'trained').length;
+            const insufficient = items.filter(item => item.status === 'insufficient_labels').length;
+
+            let tone = 'compare-on';
+            let headline = 'Training abgeschlossen';
+            if (items.length && trained === 0 && rejected > 0) {
+                tone = 'compare-off';
+                headline = 'Training fertig, Kandidat verworfen';
+            } else if (insufficient > 0 && trained === 0 && rejected === 0) {
+                tone = '';
+                headline = 'Training nicht möglich';
+            }
+
+            const detail = items.map(item => {
+                const label = trainingTargetLabel(item.target);
+                if (item.status === 'trained') {
+                    return `${label}: aktiv${item.training_duration_ms ? ` · ${formatDuration(item.training_duration_ms)}` : ''}`;
+                }
+                if (item.status === 'rejected') {
+                    return `${label}: Kandidat verworfen${item.training_duration_ms ? ` · ${formatDuration(item.training_duration_ms)}` : ''}`;
+                }
+                if (item.status === 'insufficient_labels') {
+                    return `${label}: zu wenig Labels`;
+                }
+                return `${label}: ${item.status}`;
+            }).join(' · ');
+
+            return { tone, headline, detail };
+        }
+
+        function effectiveTrainingStatus() {
+            const backendTraining = state.modelOps?.training;
+            if (backendTraining?.active) {
+                return {
+                    active: true,
+                    target: backendTraining.target,
+                    startedAt: backendTraining.started_at ? new Date(backendTraining.started_at).getTime() : Date.now(),
+                };
+            }
+            return state.trainingBusy ? {
+                active: true,
+                target: state.trainingState?.target,
+                startedAt: state.trainingState?.startedAt || Date.now(),
+            } : null;
+        }
+
+        function renderPredictionOutcomeBlock(outcomes) {
+            if (!outcomes || !outcomes.considered_events) return '';
+            return `
+                <div class="ops-assessment" style="margin-top: 14px;">
+                    <strong>Wo das Modell sich vertut</strong>
+                    <p>Gezählt werden die letzten ${escapeHtml(String(outcomes.considered_events))} Feed-Entscheidungen mit gespeichertem Prediction-Snapshot.</p>
+                    <div class="data-points" style="margin-top: 10px;">
+                        <span class="data-pill">Empfohlen -> Weiter ${escapeHtml(String(outcomes.recommended_skip || 0))}</span>
+                        <span class="data-pill">Empfohlen -> Summary ${escapeHtml(String(outcomes.recommended_summarize || 0))}</span>
+                        <span class="data-pill">Vielleicht -> Weiter ${escapeHtml(String(outcomes.maybe_skip || 0))}</span>
+                        <span class="data-pill">Vielleicht -> Summary ${escapeHtml(String(outcomes.maybe_summarize || 0))}</span>
+                        <span class="data-pill">Eher nein -> Summary ${escapeHtml(String(outcomes.no_summarize || 0))}</span>
+                    </div>
+                    <details style="margin-top: 12px;">
+                        <summary style="cursor: pointer; color: var(--accent); font-size: 0.92rem;">Was bedeutet das?</summary>
+                        <div style="margin-top: 10px; color: var(--ink-soft); line-height: 1.55;">
+                            <div><strong>Empfohlen -> Weiter</strong>: Das sind starke falsch Positive. Das Modell war zu sicher, du wolltest den Artikel aber nicht.</div>
+                            <div><strong>Vielleicht -> Weiter</strong>: Hier war das Modell unsicher und du hast den Artikel verworfen. Das ist weniger schlimm.</div>
+                            <div><strong>Eher nein -> Summary</strong>: Das sind harte falsch Negative. Das Modell wollte den Artikel nicht zeigen, du hast ihn aber doch gewählt.</div>
+                            <div><strong>Vielleicht -> Summary</strong>: Interessanter Grenzbereich. Diese Fälle zeigen, ob die mittlere Stufe nützlich ist.</div>
+                        </div>
+                    </details>
+                </div>
+            `;
+        }
+
         function renderModelCard(title, targetKey, descriptor) {
             const latestRun = descriptor.latest_run;
             const previousRun = descriptor.previous_run;
@@ -1935,10 +2076,12 @@ Die Markdown-Datei ist attached.`;
             const precisionAt20 = precisionAtKDescriptor(notesJson, 20);
             const precisionAt50 = precisionAtKDescriptor(notesJson, 50);
             const thresholdStrategy = notesJson?.threshold_strategy;
+            const maybeThresholdValue = latestRun?.maybe_threshold_value ?? notesJson?.maybe_threshold_value ?? thresholdStrategy?.maybe_threshold;
             const promotionDecision = notesJson?.promotion_decision;
             const latestRejected = latestRun?.status === 'rejected';
-            const trainingThisTarget = state.trainingBusy && (
-                state.trainingState?.target === targetKey || state.trainingState?.target === 'all'
+            const trainingStatus = effectiveTrainingStatus();
+            const trainingThisTarget = trainingStatus?.active && (
+                trainingStatus?.target === targetKey || trainingStatus?.target === 'all'
             );
             const buttonLabel = trainingThisTarget
                 ? 'Training läuft ...'
@@ -1974,6 +2117,7 @@ Die Markdown-Datei ist attached.`;
                         ${targetKey === 'feed_recommendation' ? `
                             <div class="data-points" style="margin-top: 14px;">
                                 <span class="data-pill">Threshold ${escapeHtml(formatThreshold(latestRun.threshold_value))}</span>
+                                ${maybeThresholdValue ? `<span class="data-pill">Vielleicht ab ${escapeHtml(formatThreshold(maybeThresholdValue))}</span>` : ''}
                                 ${precisionAt10 ? `<span class="data-pill">P@10 ${escapeHtml(precisionAt10.value)}${precisionAt10.evaluatedCount < 10 ? ` (${precisionAt10.evaluatedCount})` : ''}</span>` : ''}
                                 ${precisionAt20 ? `<span class="data-pill">P@20 ${escapeHtml(precisionAt20.value)}${precisionAt20.evaluatedCount < 20 ? ` (${precisionAt20.evaluatedCount})` : ''}</span>` : ''}
                                 ${precisionAt50 ? `<span class="data-pill">P@50 ${escapeHtml(precisionAt50.value)}${precisionAt50.evaluatedCount < 50 ? ` (${precisionAt50.evaluatedCount})` : ''}</span>` : ''}
@@ -1982,10 +2126,11 @@ Die Markdown-Datei ist attached.`;
                                 <strong>${escapeHtml(thresholdStrategy?.strategy === 'auto_tuned' ? 'Threshold automatisch optimiert' : 'Threshold aktuell fix')}</strong>
                                 <p>
                                     ${escapeHtml(thresholdStrategy?.strategy === 'auto_tuned'
-                                        ? `Beim letzten Retrain wurde die Schwelle fuer weniger uebersehene Treffer optimiert (${thresholdStrategy?.objective || 'maximize_f2'}).`
+                                        ? `Beim letzten Retrain wurde die Schwelle auf hohe Trefferqualitaet optimiert. Klare Empfehlungen sind strenger, darunter gibt es zusaetzlich die Stufe „vielleicht“ (${thresholdStrategy?.objective || 'precision_first_two_stage'}).`
                                         : 'Aktuell gilt die Standardschwelle 0.5.' )}
                                 </p>
                             </div>
+                            ${renderPredictionOutcomeBlock(descriptor.prediction_outcomes)}
                         ` : ''}
                         <table class="matrix">
                             <thead>
@@ -2128,14 +2273,30 @@ Die Markdown-Datei ist attached.`;
             const compareStats = compare.session_stats || {};
             const compareProgress = compare.progress;
             const compareStatus = compareStatusDescriptor(compare);
-
-            const trainingBanner = state.trainingBusy
+            const trainingStatus = effectiveTrainingStatus();
+            const trainingBanner = trainingStatus?.active
                 ? `
                     <div class="ops-assessment" style="margin: 0 22px 18px;">
                         <strong>Training läuft</strong>
-                        <p>${escapeHtml(trainingTargetLabel(state.trainingState?.target))} wird gerade trainiert, ${escapeHtml(trainingElapsedText())}. Die Metriken werden aktualisiert, sobald der Lauf fertig ist.</p>
+                        <p>${escapeHtml(trainingTargetLabel(trainingStatus?.target))} wird gerade trainiert, ${escapeHtml((() => {
+                            const prevState = state.trainingState;
+                            state.trainingState = { startedAt: trainingStatus.startedAt };
+                            const text = trainingElapsedText();
+                            state.trainingState = prevState;
+                            return text;
+                        })())}. Die Metriken werden aktualisiert, sobald der Lauf fertig ist.</p>
                     </div>
                 `
+                : state.trainingLastResult
+                    ? `
+                        <div class="ops-assessment" style="margin: 0 22px 18px;">
+                            <strong>${escapeHtml(state.trainingLastResult.headline)}</strong>
+                            <p>${escapeHtml(state.trainingLastResult.detail)} · ${escapeHtml(formatRelativeTime(state.trainingLastResult.finishedAt))}</p>
+                            <div class="data-points" style="margin-top: 10px;">
+                                <span class="data-pill ${escapeHtml(state.trainingLastResult.tone || '')}">Zuletzt beendet</span>
+                            </div>
+                        </div>
+                    `
                 : '';
 
             host.innerHTML = `
@@ -2147,7 +2308,7 @@ Die Markdown-Datei ist attached.`;
                         </div>
                         <div class="toolbar">
                             <button class="inline-button" id="refreshOpsButton">Neu laden</button>
-                            <button class="inline-button" id="trainAllButton" ${state.trainingBusy ? 'disabled' : ''}>${state.trainingBusy && state.trainingState?.target === 'all' ? 'Training läuft ...' : 'Beide trainieren'}</button>
+                            <button class="inline-button" id="trainAllButton" ${trainingStatus?.active ? 'disabled' : ''}>${trainingStatus?.active && trainingStatus?.target === 'all' ? 'Training läuft ...' : 'Beide trainieren'}</button>
                         </div>
                     </div>
                     <div style="padding: 22px 22px 0;">
@@ -2272,6 +2433,7 @@ Die Markdown-Datei ist attached.`;
                     target,
                     startedAt: Date.now(),
                 };
+                state.trainingLastResult = null;
                 startTrainingTicker();
                 renderOpsScreen();
                 showToast(`Training gestartet: ${trainingTargetLabel(target)}.`, 'info');
@@ -2288,6 +2450,10 @@ Die Markdown-Datei ist attached.`;
                         return `${result.target}: ${result.status}`;
                     })
                     .join(' · ');
+                state.trainingLastResult = {
+                    ...summarizeTrainingResults(payload.results || []),
+                    finishedAt: new Date().toISOString(),
+                };
                 showToast(resultText || 'Training abgeschlossen', 'info');
                 await loadStatus();
                 await loadModelOps();
@@ -2295,6 +2461,12 @@ Die Markdown-Datei ist attached.`;
                     await loadFeed(true);
                 }
             } catch (error) {
+                state.trainingLastResult = {
+                    tone: 'compare-off',
+                    headline: 'Training fehlgeschlagen',
+                    detail: error.message || 'Unbekannter Fehler',
+                    finishedAt: new Date().toISOString(),
+                };
                 showToast(error.message, 'error');
             } finally {
                 state.trainingBusy = false;
@@ -2306,24 +2478,54 @@ Die Markdown-Datei ist attached.`;
             }
         }
 
+        function isEditableKeyboardTarget(target) {
+            if (!target) return false;
+            const tagName = String(target.tagName || '').toLowerCase();
+            return tagName === 'input'
+                || tagName === 'textarea'
+                || tagName === 'select'
+                || Boolean(target.isContentEditable);
+        }
+
+        function isPlainShortcut(event, key, code = null) {
+            if (event.metaKey || event.ctrlKey || event.altKey) return false;
+            const normalizedKey = String(event.key || '').toLowerCase();
+            return normalizedKey === key || (code && event.code === code);
+        }
+
+        function consumeKeyboardEvent(event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+
         function handleKeyboard(event) {
+            if (event.repeat || isEditableKeyboardTarget(event.target)) {
+                return;
+            }
             if (state.screen === 'feed') {
                 if (event.key === 'ArrowLeft') {
+                    consumeKeyboardEvent(event);
                     handleFeedBack();
                 } else if (event.key === 'ArrowRight') {
+                    consumeKeyboardEvent(event);
                     handleFeedSkip();
-                } else if (event.key.toLowerCase() === 's') {
+                } else if (isPlainShortcut(event, 's', 'KeyS')) {
+                    consumeKeyboardEvent(event);
                     handleFeedSummarize();
-                } else if (event.key.toLowerCase() === 'r') {
+                } else if (isPlainShortcut(event, 'r', 'KeyR')) {
+                    consumeKeyboardEvent(event);
                     loadFeed(true);
                 }
             } else if (state.screen === 'summaries') {
                 if (event.key === 'ArrowLeft' && state.summaryIndex > 0) {
+                    consumeKeyboardEvent(event);
                     state.summaryIndex -= 1;
                     renderSummaryScreen();
-                } else if (event.key.toLowerCase() === 'i') {
+                } else if (isPlainShortcut(event, 'i', 'KeyI')) {
+                    consumeKeyboardEvent(event);
                     handleSummaryFeedback('interesting');
-                } else if (event.key.toLowerCase() === 'n') {
+                } else if (isPlainShortcut(event, 'n', 'KeyN')) {
+                    consumeKeyboardEvent(event);
                     handleSummaryFeedback('not_interesting');
                 }
             }
@@ -2335,7 +2537,7 @@ Die Markdown-Datei ist attached.`;
                 button.addEventListener('click', () => switchScreen(button.dataset.screen));
             });
             document.getElementById('pageReloadButton')?.addEventListener('click', () => window.location.reload());
-            document.addEventListener('keydown', handleKeyboard);
+            document.addEventListener('keydown', handleKeyboard, true);
         }
 
         async function bootstrap() {
