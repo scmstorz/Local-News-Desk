@@ -288,6 +288,15 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertIn("isPlainShortcut(event, 's', 'KeyS')", html)
         self.assertIn("showToast('Summary vorgemerkt.", html)
 
+    def test_frontend_empty_ranked_feed_switches_to_all_without_reload(self):
+        html = Path("local-news-app.html").read_text(encoding="utf-8")
+
+        self.assertIn("function switchEmptyFeedModeToAll()", html)
+        self.assertIn("function syncFeedCountsFromLocalItems()", html)
+        self.assertIn("Keine Treffer mehr in diesem Modus. Zeige alle offenen Feed-Einträge.", html)
+        self.assertIn("switchEmptyFeedModeToAll();", html)
+        self.assertNotIn("else if (!state.feedItems.length)", html)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1239,7 +1239,8 @@ Die Markdown-Datei ist attached.`;
 
         function currentVisibleFeedCounts() {
             const localItems = state.allFeedItems || [];
-            const localTotals = localItems.length
+            const hasLocalFeedSnapshot = Boolean(state.feedCounts);
+            const localTotals = hasLocalFeedSnapshot
                 ? {
                     total_pending: localItems.length,
                     recommended_pending: localItems.filter(item => item.prediction?.recommended).length,
@@ -1283,6 +1284,30 @@ Die Markdown-Datei ist attached.`;
             }
 
             state.feedIndex = Math.min(state.feedIndex, Math.max(filteredItems.length - 1, 0));
+        }
+
+        function syncFeedCountsFromLocalItems() {
+            if (!state.feedCounts) return;
+            const localItems = state.allFeedItems || [];
+            state.feedCounts = {
+                ...state.feedCounts,
+                total_pending: localItems.length,
+                recommended_pending: localItems.filter(item => item.prediction?.recommended).length,
+                maybe_pending: localItems.filter(item => item.prediction?.tier === 'maybe').length,
+            };
+        }
+
+        function switchEmptyFeedModeToAll() {
+            if (state.feedMode === 'all' || state.feedItems.length || !(state.allFeedItems || []).length) {
+                return false;
+            }
+            state.feedMode = 'all';
+            applyFeedMode(true);
+            if (state.feedItems.length) {
+                showToast('Keine Treffer mehr in diesem Modus. Zeige alle offenen Feed-Einträge.', 'info');
+                return true;
+            }
+            return false;
         }
 
         function currentFeedItem() {
@@ -1343,6 +1368,7 @@ Die Markdown-Datei ist attached.`;
             if (!idSet.size) return;
             state.allFeedItems = (state.allFeedItems || []).filter(item => !idSet.has(Number(item.id)));
             applyFeedMode(false);
+            syncFeedCountsFromLocalItems();
             renderHeaderStatus();
         }
 
@@ -1703,6 +1729,7 @@ Die Markdown-Datei ist attached.`;
             state.lastFeedActionStatus = `Uebersprungen: ${item.title}`;
             if (!wasViewingHistory) {
                 removeOnlyCurrentFeedItem(item);
+                switchEmptyFeedModeToAll();
             } else {
                 exitFeedHistoryMode();
             }
@@ -1713,10 +1740,9 @@ Die Markdown-Datei ist attached.`;
                 if (result.deduplicated_count) {
                     showToast(`${result.deduplicated_count} ähnliche Meldung${result.deduplicated_count > 1 ? 'en' : ''} ebenfalls aus dem Feed entfernt.`, 'info');
                 }
-                if (state.screen === 'feed' && state.feedItems.length) {
+                switchEmptyFeedModeToAll();
+                if (state.screen === 'feed') {
                     renderFeedScreen();
-                } else if (!state.feedItems.length) {
-                    await loadFeed(true);
                 }
                 await loadStatus();
             });
@@ -1734,6 +1760,7 @@ Die Markdown-Datei ist attached.`;
             showToast('Summary vorgemerkt.', 'info');
             if (!wasViewingHistory) {
                 removeOnlyCurrentFeedItem(item);
+                switchEmptyFeedModeToAll();
             } else {
                 exitFeedHistoryMode();
             }
@@ -1745,10 +1772,9 @@ Die Markdown-Datei ist attached.`;
                     ? ` ${result.deduplicated_count} ähnliche Meldung${result.deduplicated_count > 1 ? 'en wurden' : ' wurde'} ebenfalls aus dem Feed entfernt.`
                     : '';
                 showToast(`Summary läuft im Hintergrund.${duplicateText}`, 'info');
-                if (state.screen === 'feed' && state.feedItems.length) {
+                switchEmptyFeedModeToAll();
+                if (state.screen === 'feed') {
                     renderFeedScreen();
-                } else if (!state.feedItems.length) {
-                    await loadFeed(true);
                 }
                 await loadStatus();
             });
