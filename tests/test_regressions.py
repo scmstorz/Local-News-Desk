@@ -100,6 +100,9 @@ class LocalNewsRegressionTests(unittest.TestCase):
                 ).fetchall()
             ]
 
+    def event_payloads(self, article_id):
+        return [json.loads(event["event_payload"]) for event in self.event_rows(article_id)]
+
     def store_embedding(self, article_id, input_hash=None, model=None):
         now = backend.utc_now_iso()
         article = self.article_row(article_id)
@@ -140,6 +143,10 @@ class LocalNewsRegressionTests(unittest.TestCase):
 
         events = self.event_rows(article_id)
         self.assertEqual([event["event_type"] for event in events], ["summary_requested"])
+        payload = json.loads(events[0]["event_payload"])
+        self.assertEqual(payload["previous_feed_decision"], "pending")
+        self.assertEqual(payload["new_feed_decision"], "summarize")
+        self.assertIn("prediction_snapshot", payload)
 
     def test_summarize_endpoint_requeues_failed_article_and_clears_error(self):
         article_id = self.insert_article(summary_status="failed")
@@ -198,6 +205,10 @@ class LocalNewsRegressionTests(unittest.TestCase):
             [event["event_type"] for event in self.event_rows(article_id)],
             ["summary_processing_started", "summary_generated"],
         )
+        payloads = self.event_payloads(article_id)
+        self.assertEqual(payloads[0], {})
+        self.assertEqual(payloads[1]["model"], backend.OLLAMA_MODEL)
+        self.assertEqual(payloads[1]["final_url"], "https://example.com/final")
 
     def test_summary_job_failure_marks_failed_and_logs_error(self):
         article_id = self.insert_article(feed_decision="summarize", summary_status="processing")
@@ -213,6 +224,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(article["summary_status"], "failed")
         self.assertEqual(article["last_error"], "extraction failed")
         self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_failed"])
+        self.assertEqual(self.event_payloads(article_id), [{"error": "extraction failed"}])
 
     def test_stale_processing_summary_job_is_recovered_to_failed(self):
         old_timestamp = (
@@ -230,6 +242,10 @@ class LocalNewsRegressionTests(unittest.TestCase):
             [event["event_type"] for event in self.event_rows(article_id)],
             ["summary_processing_recovered"],
         )
+        self.assertEqual(
+            self.event_payloads(article_id),
+            [{"recovery": "stale_to_failed", "timeout_minutes": backend.SUMMARY_PROCESSING_STALE_MINUTES}],
+        )
 
     def test_skip_endpoint_marks_article_and_logs_event(self):
         article_id = self.insert_article()
@@ -242,6 +258,25 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(article["summary_status"], "not_requested")
         events = self.event_rows(article_id)
         self.assertEqual([event["event_type"] for event in events], ["article_skipped"])
+        payload = json.loads(events[0]["event_payload"])
+        self.assertEqual(payload["previous_feed_decision"], "pending")
+        self.assertEqual(payload["new_feed_decision"], "skip")
+        self.assertIn("prediction_snapshot", payload)
+
+    def test_summary_feedback_endpoint_updates_article_and_logs_payload(self):
+        article_id = self.insert_article(summary_status="ready")
+
+        response = self.client.post(
+            f"/api/summaries/{article_id}/feedback",
+            json={"feedback": "interesting"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        article = self.article_row(article_id)
+        self.assertEqual(article["summary_feedback"], "interesting")
+        self.assertIsNotNone(article["summary_feedback_at"])
+        self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_feedback"])
+        self.assertEqual(self.event_payloads(article_id), [{"feedback": "interesting"}])
 
     def test_feed_recommended_and_maybe_modes_are_disjoint(self):
         run_id = 42
