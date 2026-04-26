@@ -100,6 +100,28 @@ class LocalNewsRegressionTests(unittest.TestCase):
                 ).fetchall()
             ]
 
+    def store_embedding(self, article_id, input_hash=None, model=None):
+        now = backend.utc_now_iso()
+        article = self.article_row(article_id)
+        input_hash = input_hash if input_hash is not None else backend.build_embedding_input_hash(article)
+        model = model if model is not None else backend.get_embedding_model()
+        with backend.db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO article_embeddings(
+                    article_id, embedding_model, embedding_input_hash, embedding_json, generated_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(article_id) DO UPDATE SET
+                    embedding_model = excluded.embedding_model,
+                    embedding_input_hash = excluded.embedding_input_hash,
+                    embedding_json = excluded.embedding_json,
+                    generated_at = excluded.generated_at,
+                    updated_at = excluded.updated_at
+                """,
+                (article_id, model, input_hash, json.dumps([0.1, 0.2]), now, now),
+            )
+
     def test_summarize_endpoint_queues_article_and_wakes_worker(self):
         article_id = self.insert_article()
 
@@ -358,6 +380,90 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(backend.extract_ollama_embedding_vector({"embeddings": [0.1, 0.2]}), [0.1, 0.2])
         self.assertEqual(backend.extract_ollama_embedding_vector({"data": [{"embedding": [0.1, 0.2]}]}), [0.1, 0.2])
         self.assertIsNone(backend.extract_ollama_embedding_vector({"embeddings": []}))
+
+    def test_embedding_selection_skips_empty_input_titles(self):
+        empty_id = self.insert_article(guid="empty-input", title="\u200b")
+        valid_id = self.insert_article(guid="valid-input", title="Valid article title for embedding")
+
+        selected = backend.select_article_for_embedding()
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["id"], valid_id)
+        self.assertNotEqual(selected["id"], empty_id)
+
+    def test_embedding_selection_skips_current_matching_embedding(self):
+        article_id = self.insert_article(guid="already-embedded", title="Already embedded article title")
+        self.store_embedding(article_id)
+
+        selected = backend.select_article_for_embedding()
+
+        self.assertIsNone(selected)
+
+    def test_embedding_selection_reselects_article_when_hash_changed(self):
+        article_id = self.insert_article(guid="stale-hash", title="Article with changed embedding input")
+        self.store_embedding(article_id, input_hash="old-hash")
+
+        selected = backend.select_article_for_embedding()
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["id"], article_id)
+        self.assertEqual(selected["expected_embedding_hash"], backend.build_embedding_input_hash(selected))
+
+    def test_embedding_selection_reselects_article_when_model_changed(self):
+        article_id = self.insert_article(guid="stale-model", title="Article embedded with old model")
+        self.store_embedding(article_id, model="previous-embedding-model")
+
+        selected = backend.select_article_for_embedding()
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["id"], article_id)
+        self.assertEqual(selected["embedding_model"], None)
+
+    def test_embedding_selection_prioritizes_pending_then_summarize_then_skip(self):
+        now = backend.utc_now()
+        skip_id = self.insert_article(
+            guid="skip-priority",
+            title="Newest skipped article",
+            feed_decision="skip",
+            published_at=now.isoformat(),
+        )
+        summarize_id = self.insert_article(
+            guid="summarize-priority",
+            title="Middle summarized article",
+            feed_decision="summarize",
+            published_at=(now - backend.timedelta(minutes=1)).isoformat(),
+        )
+        pending_id = self.insert_article(
+            guid="pending-priority",
+            title="Oldest pending article",
+            feed_decision="pending",
+            published_at=(now - backend.timedelta(minutes=2)).isoformat(),
+        )
+
+        selected = backend.select_article_for_embedding()
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["id"], pending_id)
+
+        self.store_embedding(pending_id)
+        selected = backend.select_article_for_embedding()
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["id"], summarize_id)
+
+        self.store_embedding(summarize_id)
+        selected = backend.select_article_for_embedding()
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["id"], skip_id)
+
+    def test_embedding_selection_ignores_articles_outside_recent_window(self):
+        old_timestamp = (backend.utc_now() - backend.timedelta(hours=73)).isoformat()
+        self.insert_article(guid="old-article", title="Old article outside embedding window", published_at=old_timestamp)
+
+        selected = backend.select_article_for_embedding()
+
+        self.assertIsNone(selected)
 
     def test_summary_work_pending_tracks_queued_and_processing_jobs(self):
         self.assertFalse(backend.summary_work_pending())
