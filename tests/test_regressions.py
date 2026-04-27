@@ -198,6 +198,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(article["summary_status"], "ready")
         self.assertEqual(article["summary_title"], "Generated title")
         self.assertEqual(article["summary_text"], "Generated summary")
+        self.assertEqual(article["summary_is_fallback"], 0)
         self.assertEqual(article["link_to_article"], "https://example.com/final")
         self.assertEqual(article["last_error"], "")
         self.assertIsNotNone(article["summarized_at"])
@@ -240,6 +241,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(article["summary_status"], "ready")
         self.assertEqual(article["summary_title"], "Fallback title")
         self.assertEqual(article["summary_text"], "Fallback summary")
+        self.assertEqual(article["summary_is_fallback"], 1)
         self.assertIn("Volltext konnte nicht zuverlässig extrahiert werden", article["article_text"])
         self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_generated"])
         self.assertTrue(self.event_payloads(article_id)[0]["extraction_fallback"])
@@ -330,6 +332,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(article["link_to_article"], "https://example.com/final")
         self.assertEqual(article["summary_title"], "Ready title")
         self.assertEqual(article["summary_text"], "Ready summary")
+        self.assertEqual(article["summary_is_fallback"], 0)
         self.assertEqual(article["summary_model"], backend.OLLAMA_MODEL)
         self.assertEqual(article["last_error"], "")
         self.assertIsNotNone(article["summarized_at"])
@@ -359,6 +362,33 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(article["last_error"], "extraction failed")
         self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_failed"])
         self.assertEqual(self.event_payloads(article_id), [{"error": "extraction failed"}])
+
+    def test_backfill_summary_fallback_flags_uses_generated_event_payload(self):
+        article_id = self.insert_article(summary_status="ready")
+
+        with backend.db_connection() as conn:
+            backend.log_event(conn, article_id, "summary_generated", {"extraction_fallback": True})
+            backend.backfill_summary_fallback_flags(conn)
+
+        self.assertEqual(self.article_row(article_id)["summary_is_fallback"], 1)
+
+    def test_serialize_summary_exposes_fallback_flag(self):
+        article_id = self.insert_article(summary_status="ready")
+        with backend.db_connection() as conn:
+            conn.execute(
+                """
+                UPDATE articles
+                SET summary_title = 'Metadata title',
+                    summary_text = 'Metadata summary',
+                    summary_is_fallback = 1
+                WHERE id = ?
+                """,
+                (article_id,),
+            )
+
+        payload = backend.serialize_summary(self.article_row(article_id))
+
+        self.assertTrue(payload["summary_is_fallback"])
 
     def test_stale_processing_summary_job_is_recovered_to_failed(self):
         old_timestamp = (
@@ -672,6 +702,13 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertIn("Keine Treffer mehr in diesem Modus. Zeige alle offenen Feed-Einträge.", html)
         self.assertIn("switchEmptyFeedModeToAll();", html)
         self.assertNotIn("else if (!state.feedItems.length)", html)
+
+    def test_frontend_marks_metadata_fallback_summaries(self):
+        html = Path("local-news-app.html").read_text(encoding="utf-8")
+
+        self.assertIn("summary_is_fallback", html)
+        self.assertIn("Keine echte Volltext-Summary", html)
+        self.assertIn("Diese Zusammenfassung basiert nur auf Titel, Quelle, URL", html)
 
 
 if __name__ == "__main__":

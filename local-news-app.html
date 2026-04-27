@@ -647,6 +647,11 @@
             line-height: 1.55;
         }
 
+        .summary-fallback-warning {
+            background: rgba(249, 115, 22, 0.12);
+            border-color: rgba(249, 115, 22, 0.24);
+        }
+
         .toast-stack {
             position: fixed;
             top: 24px;
@@ -1032,8 +1037,12 @@
                 `Quelle: ${item.source_label || 'Unbekannt'}`,
                 `URL: ${item.link_to_article || item.source_url || ''}`,
                 '',
-                item.summary_text || '',
             ];
+            if (item.summary_is_fallback) {
+                lines.push('Hinweis: Keine echte Volltext-Summary. Der Artikel-Volltext konnte nicht zuverlässig extrahiert werden; diese Zusammenfassung basiert nur auf Metadaten oder kurzen Auszügen.');
+                lines.push('');
+            }
+            lines.push(item.summary_text || '');
             return lines.join('\n').trim();
         }
 
@@ -1787,6 +1796,7 @@ Die Markdown-Datei ist attached.`;
             const compare = state.status?.llm_compare || { enabled: false };
             const compareText = compareProgressText(compare);
             const isUnavailable = item?.summary_status === 'failed';
+            const isFallbackSummary = Boolean(item?.summary_is_fallback);
             const reviewTotal = counts.review_total ?? ((counts.ready ?? 0) + (counts.failed ?? 0));
 
             if (!item) {
@@ -1835,8 +1845,15 @@ Die Markdown-Datei ist attached.`;
                             <a class="meta-chip" href="${escapeHtml(item.source_url)}" target="_blank" rel="noopener noreferrer">Quelle · ${escapeHtml(item.source_label)}</a>
                             <span class="meta-chip">Zeit · ${escapeHtml(formatRelativeTime(item.published_at))}</span>
                             <span class="meta-chip">Status · ${isUnavailable ? 'Not available' : escapeHtml(item.summary_model || 'lokal')}</span>
+                            ${isFallbackSummary && !isUnavailable ? '<span class="meta-chip">Keine Volltext-Summary</span>' : ''}
                         </div>
                         <h3>${escapeHtml(item.summary_title || item.title)}</h3>
+                        ${isFallbackSummary && !isUnavailable ? `
+                            <div class="ops-assessment summary-fallback-warning">
+                                <strong>Keine echte Volltext-Summary</strong>
+                                <p>Der Artikel-Volltext konnte nicht zuverlässig extrahiert werden. Diese Zusammenfassung basiert nur auf Titel, Quelle, URL und vorhandenen Metadaten oder kurzen Auszügen.</p>
+                            </div>
+                        ` : ''}
                         <div class="summary-text">${isUnavailable ? 'Für diesen Artikel konnte lokal keine Summary erzeugt werden. Du kannst den Originalartikel trotzdem öffnen und den Eintrag danach aus der Liste nehmen.' : escapeHtml(item.summary_text)}</div>
                         <div class="action-row">
                             <div class="action-group">

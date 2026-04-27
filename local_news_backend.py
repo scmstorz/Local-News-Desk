@@ -198,6 +198,7 @@ CREATE TABLE IF NOT EXISTS articles (
     summary_status TEXT NOT NULL DEFAULT 'not_requested',
     summary_title TEXT NOT NULL DEFAULT '',
     summary_text TEXT NOT NULL DEFAULT '',
+    summary_is_fallback INTEGER NOT NULL DEFAULT 0,
     summary_model TEXT NOT NULL DEFAULT '',
     summary_requested_at TEXT,
     summarized_at TEXT,
@@ -401,12 +402,34 @@ def column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -
 
 
 def migrate_db(conn: sqlite3.Connection) -> None:
+    if not column_exists(conn, "articles", "summary_is_fallback"):
+        conn.execute("ALTER TABLE articles ADD COLUMN summary_is_fallback INTEGER NOT NULL DEFAULT 0")
     if not column_exists(conn, "llm_compare_results", "status"):
         conn.execute("ALTER TABLE llm_compare_results ADD COLUMN status TEXT NOT NULL DEFAULT 'ok'")
     if not column_exists(conn, "llm_compare_results", "duration_ms"):
         conn.execute("ALTER TABLE llm_compare_results ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0")
     if not column_exists(conn, "llm_compare_results", "error_text"):
         conn.execute("ALTER TABLE llm_compare_results ADD COLUMN error_text TEXT NOT NULL DEFAULT ''")
+    backfill_summary_fallback_flags(conn)
+
+
+def backfill_summary_fallback_flags(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        UPDATE articles
+        SET summary_is_fallback = 1
+        WHERE summary_is_fallback = 0
+          AND id IN (
+              SELECT article_id
+              FROM article_events
+              WHERE event_type = 'summary_generated'
+                AND (
+                    event_payload LIKE '%"extraction_fallback": true%'
+                    OR event_payload LIKE '%"extraction_fallback":true%'
+                )
+          )
+        """
+    )
 
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -2631,7 +2654,8 @@ def set_feed_decision(article_id: int, decision: str) -> dict[str, Any]:
                 summary_status = ?,
                 summary_requested_at = ?,
                 updated_at = ?,
-                last_error = CASE WHEN ? = 'summarize' THEN '' ELSE last_error END
+                last_error = CASE WHEN ? = 'summarize' THEN '' ELSE last_error END,
+                summary_is_fallback = CASE WHEN ? = 'summarize' THEN 0 ELSE summary_is_fallback END
             WHERE id = ?
             """,
             (
@@ -2640,6 +2664,7 @@ def set_feed_decision(article_id: int, decision: str) -> dict[str, Any]:
                 summary_status,
                 summary_requested_at,
                 now,
+                decision,
                 decision,
                 article_id,
             ),
@@ -2841,6 +2866,7 @@ def mark_summary_ready(
             article_text_extracted_at = ?,
             summary_title = ?,
             summary_text = ?,
+            summary_is_fallback = ?,
             summary_model = ?,
             summary_status = 'ready',
             summarized_at = ?,
@@ -2854,6 +2880,7 @@ def mark_summary_ready(
             now,
             summary_title,
             summary_text,
+            1 if extraction_fallback else 0,
             OLLAMA_MODEL,
             now,
             now,
@@ -2896,6 +2923,7 @@ def process_summary_job(job: dict[str, Any]) -> None:
                 UPDATE articles
                 SET summary_status = 'failed',
                     updated_at = ?,
+                    summary_is_fallback = 0,
                     last_error = ?
                 WHERE id = ?
                 """,
@@ -3690,6 +3718,7 @@ def serialize_summary(item: dict[str, Any]) -> dict[str, Any]:
         "title": item["title"],
         "summary_title": item["summary_title"],
         "summary_text": item["summary_text"],
+        "summary_is_fallback": bool(item.get("summary_is_fallback")),
         "summary_status": item["summary_status"],
         "source_label": item["source_label"],
         "source_url": item["source_url"],
