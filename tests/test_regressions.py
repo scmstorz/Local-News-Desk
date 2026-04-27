@@ -664,6 +664,31 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(post.call_args_list[1].kwargs["json"]["prompt"], "Article title")
         second_response.raise_for_status.assert_called_once_with()
 
+    def test_select_embedding_candidate_skips_empty_and_current_items(self):
+        current_item = {"id": 2, "title": "Already embedded article", "embedding_model": "model-a"}
+        current_item["embedding_input_hash"] = backend.build_embedding_input_hash(current_item)
+        stale_item = {"id": 3, "title": "Needs embedding", "embedding_model": "model-a", "embedding_input_hash": "old-hash"}
+
+        selected = backend.select_embedding_candidate(
+            [
+                {"id": 1, "title": "\u200b", "embedding_model": None, "embedding_input_hash": None},
+                current_item,
+                stale_item,
+            ],
+            "model-a",
+        )
+
+        self.assertEqual(selected["id"], 3)
+        self.assertEqual(selected["expected_embedding_hash"], backend.build_embedding_input_hash(stale_item))
+
+    def test_select_embedding_candidate_reselects_when_model_is_missing(self):
+        item = {"id": 1, "title": "Valid article title", "embedding_model": None, "embedding_input_hash": None}
+
+        selected = backend.select_embedding_candidate([item], "model-a")
+
+        self.assertEqual(selected["id"], 1)
+        self.assertEqual(selected["expected_embedding_hash"], backend.build_embedding_input_hash(item))
+
     def test_embedding_selection_skips_empty_input_titles(self):
         empty_id = self.insert_article(guid="empty-input", title="\u200b")
         valid_id = self.insert_article(guid="valid-input", title="Valid article title for embedding")

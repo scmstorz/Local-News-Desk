@@ -1734,8 +1734,21 @@ def ollama_embed_text(text: str) -> list[float]:
     raise RuntimeError(f"Ollama embedding response did not contain a usable vector; keys={response_keys}")
 
 
+def select_embedding_candidate(rows: list[sqlite3.Row | dict[str, Any]], model_name: str) -> Optional[dict[str, Any]]:
+    for row in rows:
+        item = row_to_dict(row) if isinstance(row, sqlite3.Row) else dict(row)
+        if not build_embedding_input_text(item):
+            continue
+        expected_hash = build_embedding_input_hash(item)
+        if item.get("embedding_model") != model_name or item.get("embedding_input_hash") != expected_hash:
+            item["expected_embedding_hash"] = expected_hash
+            return item
+    return None
+
+
 def select_article_for_embedding() -> Optional[dict[str, Any]]:
     cutoff = (utc_now() - timedelta(hours=72)).isoformat()
+    embedding_model = get_embedding_model()
     with db_connection() as conn:
         rows = conn.execute(
             """
@@ -1764,18 +1777,10 @@ def select_article_for_embedding() -> Optional[dict[str, Any]]:
               a.id DESC
             LIMIT 250
             """,
-            (get_embedding_model(), cutoff),
+            (embedding_model, cutoff),
         ).fetchall()
 
-    for row in rows:
-        item = row_to_dict(row)
-        if not build_embedding_input_text(item):
-            continue
-        expected_hash = build_embedding_input_hash(item)
-        if item.get("embedding_model") != get_embedding_model() or item.get("embedding_input_hash") != expected_hash:
-            item["expected_embedding_hash"] = expected_hash
-            return item
-    return None
+    return select_embedding_candidate(rows, embedding_model)
 
 
 def store_article_embedding(article: dict[str, Any], vector: list[float]) -> None:
