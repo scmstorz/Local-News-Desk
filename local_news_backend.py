@@ -1375,6 +1375,22 @@ def wake_summary_worker() -> None:
     STATE.summary_event.set()
 
 
+def encode_event_payload(payload: Optional[dict[str, Any]] = None) -> str:
+    return json.dumps(payload or {}, ensure_ascii=True, sort_keys=True)
+
+
+def decode_event_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if not value:
+        return {}
+    try:
+        payload = json.loads(str(value))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def log_event(
     conn: sqlite3.Connection,
     article_id: int,
@@ -1389,7 +1405,7 @@ def log_event(
         (
             article_id,
             event_type,
-            json.dumps(payload or {}, ensure_ascii=True),
+            encode_event_payload(payload),
             utc_now_iso(),
         ),
     )
@@ -3273,10 +3289,7 @@ def feed_prediction_outcome_stats(limit: int = 1500) -> dict[str, Any]:
 
     considered = 0
     for row in rows:
-        try:
-            payload = json.loads(row["event_payload"] or "{}")
-        except json.JSONDecodeError:
-            payload = {}
+        payload = decode_event_payload(row["event_payload"])
         snapshot = payload.get("prediction_snapshot") or {}
         tier = snapshot.get("predicted_tier")
         if tier not in buckets:

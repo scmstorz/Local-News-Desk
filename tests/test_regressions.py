@@ -101,7 +101,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
             ]
 
     def event_payloads(self, article_id):
-        return [json.loads(event["event_payload"]) for event in self.event_rows(article_id)]
+        return [backend.decode_event_payload(event["event_payload"]) for event in self.event_rows(article_id)]
 
     def store_embedding(self, article_id, input_hash=None, model=None):
         now = backend.utc_now_iso()
@@ -125,6 +125,15 @@ class LocalNewsRegressionTests(unittest.TestCase):
                 (article_id, model, input_hash, json.dumps([0.1, 0.2]), now, now),
             )
 
+    def test_event_payload_codec_handles_empty_invalid_and_non_object_values(self):
+        encoded = backend.encode_event_payload({"b": 2, "a": "ä"})
+
+        self.assertEqual(encoded, '{"a": "\\u00e4", "b": 2}')
+        self.assertEqual(backend.decode_event_payload(encoded), {"a": "ä", "b": 2})
+        self.assertEqual(backend.decode_event_payload(None), {})
+        self.assertEqual(backend.decode_event_payload("not-json"), {})
+        self.assertEqual(backend.decode_event_payload("[1, 2]"), {})
+
     def test_summarize_endpoint_queues_article_and_wakes_worker(self):
         article_id = self.insert_article()
 
@@ -143,7 +152,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
 
         events = self.event_rows(article_id)
         self.assertEqual([event["event_type"] for event in events], ["summary_requested"])
-        payload = json.loads(events[0]["event_payload"])
+        payload = backend.decode_event_payload(events[0]["event_payload"])
         self.assertEqual(payload["previous_feed_decision"], "pending")
         self.assertEqual(payload["new_feed_decision"], "summarize")
         self.assertIn("prediction_snapshot", payload)
@@ -507,7 +516,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(article["summary_status"], "not_requested")
         events = self.event_rows(article_id)
         self.assertEqual([event["event_type"] for event in events], ["article_skipped"])
-        payload = json.loads(events[0]["event_payload"])
+        payload = backend.decode_event_payload(events[0]["event_payload"])
         self.assertEqual(payload["previous_feed_decision"], "pending")
         self.assertEqual(payload["new_feed_decision"], "skip")
         self.assertIn("prediction_snapshot", payload)
