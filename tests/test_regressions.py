@@ -111,7 +111,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
                     generated_at = excluded.generated_at,
                     updated_at = excluded.updated_at
                 """,
-                (article_id, model, input_hash, json.dumps([0.1, 0.2]), now, now),
+                (article_id, model, input_hash, backend.encode_embedding_vector([0.1, 0.2]), now, now),
             )
 
     def test_event_payload_codec_handles_empty_invalid_and_non_object_values(self):
@@ -151,6 +151,17 @@ class LocalNewsRegressionTests(unittest.TestCase):
                 ("invalid_state", "not-json", backend.utc_now_iso()),
             )
             self.assertEqual(backend.fetch_app_state(conn, "invalid_state", default="fallback"), "fallback")
+
+    def test_embedding_vector_codec_accepts_only_finite_numeric_vectors(self):
+        encoded = backend.encode_embedding_vector([1, 2.5])
+
+        self.assertEqual(encoded, "[1.0, 2.5]")
+        self.assertEqual(backend.decode_embedding_vector(encoded), [1.0, 2.5])
+        self.assertEqual(backend.decode_embedding_vector("[[1, 2]]"), [1.0, 2.0])
+        self.assertIsNone(backend.decode_embedding_vector("not-json"))
+        self.assertIsNone(backend.decode_embedding_vector("[]"))
+        with self.assertRaises(ValueError):
+            backend.encode_embedding_vector([float("nan")])
 
     def test_fetch_article_by_id_returns_dict_or_none(self):
         article_id = self.insert_article(title="Fetch helper test article")
@@ -938,6 +949,52 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(backend.extract_ollama_embedding_vector({"embeddings": [0.1, 0.2]}), [0.1, 0.2])
         self.assertEqual(backend.extract_ollama_embedding_vector({"data": [{"embedding": [0.1, 0.2]}]}), [0.1, 0.2])
         self.assertIsNone(backend.extract_ollama_embedding_vector({"embeddings": []}))
+
+    def test_load_embeddings_skips_invalid_stored_vectors(self):
+        valid_id = self.insert_article(guid="valid-embedding", title="Valid embedding article")
+        invalid_id = self.insert_article(guid="invalid-embedding", title="Invalid embedding article")
+        now = backend.utc_now_iso()
+        with backend.db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO article_embeddings(
+                    article_id, embedding_model, embedding_input_hash, embedding_json, generated_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    valid_id,
+                    backend.get_embedding_model(),
+                    "valid-hash",
+                    backend.encode_embedding_vector([0.1, 0.2]),
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO article_embeddings(
+                    article_id, embedding_model, embedding_input_hash, embedding_json, generated_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (invalid_id, backend.get_embedding_model(), "invalid-hash", "not-json", now, now),
+            )
+
+        embeddings = backend.load_embeddings_for_article_ids([valid_id, invalid_id])
+
+        self.assertEqual(embeddings, {valid_id: [0.1, 0.2]})
+
+    def test_store_article_embedding_validates_vector_before_writing(self):
+        article_id = self.insert_article(guid="store-embedding", title="Store embedding article")
+        article = self.article_row(article_id)
+        article["expected_embedding_hash"] = backend.build_embedding_input_hash(article)
+
+        backend.store_article_embedding(article, [0.3, 0.4])
+
+        self.assertEqual(backend.load_embeddings_for_article_ids([article_id]), {article_id: [0.3, 0.4]})
+        with self.assertRaises(ValueError):
+            backend.store_article_embedding(article, [])
 
     def test_embedding_request_specs_normalize_input_and_cover_ollama_endpoints(self):
         specs = backend.build_ollama_embedding_request_specs("  First\n\nsecond\tline  ", model_name="embed-model")

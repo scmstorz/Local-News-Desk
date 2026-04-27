@@ -540,6 +540,21 @@ def cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def encode_embedding_vector(vector: list[float]) -> str:
+    coerced = coerce_embedding_vector(vector)
+    if not coerced:
+        raise ValueError("Embedding vector must contain finite numeric values")
+    return json.dumps(coerced)
+
+
+def decode_embedding_vector(value: Any) -> Optional[list[float]]:
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return coerce_embedding_vector(parsed)
+
+
 def load_embeddings_for_article_ids(article_ids: list[int]) -> dict[int, list[float]]:
     if not article_ids:
         return {}
@@ -556,10 +571,10 @@ def load_embeddings_for_article_ids(article_ids: list[int]) -> dict[int, list[fl
         ).fetchall()
     embeddings: dict[int, list[float]] = {}
     for row in rows:
-        try:
-            embeddings[int(row["article_id"])] = [float(value) for value in json.loads(row["embedding_json"])]
-        except (TypeError, ValueError, json.JSONDecodeError):
+        vector = decode_embedding_vector(row["embedding_json"])
+        if vector is None:
             continue
+        embeddings[int(row["article_id"])] = vector
     return embeddings
 
 
@@ -1876,7 +1891,7 @@ def store_article_embedding(article: dict[str, Any], vector: list[float]) -> Non
                 int(article["id"]),
                 get_embedding_model(),
                 article["expected_embedding_hash"],
-                json.dumps(vector),
+                encode_embedding_vector(vector),
                 now,
                 now,
             ),
