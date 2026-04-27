@@ -659,6 +659,40 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_feedback"])
         self.assertEqual(self.event_payloads(article_id), [{"feedback": "interesting"}])
 
+    def test_apply_summary_feedback_updates_article_and_logs_event(self):
+        article_id = self.insert_article(summary_status="ready")
+
+        with backend.db_connection() as conn:
+            backend.apply_summary_feedback(
+                conn,
+                article_id,
+                "not_interesting",
+                "2026-04-27T11:00:00+00:00",
+            )
+
+        article = self.article_row(article_id)
+        self.assertEqual(article["summary_feedback"], "not_interesting")
+        self.assertEqual(article["summary_feedback_at"], "2026-04-27T11:00:00+00:00")
+        self.assertEqual(article["updated_at"], "2026-04-27T11:00:00+00:00")
+        self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_feedback"])
+        self.assertEqual(self.event_payloads(article_id), [{"feedback": "not_interesting"}])
+
+    def test_summary_feedback_rejects_invalid_values(self):
+        article_id = self.insert_article(summary_status="ready")
+
+        with self.assertRaises(ValueError):
+            backend.validate_summary_feedback("invalid")
+
+        response = self.client.post(
+            f"/api/summaries/{article_id}/feedback",
+            json={"feedback": "invalid"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["message"], "Unsupported feedback")
+        self.assertEqual(self.article_row(article_id)["summary_feedback"], "unreviewed")
+        self.assertEqual(self.event_rows(article_id), [])
+
     def test_feed_recommended_and_maybe_modes_are_disjoint(self):
         run_id = 42
         with backend.STATE.model_lock:

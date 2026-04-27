@@ -2883,24 +2883,38 @@ def archive_pending_feed() -> dict[str, Any]:
 
 
 def set_summary_feedback(article_id: int, feedback: str) -> dict[str, Any]:
-    if feedback not in {"interesting", "not_interesting", "not_available"}:
-        raise ValueError("Unsupported summary feedback")
+    validate_summary_feedback(feedback)
     with db_connection() as conn:
         if not fetch_article_by_id(conn, article_id):
             raise LookupError("Article not found")
         now = utc_now_iso()
-        conn.execute(
-            """
-            UPDATE articles
-            SET summary_feedback = ?,
-                summary_feedback_at = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (feedback, now, now, article_id),
-        )
-        log_event(conn, article_id, "summary_feedback", {"feedback": feedback})
+        apply_summary_feedback(conn, article_id, feedback, now)
     return {"status": "ok", "article_id": article_id, "feedback": feedback}
+
+
+def validate_summary_feedback(feedback: str) -> None:
+    if feedback not in {"interesting", "not_interesting", "not_available"}:
+        raise ValueError("Unsupported summary feedback")
+
+
+def apply_summary_feedback(
+    conn: sqlite3.Connection,
+    article_id: int,
+    feedback: str,
+    feedback_at: str,
+) -> None:
+    validate_summary_feedback(feedback)
+    conn.execute(
+        """
+        UPDATE articles
+        SET summary_feedback = ?,
+            summary_feedback_at = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (feedback, feedback_at, feedback_at, article_id),
+    )
+    log_event(conn, article_id, "summary_feedback", {"feedback": feedback})
 
 
 def recover_stale_processing_jobs() -> int:
