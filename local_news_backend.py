@@ -4149,10 +4149,32 @@ def add_cors_headers(response):  # type: ignore[no-untyped-def]
 @APP.errorhandler(Exception)
 def handle_unexpected_exception(error):  # type: ignore[no-untyped-def]
     if isinstance(error, HTTPException):
-        return jsonify({"status": "error", "message": error.description}), error.code
+        return api_error_response(error.description, error.code or 500)
 
     LOGGER.exception("Unhandled API error: %s", error)
-    return jsonify({"status": "error", "message": str(error) or "Internal server error"}), 500
+    return api_error_response(str(error) or "Internal server error", 500)
+
+
+def api_error_response(message: str, status_code: int):
+    return jsonify({"status": "error", "message": message}), status_code
+
+
+def run_feed_action_api(article_id: int, decision: str):
+    try:
+        return jsonify(set_feed_decision(article_id, decision))
+    except LookupError:
+        return api_error_response("Article not found", 404)
+    except RuntimeError as exc:
+        return api_error_response(str(exc), 409)
+
+
+def run_summary_feedback_api(article_id: int, feedback: Any):
+    try:
+        return jsonify(set_summary_feedback(article_id, feedback))
+    except ValueError:
+        return api_error_response("Unsupported feedback", 400)
+    except LookupError:
+        return api_error_response("Article not found", 404)
 
 
 @APP.before_request
@@ -4279,22 +4301,12 @@ def api_feed():
 
 @APP.post("/api/articles/<int:article_id>/skip")
 def api_skip_article(article_id: int):
-    try:
-        return jsonify(set_feed_decision(article_id, "skip"))
-    except LookupError:
-        return jsonify({"status": "error", "message": "Article not found"}), 404
-    except RuntimeError as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 409
+    return run_feed_action_api(article_id, "skip")
 
 
 @APP.post("/api/articles/<int:article_id>/summarize")
 def api_summarize_article(article_id: int):
-    try:
-        return jsonify(set_feed_decision(article_id, "summarize"))
-    except LookupError:
-        return jsonify({"status": "error", "message": "Article not found"}), 404
-    except RuntimeError as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 409
+    return run_feed_action_api(article_id, "summarize")
 
 
 @APP.get("/api/summaries")
@@ -4311,13 +4323,7 @@ def api_summaries():
 @APP.post("/api/summaries/<int:article_id>/feedback")
 def api_summary_feedback(article_id: int):
     body = request.get_json(silent=True) or {}
-    feedback = body.get("feedback")
-    try:
-        return jsonify(set_summary_feedback(article_id, feedback))
-    except ValueError:
-        return jsonify({"status": "error", "message": "Unsupported feedback"}), 400
-    except LookupError:
-        return jsonify({"status": "error", "message": "Article not found"}), 404
+    return run_summary_feedback_api(article_id, body.get("feedback"))
 
 
 @APP.get("/api/model-ops")

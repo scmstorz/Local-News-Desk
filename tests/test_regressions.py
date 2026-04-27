@@ -760,6 +760,47 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(self.article_row(article_id)["summary_feedback"], "unreviewed")
         self.assertEqual(self.event_rows(article_id), [])
 
+    def test_api_error_response_uses_consistent_error_shape(self):
+        with backend.APP.app_context():
+            response, status_code = backend.api_error_response("Nope", 418)
+
+        self.assertEqual(status_code, 418)
+        self.assertEqual(response.get_json(), {"status": "error", "message": "Nope"})
+
+    def test_feed_action_api_maps_domain_errors_to_http_responses(self):
+        with backend.APP.app_context(), mock.patch(
+            "local_news_backend.set_feed_decision", side_effect=LookupError()
+        ):
+            response, status_code = backend.run_feed_action_api(123, "skip")
+
+        self.assertEqual(status_code, 404)
+        self.assertEqual(response.get_json()["message"], "Article not found")
+
+        with backend.APP.app_context(), mock.patch(
+            "local_news_backend.set_feed_decision", side_effect=RuntimeError("Article is already in summary flow")
+        ):
+            response, status_code = backend.run_feed_action_api(123, "skip")
+
+        self.assertEqual(status_code, 409)
+        self.assertEqual(response.get_json()["message"], "Article is already in summary flow")
+
+    def test_summary_feedback_api_maps_domain_errors_to_http_responses(self):
+        with backend.APP.app_context(), mock.patch(
+            "local_news_backend.set_summary_feedback", side_effect=ValueError()
+        ):
+            response, status_code = backend.run_summary_feedback_api(123, "invalid")
+
+        self.assertEqual(status_code, 400)
+        self.assertEqual(response.get_json()["message"], "Unsupported feedback")
+
+        with backend.APP.app_context(), mock.patch(
+            "local_news_backend.set_summary_feedback", side_effect=LookupError()
+        ):
+            response, status_code = backend.run_summary_feedback_api(123, "interesting")
+
+        self.assertEqual(status_code, 404)
+        self.assertEqual(response.get_json()["message"], "Article not found")
+
     def test_feed_recommended_and_maybe_modes_are_disjoint(self):
         run_id = 42
         with backend.STATE.model_lock:
