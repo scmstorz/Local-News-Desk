@@ -3957,6 +3957,13 @@ def serialize_summary(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_summaries_api_payload() -> dict[str, Any]:
+    return {
+        "items": [serialize_summary(item) for item in fetch_review_summaries()],
+        "counts": summary_counts(),
+    }
+
+
 def fetch_summary_counts(conn: sqlite3.Connection) -> dict[str, int]:
     row = conn.execute(
         """
@@ -4393,13 +4400,7 @@ def api_summarize_article(article_id: int):
 
 @APP.get("/api/summaries")
 def api_summaries():
-    items = fetch_review_summaries()
-    return jsonify(
-        {
-            "items": [serialize_summary(item) for item in items],
-            "counts": summary_counts(),
-        }
-    )
+    return jsonify(build_summaries_api_payload())
 
 
 @APP.post("/api/summaries/<int:article_id>/feedback")

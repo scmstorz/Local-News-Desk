@@ -645,6 +645,41 @@ class LocalNewsRegressionTests(unittest.TestCase):
 
         self.assertTrue(payload["summary_is_fallback"])
 
+    def test_summaries_api_payload_serializes_review_items_and_counts(self):
+        article = {
+            "id": 1,
+            "title": "Original title",
+            "summary_title": "Summary title",
+            "summary_text": "Summary text",
+            "summary_is_fallback": 1,
+            "summary_status": "ready",
+            "source_label": "example.com",
+            "source_url": "https://example.com",
+            "published_at": "2026-04-27T10:00:00+00:00",
+            "link_to_article": "https://example.com/article",
+            "summary_model": "local-model",
+            "summary_feedback": "unreviewed",
+        }
+        counts = {"queued": 0, "processing": 0, "ready": 1, "failed": 0, "review_total": 1}
+
+        with mock.patch("local_news_backend.fetch_review_summaries", return_value=[article]), mock.patch(
+            "local_news_backend.summary_counts", return_value=counts
+        ):
+            payload = backend.build_summaries_api_payload()
+
+        self.assertEqual(payload["counts"], counts)
+        self.assertEqual(len(payload["items"]), 1)
+        self.assertEqual(payload["items"][0]["summary_title"], "Summary title")
+        self.assertTrue(payload["items"][0]["summary_is_fallback"])
+
+    def test_summaries_endpoint_uses_payload_builder(self):
+        expected = {"items": [], "counts": {"review_total": 0}}
+        with mock.patch("local_news_backend.build_summaries_api_payload", return_value=expected):
+            response = self.client.get("/api/summaries")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), expected)
+
     def test_reviewable_summary_status_requires_unreviewed_ready_or_failed(self):
         self.assertTrue(backend.is_reviewable_summary_status("ready", "unreviewed"))
         self.assertTrue(backend.is_reviewable_summary_status("failed", "unreviewed"))
