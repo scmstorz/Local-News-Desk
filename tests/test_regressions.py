@@ -923,6 +923,51 @@ class LocalNewsRegressionTests(unittest.TestCase):
             },
         )
 
+    def test_status_config_payload_exposes_runtime_settings(self):
+        payload = backend.build_status_config_payload()
+
+        self.assertEqual(payload["ollama_model"], backend.OLLAMA_MODEL)
+        self.assertEqual(payload["ollama_base_url"], backend.OLLAMA_BASE_URL)
+        self.assertEqual(payload["feed_count"], len(backend.RSS_FEED_URLS))
+        self.assertEqual(payload["llm_compare_models"], backend.get_compare_models())
+        self.assertIn("config_path", payload)
+
+    def test_status_models_payload_reports_loaded_models_and_latest_runs(self):
+        latest_feed = {"id": 1, "target": "feed_recommendation"}
+        latest_summary = {"id": 2, "target": "summary_interest"}
+        with mock.patch("local_news_backend.get_loaded_model", side_effect=[{"pipeline": object()}, None]), mock.patch(
+            "local_news_backend.latest_model_run", side_effect=[latest_feed, latest_summary]
+        ):
+            payload = backend.build_status_models_payload()
+
+        self.assertTrue(payload["feed_recommendation"]["loaded"])
+        self.assertEqual(payload["feed_recommendation"]["latest_run"], latest_feed)
+        self.assertFalse(payload["summary_interest"]["loaded"])
+        self.assertEqual(payload["summary_interest"]["latest_run"], latest_summary)
+
+    def test_status_payload_composes_top_level_sections(self):
+        with mock.patch("local_news_backend.feed_counts", return_value={"pending": 1}), mock.patch(
+            "local_news_backend.summary_counts", return_value={"ready": 2}
+        ), mock.patch("local_news_backend.build_status_models_payload", return_value={"models": True}), mock.patch(
+            "local_news_backend.llm_compare_status", return_value={"enabled": False}
+        ), mock.patch("local_news_backend.ollama_health", return_value={"reachable": True}), mock.patch(
+            "local_news_backend.get_app_state", return_value={"status": "ok"}
+        ), mock.patch("local_news_backend.build_status_config_payload", return_value={"config": True}):
+            payload = backend.build_status_payload()
+
+        self.assertEqual(
+            payload,
+            {
+                "feed": {"pending": 1},
+                "summaries": {"ready": 2},
+                "models": {"models": True},
+                "llm_compare": {"enabled": False},
+                "ollama": {"reachable": True},
+                "last_feed_refresh": {"status": "ok"},
+                "config": {"config": True},
+            },
+        )
+
     def test_feed_recommended_and_maybe_modes_are_disjoint(self):
         run_id = 42
         with backend.STATE.model_lock:

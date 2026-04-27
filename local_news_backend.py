@@ -4297,6 +4297,48 @@ def build_model_ops_payload() -> dict[str, Any]:
     }
 
 
+def build_status_config_payload() -> dict[str, Any]:
+    return {
+        "config_path": str(CONFIG_PATH),
+        "ollama_model": OLLAMA_MODEL,
+        "ollama_embedding_model": get_embedding_model(),
+        "ollama_base_url": OLLAMA_BASE_URL,
+        "ollama_summary_timeout_seconds": get_summary_timeout_seconds(),
+        "ollama_embedding_timeout_seconds": get_embedding_timeout_seconds(),
+        "feed_refresh_seconds": FEED_REFRESH_SECONDS,
+        "embedding_poll_seconds": EMBEDDING_POLL_SECONDS,
+        "feed_count": len(RSS_FEED_URLS),
+        "llm_compare_models": get_compare_models(),
+        "llm_compare_export_dir": str(COMPARE_EXPORT_DIR),
+        "llm_compare_timeout_seconds": get_compare_timeout_seconds(),
+    }
+
+
+def build_status_models_payload() -> dict[str, Any]:
+    return {
+        "feed_recommendation": {
+            "loaded": get_loaded_model("feed_recommendation") is not None,
+            "latest_run": latest_model_run("feed_recommendation", include_rejected=False),
+        },
+        "summary_interest": {
+            "loaded": get_loaded_model("summary_interest") is not None,
+            "latest_run": latest_model_run("summary_interest", include_rejected=False),
+        },
+    }
+
+
+def build_status_payload() -> dict[str, Any]:
+    return {
+        "feed": feed_counts(),
+        "summaries": summary_counts(),
+        "models": build_status_models_payload(),
+        "llm_compare": llm_compare_status(),
+        "ollama": ollama_health(),
+        "last_feed_refresh": get_app_state("last_feed_refresh"),
+        "config": build_status_config_payload(),
+    }
+
+
 @APP.before_request
 def handle_options():  # type: ignore[no-untyped-def]
     if request.method == "OPTIONS":
@@ -4324,41 +4366,7 @@ def api_health():
 
 @APP.get("/api/status")
 def api_status():
-    latest_feed_run = latest_model_run("feed_recommendation", include_rejected=False)
-    latest_summary_run = latest_model_run("summary_interest", include_rejected=False)
-    return jsonify(
-        {
-            "feed": feed_counts(),
-            "summaries": summary_counts(),
-            "models": {
-                "feed_recommendation": {
-                    "loaded": get_loaded_model("feed_recommendation") is not None,
-                    "latest_run": latest_feed_run,
-                },
-                "summary_interest": {
-                    "loaded": get_loaded_model("summary_interest") is not None,
-                    "latest_run": latest_summary_run,
-                },
-            },
-            "llm_compare": llm_compare_status(),
-            "ollama": ollama_health(),
-            "last_feed_refresh": get_app_state("last_feed_refresh"),
-            "config": {
-                "config_path": str(CONFIG_PATH),
-                "ollama_model": OLLAMA_MODEL,
-                "ollama_embedding_model": get_embedding_model(),
-                "ollama_base_url": OLLAMA_BASE_URL,
-                "ollama_summary_timeout_seconds": get_summary_timeout_seconds(),
-                "ollama_embedding_timeout_seconds": get_embedding_timeout_seconds(),
-                "feed_refresh_seconds": FEED_REFRESH_SECONDS,
-                "embedding_poll_seconds": EMBEDDING_POLL_SECONDS,
-                "feed_count": len(RSS_FEED_URLS),
-                "llm_compare_models": get_compare_models(),
-                "llm_compare_export_dir": str(COMPARE_EXPORT_DIR),
-                "llm_compare_timeout_seconds": get_compare_timeout_seconds(),
-            },
-        }
-    )
+    return jsonify(build_status_payload())
 
 
 @APP.post("/api/feeds/refresh")
