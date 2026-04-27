@@ -3210,23 +3210,26 @@ def fetch_visible_pending_feed_articles() -> list[dict[str, Any]]:
     return build_visible_pending_feed_items(fetch_pending_feed_articles())
 
 
+def is_reviewable_summary_status(summary_status: str, summary_feedback: str) -> bool:
+    return summary_feedback == "unreviewed" and summary_status in {"ready", "failed"}
+
+
+def fetch_review_summary_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM articles
+        WHERE summary_feedback = 'unreviewed'
+          AND summary_status IN ('ready', 'failed')
+        ORDER BY datetime(COALESCE(summarized_at, summary_requested_at, updated_at)) DESC, id DESC
+        """
+    ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
 def fetch_review_summaries() -> list[dict[str, Any]]:
     with db_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM articles
-            WHERE (
-                summary_status = 'ready'
-                AND summary_feedback = 'unreviewed'
-            ) OR (
-                summary_status = 'failed'
-                AND summary_feedback = 'unreviewed'
-            )
-            ORDER BY datetime(COALESCE(summarized_at, summary_requested_at, updated_at)) DESC, id DESC
-            """
-        ).fetchall()
-    return [row_to_dict(row) for row in rows]
+        return fetch_review_summary_rows(conn)
 
 
 def latest_labels_count(target: str) -> dict[str, Any]:
@@ -3869,16 +3872,31 @@ def serialize_summary(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def summary_counts() -> dict[str, int]:
-    ready = count_rows("summary_status = 'ready' AND summary_feedback = 'unreviewed'")
-    failed = count_rows("summary_status = 'failed' AND summary_feedback = 'unreviewed'")
+def fetch_summary_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    row = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN summary_status = 'queued' THEN 1 ELSE 0 END) AS queued,
+            SUM(CASE WHEN summary_status = 'processing' THEN 1 ELSE 0 END) AS processing,
+            SUM(CASE WHEN summary_status = 'ready' AND summary_feedback = 'unreviewed' THEN 1 ELSE 0 END) AS ready,
+            SUM(CASE WHEN summary_status = 'failed' AND summary_feedback = 'unreviewed' THEN 1 ELSE 0 END) AS failed
+        FROM articles
+        """
+    ).fetchone()
+    ready = int(row["ready"] or 0)
+    failed = int(row["failed"] or 0)
     return {
-        "queued": count_rows("summary_status = 'queued'"),
-        "processing": count_rows("summary_status = 'processing'"),
+        "queued": int(row["queued"] or 0),
+        "processing": int(row["processing"] or 0),
         "ready": ready,
         "failed": failed,
         "review_total": ready + failed,
     }
+
+
+def summary_counts() -> dict[str, int]:
+    with db_connection() as conn:
+        return fetch_summary_counts(conn)
 
 
 def classify_primary_summary_failure(error_text: str) -> str:

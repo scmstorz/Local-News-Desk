@@ -607,6 +607,73 @@ class LocalNewsRegressionTests(unittest.TestCase):
 
         self.assertTrue(payload["summary_is_fallback"])
 
+    def test_reviewable_summary_status_requires_unreviewed_ready_or_failed(self):
+        self.assertTrue(backend.is_reviewable_summary_status("ready", "unreviewed"))
+        self.assertTrue(backend.is_reviewable_summary_status("failed", "unreviewed"))
+        self.assertFalse(backend.is_reviewable_summary_status("queued", "unreviewed"))
+        self.assertFalse(backend.is_reviewable_summary_status("ready", "interesting"))
+
+    def test_fetch_review_summary_rows_orders_only_unreviewed_ready_and_failed(self):
+        old_ready_id = self.insert_article(summary_status="ready", guid="old-ready")
+        new_failed_id = self.insert_article(summary_status="failed", guid="new-failed")
+        reviewed_id = self.insert_article(summary_status="ready", guid="reviewed")
+        queued_id = self.insert_article(summary_status="queued", guid="queued")
+
+        with backend.db_connection() as conn:
+            conn.execute(
+                """
+                UPDATE articles
+                SET summarized_at = CASE id
+                    WHEN ? THEN '2026-04-27T09:00:00+00:00'
+                    WHEN ? THEN '2026-04-27T10:00:00+00:00'
+                    ELSE summarized_at
+                END,
+                    summary_feedback = CASE id
+                    WHEN ? THEN 'interesting'
+                    ELSE summary_feedback
+                END
+                WHERE id IN (?, ?, ?, ?)
+                """,
+                (
+                    old_ready_id,
+                    new_failed_id,
+                    reviewed_id,
+                    old_ready_id,
+                    new_failed_id,
+                    reviewed_id,
+                    queued_id,
+                ),
+            )
+
+            rows = backend.fetch_review_summary_rows(conn)
+
+        self.assertEqual([row["id"] for row in rows], [new_failed_id, old_ready_id])
+
+    def test_fetch_summary_counts_counts_reviewable_ready_and_failed(self):
+        self.insert_article(summary_status="queued", guid="queued")
+        self.insert_article(summary_status="processing", guid="processing")
+        self.insert_article(summary_status="ready", guid="ready-unreviewed")
+        self.insert_article(summary_status="failed", guid="failed-unreviewed")
+        reviewed_ready_id = self.insert_article(summary_status="ready", guid="ready-reviewed")
+        with backend.db_connection() as conn:
+            conn.execute(
+                "UPDATE articles SET summary_feedback = 'interesting' WHERE id = ?",
+                (reviewed_ready_id,),
+            )
+
+            counts = backend.fetch_summary_counts(conn)
+
+        self.assertEqual(
+            counts,
+            {
+                "queued": 1,
+                "processing": 1,
+                "ready": 1,
+                "failed": 1,
+                "review_total": 2,
+            },
+        )
+
     def test_stale_processing_summary_job_is_recovered_to_failed(self):
         old_timestamp = (
             backend.utc_now() - backend.timedelta(minutes=backend.SUMMARY_PROCESSING_STALE_MINUTES + 1)
