@@ -2739,47 +2739,13 @@ def set_feed_decision(article_id: int, decision: str) -> dict[str, Any]:
 
         prediction_snapshot = compute_feed_prediction_snapshot(row_dict)
         now = utc_now_iso()
-        summary_status = row_dict["summary_status"]
-        summary_requested_at = row_dict["summary_requested_at"]
+        transition = build_feed_decision_transition(row_dict, decision, now)
 
-        if decision == "skip" and summary_status in {"queued", "processing", "ready"}:
-            raise RuntimeError("Article is already in summary flow")
-
-        if decision == "summarize":
-            if summary_status in {"not_requested", "failed"}:
-                summary_status = "queued"
-                summary_requested_at = now
-            event_name = "summary_requested"
-        else:
-            event_name = "article_skipped"
-
-        conn.execute(
-            """
-            UPDATE articles
-            SET feed_decision = ?,
-                feed_decision_at = ?,
-                summary_status = ?,
-                summary_requested_at = ?,
-                updated_at = ?,
-                last_error = CASE WHEN ? = 'summarize' THEN '' ELSE last_error END,
-                summary_is_fallback = CASE WHEN ? = 'summarize' THEN 0 ELSE summary_is_fallback END
-            WHERE id = ?
-            """,
-            (
-                decision,
-                now,
-                summary_status,
-                summary_requested_at,
-                now,
-                decision,
-                decision,
-                article_id,
-            ),
-        )
+        apply_feed_decision_transition(conn, article_id, transition)
         log_event(
             conn,
             article_id,
-            event_name,
+            transition["event_name"],
             {
                 "previous_feed_decision": row_dict["feed_decision"],
                 "new_feed_decision": decision,
@@ -2797,6 +2763,67 @@ def set_feed_decision(article_id: int, decision: str) -> dict[str, Any]:
         "decision": decision,
         "deduplicated_count": len(deduplicated_ids),
     }
+
+
+def build_feed_decision_transition(article: dict[str, Any], decision: str, decided_at: str) -> dict[str, Any]:
+    if decision not in {"skip", "summarize"}:
+        raise ValueError("Unsupported feed decision")
+
+    summary_status = article["summary_status"]
+    summary_requested_at = article["summary_requested_at"]
+
+    if decision == "skip":
+        if summary_status in {"queued", "processing", "ready"}:
+            raise RuntimeError("Article is already in summary flow")
+        return {
+            "decision": decision,
+            "decided_at": decided_at,
+            "summary_status": summary_status,
+            "summary_requested_at": summary_requested_at,
+            "event_name": "article_skipped",
+        }
+
+    if summary_status in {"not_requested", "failed"}:
+        summary_status = "queued"
+        summary_requested_at = decided_at
+    return {
+        "decision": decision,
+        "decided_at": decided_at,
+        "summary_status": summary_status,
+        "summary_requested_at": summary_requested_at,
+        "event_name": "summary_requested",
+    }
+
+
+def apply_feed_decision_transition(
+    conn: sqlite3.Connection,
+    article_id: int,
+    transition: dict[str, Any],
+) -> None:
+    decision = transition["decision"]
+    conn.execute(
+        """
+        UPDATE articles
+        SET feed_decision = ?,
+            feed_decision_at = ?,
+            summary_status = ?,
+            summary_requested_at = ?,
+            updated_at = ?,
+            last_error = CASE WHEN ? = 'summarize' THEN '' ELSE last_error END,
+            summary_is_fallback = CASE WHEN ? = 'summarize' THEN 0 ELSE summary_is_fallback END
+        WHERE id = ?
+        """,
+        (
+            decision,
+            transition["decided_at"],
+            transition["summary_status"],
+            transition["summary_requested_at"],
+            transition["decided_at"],
+            decision,
+            decision,
+            article_id,
+        ),
+    )
 
 
 def archive_pending_feed() -> dict[str, Any]:

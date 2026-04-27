@@ -232,6 +232,68 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(article["last_error"], "")
         self.assertIsNotNone(article["summary_requested_at"])
 
+    def test_feed_decision_transition_queues_new_summary_and_logs_requested_event(self):
+        article = {
+            "summary_status": "not_requested",
+            "summary_requested_at": None,
+        }
+
+        transition = backend.build_feed_decision_transition(
+            article,
+            "summarize",
+            "2026-04-27T10:00:00+00:00",
+        )
+
+        self.assertEqual(
+            transition,
+            {
+                "decision": "summarize",
+                "decided_at": "2026-04-27T10:00:00+00:00",
+                "summary_status": "queued",
+                "summary_requested_at": "2026-04-27T10:00:00+00:00",
+                "event_name": "summary_requested",
+            },
+        )
+
+    def test_feed_decision_transition_rejects_skip_after_summary_started(self):
+        article = {
+            "summary_status": "processing",
+            "summary_requested_at": "2026-04-27T09:00:00+00:00",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "already in summary flow"):
+            backend.build_feed_decision_transition(article, "skip", "2026-04-27T10:00:00+00:00")
+
+    def test_apply_feed_decision_transition_updates_article_summary_fields(self):
+        article_id = self.insert_article(summary_status="failed")
+        transition = {
+            "decision": "summarize",
+            "decided_at": "2026-04-27T10:00:00+00:00",
+            "summary_status": "queued",
+            "summary_requested_at": "2026-04-27T10:00:00+00:00",
+            "event_name": "summary_requested",
+        }
+        with backend.db_connection() as conn:
+            conn.execute(
+                """
+                UPDATE articles
+                SET last_error = 'old failure',
+                    summary_is_fallback = 1
+                WHERE id = ?
+                """,
+                (article_id,),
+            )
+
+            backend.apply_feed_decision_transition(conn, article_id, transition)
+
+        article = self.article_row(article_id)
+        self.assertEqual(article["feed_decision"], "summarize")
+        self.assertEqual(article["feed_decision_at"], "2026-04-27T10:00:00+00:00")
+        self.assertEqual(article["summary_status"], "queued")
+        self.assertEqual(article["summary_requested_at"], "2026-04-27T10:00:00+00:00")
+        self.assertEqual(article["last_error"], "")
+        self.assertEqual(article["summary_is_fallback"], 0)
+
     def test_skip_endpoint_rejects_article_already_in_summary_flow(self):
         article_id = self.insert_article(summary_status="queued")
 
