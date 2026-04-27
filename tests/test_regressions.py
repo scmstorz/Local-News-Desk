@@ -83,7 +83,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
 
     def article_row(self, article_id):
         with backend.db_connection() as conn:
-            return backend.row_to_dict(conn.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone())
+            return backend.fetch_article_by_id(conn, article_id)
 
     def event_rows(self, article_id):
         with backend.db_connection() as conn:
@@ -162,6 +162,17 @@ class LocalNewsRegressionTests(unittest.TestCase):
                 ("invalid_state", "not-json", backend.utc_now_iso()),
             )
             self.assertEqual(backend.fetch_app_state(conn, "invalid_state", default="fallback"), "fallback")
+
+    def test_fetch_article_by_id_returns_dict_or_none(self):
+        article_id = self.insert_article(title="Fetch helper test article")
+
+        with backend.db_connection() as conn:
+            article = backend.fetch_article_by_id(conn, article_id)
+            missing = backend.fetch_article_by_id(conn, article_id + 1000)
+
+        self.assertEqual(article["id"], article_id)
+        self.assertEqual(article["title"], "Fetch helper test article")
+        self.assertIsNone(missing)
 
     def test_summarize_endpoint_queues_article_and_wakes_worker(self):
         article_id = self.insert_article()

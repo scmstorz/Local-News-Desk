@@ -436,6 +436,11 @@ def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
+def fetch_article_by_id(conn: sqlite3.Connection, article_id: int) -> Optional[dict[str, Any]]:
+    row = conn.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
 def parse_datetime(value: Any) -> datetime:
     if not value:
         return utc_now()
@@ -2694,11 +2699,10 @@ def set_feed_decision(article_id: int, decision: str) -> dict[str, Any]:
     if decision not in {"skip", "summarize"}:
         raise ValueError("Unsupported feed decision")
     with db_connection() as conn:
-        row = conn.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
-        if not row:
+        row_dict = fetch_article_by_id(conn, article_id)
+        if not row_dict:
             raise LookupError("Article not found")
 
-        row_dict = row_to_dict(row)
         prediction_snapshot = compute_feed_prediction_snapshot(row_dict)
         now = utc_now_iso()
         summary_status = row_dict["summary_status"]
@@ -2821,8 +2825,7 @@ def set_summary_feedback(article_id: int, feedback: str) -> dict[str, Any]:
     if feedback not in {"interesting", "not_interesting", "not_available"}:
         raise ValueError("Unsupported summary feedback")
     with db_connection() as conn:
-        row = conn.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
-        if not row:
+        if not fetch_article_by_id(conn, article_id):
             raise LookupError("Article not found")
         now = utc_now_iso()
         conn.execute(
