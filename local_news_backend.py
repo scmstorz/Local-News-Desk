@@ -2825,21 +2825,27 @@ def mark_summary_processing(conn: sqlite3.Connection, article_id: int) -> None:
     log_event(conn, article_id, "summary_processing_started", {})
 
 
+def select_next_queued_summary_job(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT *
+        FROM articles
+        WHERE summary_status = 'queued'
+        ORDER BY datetime(summary_requested_at) ASC, id ASC
+        LIMIT 1
+        """,
+    ).fetchone()
+    if not row:
+        return None
+    return row_to_dict(row)
+
+
 def claim_next_summary_job() -> Optional[dict[str, Any]]:
     recover_stale_processing_jobs()
     with db_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM articles
-            WHERE summary_status = 'queued'
-            ORDER BY datetime(summary_requested_at) ASC, id ASC
-            LIMIT 1
-            """,
-        ).fetchone()
-        if not row:
+        row_dict = select_next_queued_summary_job(conn)
+        if not row_dict:
             return None
-        row_dict = row_to_dict(row)
         mark_summary_processing(conn, row_dict["id"])
     return row_dict
 
@@ -2895,6 +2901,21 @@ def mark_summary_ready(
     )
 
 
+def mark_summary_failed(conn: sqlite3.Connection, article_id: int, error_text: str) -> None:
+    conn.execute(
+        """
+        UPDATE articles
+        SET summary_status = 'failed',
+            updated_at = ?,
+            summary_is_fallback = 0,
+            last_error = ?
+        WHERE id = ?
+        """,
+        (utc_now_iso(), error_text, article_id),
+    )
+    log_event(conn, article_id, "summary_failed", {"error": error_text})
+
+
 def process_summary_job(job: dict[str, Any]) -> None:
     article_id = int(job["id"])
     try:
@@ -2918,23 +2939,7 @@ def process_summary_job(job: dict[str, Any]) -> None:
     except Exception as exc:  # pragma: no cover - runtime defensive
         LOGGER.warning("Summary job failed for article %s: %s", article_id, exc)
         with db_connection() as conn:
-            conn.execute(
-                """
-                UPDATE articles
-                SET summary_status = 'failed',
-                    updated_at = ?,
-                    summary_is_fallback = 0,
-                    last_error = ?
-                WHERE id = ?
-                """,
-                (utc_now_iso(), str(exc), article_id),
-            )
-            log_event(
-                conn,
-                article_id,
-                "summary_failed",
-                {"error": str(exc)},
-            )
+            mark_summary_failed(conn, article_id, str(exc))
 
 
 def summary_worker() -> None:

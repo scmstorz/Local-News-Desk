@@ -313,6 +313,40 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_processing_started"])
         self.assertEqual(self.event_payloads(article_id), [{}])
 
+    def test_select_next_queued_summary_job_orders_by_request_time_then_id(self):
+        newer_id = self.insert_article(feed_decision="summarize", summary_status="queued")
+        older_id = self.insert_article(feed_decision="summarize", summary_status="queued")
+        same_time_earlier_id = self.insert_article(feed_decision="summarize", summary_status="queued")
+        pending_id = self.insert_article(feed_decision="summarize", summary_status="not_requested")
+
+        with backend.db_connection() as conn:
+            conn.execute(
+                """
+                UPDATE articles
+                SET summary_requested_at = CASE id
+                    WHEN ? THEN '2026-04-26T10:00:00+00:00'
+                    WHEN ? THEN '2026-04-26T09:00:00+00:00'
+                    WHEN ? THEN '2026-04-26T09:00:00+00:00'
+                    WHEN ? THEN '2026-04-26T08:00:00+00:00'
+                END
+                WHERE id IN (?, ?, ?, ?)
+                """,
+                (
+                    newer_id,
+                    older_id,
+                    same_time_earlier_id,
+                    pending_id,
+                    newer_id,
+                    older_id,
+                    same_time_earlier_id,
+                    pending_id,
+                ),
+            )
+
+            job = backend.select_next_queued_summary_job(conn)
+
+        self.assertEqual(job["id"], older_id)
+
     def test_mark_summary_ready_updates_article_and_logs_event(self):
         article_id = self.insert_article(feed_decision="summarize", summary_status="processing")
 
@@ -341,6 +375,20 @@ class LocalNewsRegressionTests(unittest.TestCase):
             self.event_payloads(article_id),
             [{"model": backend.OLLAMA_MODEL, "final_url": "https://example.com/final", "extraction_fallback": False}],
         )
+
+    def test_mark_summary_failed_updates_article_and_logs_event(self):
+        article_id = self.insert_article(feed_decision="summarize", summary_status="processing")
+        with backend.db_connection() as conn:
+            conn.execute("UPDATE articles SET summary_is_fallback = 1 WHERE id = ?", (article_id,))
+
+            backend.mark_summary_failed(conn, article_id, "source unavailable")
+
+        article = self.article_row(article_id)
+        self.assertEqual(article["summary_status"], "failed")
+        self.assertEqual(article["summary_is_fallback"], 0)
+        self.assertEqual(article["last_error"], "source unavailable")
+        self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_failed"])
+        self.assertEqual(self.event_payloads(article_id), [{"error": "source unavailable"}])
 
     def test_legacy_summary_job_getter_delegates_to_claim_function(self):
         with mock.patch("local_news_backend.claim_next_summary_job", return_value={"id": 123}) as claim:
