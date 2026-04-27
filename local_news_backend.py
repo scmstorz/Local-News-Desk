@@ -1403,6 +1403,30 @@ def decode_app_state_value(value: Any, default: Any = None) -> Any:
         return default
 
 
+def decode_json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if value is None:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def decode_json_array(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return list(value)
+    if value is None:
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def upsert_app_state(conn: sqlite3.Connection, key: str, value: Any) -> None:
     conn.execute(
         """
@@ -2078,7 +2102,7 @@ def rewrite_compare_export_article(
 
     summaries_by_model = {row["model_name"]: row_to_dict(row) for row in rows}
     ordered_summaries: list[dict[str, Any]] = []
-    for model_name in json.loads(session["models_json"]):
+    for model_name in decode_json_array(session["models_json"]):
         if model_name in summaries_by_model:
             ordered_summaries.append(summaries_by_model[model_name])
 
@@ -2157,7 +2181,7 @@ def run_compare_summaries(
     if not session:
         return
 
-    models = json.loads(session["models_json"])
+    models = decode_json_array(session["models_json"])
     article_id = int(article["id"])
     with db_connection() as conn:
         existing_rows = conn.execute(
@@ -3123,7 +3147,7 @@ def fetch_next_compare_job() -> Optional[dict[str, Any]]:
     if not session:
         return None
 
-    models = json.loads(session["models_json"])
+    models = decode_json_array(session["models_json"])
     model_count = len(models)
     with db_connection() as conn:
         row = conn.execute(
@@ -3381,6 +3405,16 @@ def model_quality_assessment(target: str, latest_run: Optional[dict[str, Any]]) 
     }
 
 
+def attach_model_run_json_fields(run: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not run:
+        return run
+    if run.get("confusion_matrix_json"):
+        run["confusion_matrix"] = decode_json_array(run["confusion_matrix_json"])
+    if run.get("notes"):
+        run["notes_json"] = decode_json_object(run["notes"])
+    return run
+
+
 def feed_prediction_outcome_stats(limit: int = 1500) -> dict[str, Any]:
     buckets: dict[str, dict[str, int]] = {
         "recommended": {"skip": 0, "summarize": 0},
@@ -3565,11 +3599,7 @@ def should_promote_model(
             "reason": "non_feed_target",
         }
 
-    active_notes = {}
-    try:
-        active_notes = json.loads(current_active_run.get("notes") or "{}")
-    except json.JSONDecodeError:
-        active_notes = {}
+    active_notes = decode_json_object(current_active_run.get("notes"))
 
     active_f1 = float(current_active_run.get("f1", 0.0))
     active_precision = float(current_active_run.get("precision", 0.0))
@@ -3929,7 +3959,7 @@ def llm_compare_status() -> dict[str, Any]:
     diagnostics: Optional[dict[str, Any]] = None
 
     if session:
-        models = json.loads(session["models_json"])
+        models = decode_json_array(session["models_json"])
         total_models = max(len(models), 1)
         with db_connection() as conn:
             rows = conn.execute(
@@ -4037,7 +4067,7 @@ def llm_compare_status() -> dict[str, Any]:
         }
 
     if diagnostics_session:
-        models = json.loads(diagnostics_session["models_json"])
+        models = decode_json_array(diagnostics_session["models_json"])
         with db_connection() as conn:
             aggregate_rows = conn.execute(
                 """
@@ -4345,9 +4375,9 @@ def api_summary_feedback(article_id: int):
 def api_model_ops():
     payload: dict[str, Any] = {"targets": {}, "training": get_training_status()}
     for target in TARGET_CONFIG:
-        latest_run = latest_model_run(target)
-        previous_run = previous_model_run(target)
-        active_run = latest_model_run(target, include_rejected=False)
+        latest_run = attach_model_run_json_fields(latest_model_run(target))
+        previous_run = attach_model_run_json_fields(previous_model_run(target))
+        active_run = attach_model_run_json_fields(latest_model_run(target, include_rejected=False))
         counts = latest_labels_count(target)
         payload["targets"][target] = {
             "latest_run": latest_run,
@@ -4363,25 +4393,6 @@ def api_model_ops():
         }
         if target == "feed_recommendation":
             payload["targets"][target]["prediction_outcomes"] = feed_prediction_outcome_stats()
-        if latest_run and latest_run.get("confusion_matrix_json"):
-            payload["targets"][target]["latest_run"]["confusion_matrix"] = json.loads(
-                latest_run["confusion_matrix_json"]
-            )
-        if latest_run and latest_run.get("notes"):
-            try:
-                payload["targets"][target]["latest_run"]["notes_json"] = json.loads(latest_run["notes"])
-            except json.JSONDecodeError:
-                payload["targets"][target]["latest_run"]["notes_json"] = {}
-        if previous_run and previous_run.get("notes"):
-            try:
-                payload["targets"][target]["previous_run"]["notes_json"] = json.loads(previous_run["notes"])
-            except json.JSONDecodeError:
-                payload["targets"][target]["previous_run"]["notes_json"] = {}
-        if active_run and active_run.get("notes"):
-            try:
-                payload["targets"][target]["active_run"]["notes_json"] = json.loads(active_run["notes"])
-            except json.JSONDecodeError:
-                payload["targets"][target]["active_run"]["notes_json"] = {}
     return jsonify(payload)
 
 

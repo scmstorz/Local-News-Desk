@@ -134,6 +134,33 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(backend.decode_app_state_value(None, default="fallback"), "fallback")
         self.assertEqual(backend.decode_app_state_value("not-json", default="fallback"), "fallback")
 
+    def test_json_shape_decoders_default_invalid_or_wrong_shapes(self):
+        self.assertEqual(backend.decode_json_object('{"a": 1}'), {"a": 1})
+        self.assertEqual(backend.decode_json_object('["not", "object"]'), {})
+        self.assertEqual(backend.decode_json_object("not-json"), {})
+        self.assertEqual(backend.decode_json_array('["a", "b"]'), ["a", "b"])
+        self.assertEqual(backend.decode_json_array('{"not": "array"}'), [])
+        self.assertEqual(backend.decode_json_array("not-json"), [])
+
+    def test_attach_model_run_json_fields_decodes_notes_and_confusion_matrix(self):
+        run = {
+            "notes": '{"promotion_decision": {"reason": "better"}}',
+            "confusion_matrix_json": "[[1, 2], [3, 4]]",
+        }
+
+        enriched = backend.attach_model_run_json_fields(run)
+
+        self.assertEqual(enriched["notes_json"], {"promotion_decision": {"reason": "better"}})
+        self.assertEqual(enriched["confusion_matrix"], [[1, 2], [3, 4]])
+
+    def test_attach_model_run_json_fields_defaults_invalid_json(self):
+        run = {"notes": "not-json", "confusion_matrix_json": "not-json"}
+
+        enriched = backend.attach_model_run_json_fields(run)
+
+        self.assertEqual(enriched["notes_json"], {})
+        self.assertEqual(enriched["confusion_matrix"], [])
+
     def test_app_state_store_helpers_upsert_fetch_and_default_invalid_values(self):
         with backend.db_connection() as conn:
             backend.upsert_app_state(conn, "test_state", {"count": 1})
