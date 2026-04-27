@@ -2654,6 +2654,46 @@ def build_feed_response_counts(rows: list[dict[str, Any]], similarity: dict[str,
     }
 
 
+def build_feed_similarity_counts(snapshot: dict[str, Any], visible_count: int) -> dict[str, int]:
+    return {
+        "pending_total": int(snapshot.get("pending_total", 0)),
+        "visible_total": int(snapshot.get("visible_total", visible_count)),
+        "similar_group_count": int(snapshot.get("similar_group_count", 0)),
+        "similar_hidden_count": int(snapshot.get("similar_hidden_count", 0)),
+    }
+
+
+def load_feed_rows_for_api() -> tuple[list[dict[str, Any]], dict[str, int]]:
+    snapshot = current_feed_similarity_snapshot()
+    rows = fetch_visible_pending_feed_articles_from_snapshot()
+    similarity = build_feed_similarity_counts(snapshot, len(rows))
+
+    if rows:
+        return rows, similarity
+
+    pending_rows = fetch_pending_feed_articles()
+    fallback_rows = [row_to_dict(row) for row in pending_rows]
+    ensure_feed_similarity_snapshot_async()
+    return fallback_rows, {
+        "pending_total": len(fallback_rows),
+        "visible_total": len(fallback_rows),
+        "similar_group_count": 0,
+        "similar_hidden_count": 0,
+    }
+
+
+def build_feed_api_payload(mode: str) -> dict[str, Any]:
+    rows, similarity = load_feed_rows_for_api()
+    predicted_rows, run_id = predict_feed_rows(rows)
+    update_cached_feed_predictions(predicted_rows, run_id)
+    filtered = filter_predicted_feed_rows(predicted_rows, mode)
+    return {
+        "mode": mode,
+        "items": [serialize_article_for_feed(item) for item in filtered],
+        "counts": build_feed_response_counts(predicted_rows, similarity),
+    }
+
+
 def refresh_feeds() -> dict[str, Any]:
     if not STATE.refresh_lock.acquire(blocking=False):
         return {"status": "busy", "message": "Feed refresh already running"}
@@ -4338,38 +4378,7 @@ def api_feed_deduplicate():
 
 @APP.get("/api/feed")
 def api_feed():
-    mode = request.args.get("mode", "all")
-    snapshot = current_feed_similarity_snapshot()
-    rows = fetch_visible_pending_feed_articles_from_snapshot()
-    similarity = {
-        "pending_total": int(snapshot.get("pending_total", 0)),
-        "visible_total": int(snapshot.get("visible_total", len(rows))),
-        "similar_group_count": int(snapshot.get("similar_group_count", 0)),
-        "similar_hidden_count": int(snapshot.get("similar_hidden_count", 0)),
-    }
-
-    if not rows:
-        pending_rows = fetch_pending_feed_articles()
-        rows = [row_to_dict(row) for row in pending_rows]
-        similarity = {
-            "pending_total": len(rows),
-            "visible_total": len(rows),
-            "similar_group_count": 0,
-            "similar_hidden_count": 0,
-        }
-        ensure_feed_similarity_snapshot_async()
-
-    predicted_rows, run_id = predict_feed_rows(rows)
-    update_cached_feed_predictions(predicted_rows, run_id)
-    filtered = filter_predicted_feed_rows(predicted_rows, mode)
-
-    return jsonify(
-        {
-            "mode": mode,
-            "items": [serialize_article_for_feed(item) for item in filtered],
-            "counts": build_feed_response_counts(predicted_rows, similarity),
-        }
-    )
+    return jsonify(build_feed_api_payload(request.args.get("mode", "all")))
 
 
 @APP.post("/api/articles/<int:article_id>/skip")

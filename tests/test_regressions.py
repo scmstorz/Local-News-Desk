@@ -966,6 +966,96 @@ class LocalNewsRegressionTests(unittest.TestCase):
             [1, 2, 3, 4],
         )
 
+    def test_feed_similarity_counts_default_to_visible_count(self):
+        counts = backend.build_feed_similarity_counts({"pending_total": 4}, visible_count=3)
+
+        self.assertEqual(
+            counts,
+            {
+                "pending_total": 4,
+                "visible_total": 3,
+                "similar_group_count": 0,
+                "similar_hidden_count": 0,
+            },
+        )
+
+    def test_load_feed_rows_for_api_uses_snapshot_rows_when_available(self):
+        rows = [{"id": 1, "title": "Visible row"}]
+        with mock.patch("local_news_backend.current_feed_similarity_snapshot", return_value={"visible_total": 1}), mock.patch(
+            "local_news_backend.fetch_visible_pending_feed_articles_from_snapshot", return_value=rows
+        ), mock.patch("local_news_backend.fetch_pending_feed_articles") as fetch_pending, mock.patch(
+            "local_news_backend.ensure_feed_similarity_snapshot_async"
+        ) as ensure_snapshot:
+            loaded_rows, similarity = backend.load_feed_rows_for_api()
+
+        self.assertEqual(loaded_rows, rows)
+        self.assertEqual(similarity["visible_total"], 1)
+        fetch_pending.assert_not_called()
+        ensure_snapshot.assert_not_called()
+
+    def test_load_feed_rows_for_api_falls_back_to_db_and_refreshes_snapshot(self):
+        article_id = self.insert_article(title="Fallback feed article")
+        with mock.patch("local_news_backend.current_feed_similarity_snapshot", return_value={}), mock.patch(
+            "local_news_backend.fetch_visible_pending_feed_articles_from_snapshot", return_value=[]
+        ), mock.patch("local_news_backend.ensure_feed_similarity_snapshot_async") as ensure_snapshot:
+            rows, similarity = backend.load_feed_rows_for_api()
+
+        self.assertEqual([row["id"] for row in rows], [article_id])
+        self.assertEqual(
+            similarity,
+            {
+                "pending_total": 1,
+                "visible_total": 1,
+                "similar_group_count": 0,
+                "similar_hidden_count": 0,
+            },
+        )
+        ensure_snapshot.assert_called_once_with()
+
+    def test_build_feed_api_payload_filters_and_serializes_items(self):
+        rows = [
+            {
+                "id": 1,
+                "title": "Recommended",
+                "source_label": "example.com",
+                "source_url": "https://example.com",
+                "source_feed": "feed",
+                "published_at": "2026-04-27T10:00:00+00:00",
+                "link_to_article": "https://example.com/a",
+                "feed_decision": "pending",
+            },
+            {
+                "id": 2,
+                "title": "Maybe",
+                "source_label": "example.com",
+                "source_url": "https://example.com",
+                "source_feed": "feed",
+                "published_at": "2026-04-27T10:01:00+00:00",
+                "link_to_article": "https://example.com/b",
+                "feed_decision": "pending",
+            },
+        ]
+        predicted_rows = [
+            {**rows[0], "prediction": {"recommended": True, "tier": "recommended"}},
+            {**rows[1], "prediction": {"recommended": False, "tier": "maybe"}},
+        ]
+        with mock.patch(
+            "local_news_backend.load_feed_rows_for_api",
+            return_value=(rows, {"similar_group_count": 2, "similar_hidden_count": 3}),
+        ), mock.patch("local_news_backend.predict_feed_rows", return_value=(predicted_rows, 42)), mock.patch(
+            "local_news_backend.update_cached_feed_predictions"
+        ) as update_predictions:
+            payload = backend.build_feed_api_payload("recommended")
+
+        self.assertEqual(payload["mode"], "recommended")
+        self.assertEqual([item["id"] for item in payload["items"]], [1])
+        self.assertEqual(payload["counts"]["total_pending"], 2)
+        self.assertEqual(payload["counts"]["recommended_pending"], 1)
+        self.assertEqual(payload["counts"]["maybe_pending"], 1)
+        self.assertEqual(payload["counts"]["similar_group_count"], 2)
+        self.assertEqual(payload["counts"]["similar_hidden_count"], 3)
+        update_predictions.assert_called_once_with(predicted_rows, 42)
+
     def test_feed_prediction_helpers_build_consistent_tiers(self):
         self.assertEqual(
             backend.build_unavailable_feed_prediction(),
