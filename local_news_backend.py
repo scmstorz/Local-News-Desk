@@ -1683,30 +1683,48 @@ def extract_ollama_embedding_vector(body: dict[str, Any]) -> Optional[list[float
     return None
 
 
-def ollama_embed_text(text: str) -> list[float]:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    if not text:
+def normalize_embedding_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def build_ollama_embedding_request_specs(text: str, model_name: Optional[str] = None) -> list[dict[str, Any]]:
+    normalized_text = normalize_embedding_text(text)
+    if not normalized_text:
         raise ValueError("Embedding input is empty after normalization")
 
-    payload = {
-        "model": get_embedding_model(),
-        "input": text,
-    }
+    model = (model_name or get_embedding_model()).strip()
+    return [
+        {
+            "path": "/api/embed",
+            "json": {
+                "model": model,
+                "input": normalized_text,
+            },
+        },
+        {
+            "path": "/api/embeddings",
+            "json": {
+                "model": model,
+                "prompt": normalized_text,
+            },
+        },
+    ]
+
+
+def ollama_embed_text(text: str) -> list[float]:
+    request_specs = build_ollama_embedding_request_specs(text)
     with STATE.ollama_lock:
-        response = requests.post(
-            f"{OLLAMA_BASE_URL}/api/embed",
-            timeout=get_embedding_timeout_seconds(),
-            json=payload,
-        )
-        if response.status_code == 404:
+        response = None
+        for index, spec in enumerate(request_specs):
             response = requests.post(
-                f"{OLLAMA_BASE_URL}/api/embeddings",
+                f"{OLLAMA_BASE_URL}{spec['path']}",
                 timeout=get_embedding_timeout_seconds(),
-                json={
-                    "model": get_embedding_model(),
-                    "prompt": text,
-                },
+                json=spec["json"],
             )
+            if response.status_code != 404 or index == len(request_specs) - 1:
+                break
+    if response is None:  # pragma: no cover - request_specs is never empty
+        raise RuntimeError("No Ollama embedding request was prepared")
     response.raise_for_status()
     body = response.json()
     vector = extract_ollama_embedding_vector(body)

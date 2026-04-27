@@ -628,6 +628,42 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(backend.extract_ollama_embedding_vector({"data": [{"embedding": [0.1, 0.2]}]}), [0.1, 0.2])
         self.assertIsNone(backend.extract_ollama_embedding_vector({"embeddings": []}))
 
+    def test_embedding_request_specs_normalize_input_and_cover_ollama_endpoints(self):
+        specs = backend.build_ollama_embedding_request_specs("  First\n\nsecond\tline  ", model_name="embed-model")
+
+        self.assertEqual(
+            specs,
+            [
+                {"path": "/api/embed", "json": {"model": "embed-model", "input": "First second line"}},
+                {"path": "/api/embeddings", "json": {"model": "embed-model", "prompt": "First second line"}},
+            ],
+        )
+
+        with self.assertRaises(ValueError):
+            backend.build_ollama_embedding_request_specs(" \n\t ")
+
+    def test_ollama_embed_text_retries_legacy_embedding_endpoint_on_404(self):
+        first_response = mock.Mock()
+        first_response.status_code = 404
+        second_response = mock.Mock()
+        second_response.status_code = 200
+        second_response.json.return_value = {"embedding": [0.1, 0.2]}
+
+        with mock.patch(
+            "local_news_backend.requests.post",
+            side_effect=[first_response, second_response],
+        ) as post:
+            vector = backend.ollama_embed_text("Article title")
+
+        self.assertEqual(vector, [0.1, 0.2])
+        self.assertEqual(
+            [call.args[0] for call in post.call_args_list],
+            [f"{backend.OLLAMA_BASE_URL}/api/embed", f"{backend.OLLAMA_BASE_URL}/api/embeddings"],
+        )
+        self.assertEqual(post.call_args_list[0].kwargs["json"]["input"], "Article title")
+        self.assertEqual(post.call_args_list[1].kwargs["json"]["prompt"], "Article title")
+        second_response.raise_for_status.assert_called_once_with()
+
     def test_embedding_selection_skips_empty_input_titles(self):
         empty_id = self.insert_article(guid="empty-input", title="\u200b")
         valid_id = self.insert_article(guid="valid-input", title="Valid article title for embedding")
