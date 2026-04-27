@@ -87,18 +87,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
 
     def event_rows(self, article_id):
         with backend.db_connection() as conn:
-            return [
-                backend.row_to_dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT *
-                    FROM article_events
-                    WHERE article_id = ?
-                    ORDER BY id
-                    """,
-                    (article_id,),
-                ).fetchall()
-            ]
+            return backend.fetch_article_events(conn, article_id)
 
     def event_payloads(self, article_id):
         return [backend.decode_event_payload(event["event_payload"]) for event in self.event_rows(article_id)]
@@ -173,6 +162,38 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(article["id"], article_id)
         self.assertEqual(article["title"], "Fetch helper test article")
         self.assertIsNone(missing)
+
+    def test_fetch_article_events_returns_article_events_in_insert_order(self):
+        article_id = self.insert_article()
+        other_id = self.insert_article(guid="other-article")
+
+        with backend.db_connection() as conn:
+            backend.log_event(conn, article_id, "first_event", {"order": 1})
+            backend.log_event(conn, other_id, "other_event", {})
+            backend.log_event(conn, article_id, "second_event", {"order": 2})
+
+            events = backend.fetch_article_events(conn, article_id)
+
+        self.assertEqual([event["event_type"] for event in events], ["first_event", "second_event"])
+        self.assertEqual([backend.decode_event_payload(event["event_payload"])["order"] for event in events], [1, 2])
+
+    def test_fetch_recent_article_events_filters_types_and_limit(self):
+        first_id = self.insert_article()
+        second_id = self.insert_article(guid="second-article")
+
+        with backend.db_connection() as conn:
+            backend.log_event(conn, first_id, "article_skipped", {"article": "first"})
+            backend.log_event(conn, first_id, "ignored_event", {})
+            backend.log_event(conn, second_id, "summary_requested", {"article": "second"})
+
+            events = backend.fetch_recent_article_events(conn, ["article_skipped", "summary_requested"], 1)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "summary_requested")
+        self.assertEqual(backend.decode_event_payload(events[0]["event_payload"]), {"article": "second"})
+        with backend.db_connection() as conn:
+            self.assertEqual(backend.fetch_recent_article_events(conn, [], 10), [])
+            self.assertEqual(backend.fetch_recent_article_events(conn, ["article_skipped"], 0), [])
 
     def test_summarize_endpoint_queues_article_and_wakes_worker(self):
         article_id = self.insert_article()

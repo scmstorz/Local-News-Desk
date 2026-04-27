@@ -441,6 +441,40 @@ def fetch_article_by_id(conn: sqlite3.Connection, article_id: int) -> Optional[d
     return row_to_dict(row) if row else None
 
 
+def fetch_article_events(conn: sqlite3.Connection, article_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM article_events
+        WHERE article_id = ?
+        ORDER BY id
+        """,
+        (article_id,),
+    ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def fetch_recent_article_events(
+    conn: sqlite3.Connection,
+    event_types: list[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not event_types or limit <= 0:
+        return []
+    placeholders = ",".join("?" for _ in event_types)
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM article_events
+        WHERE event_type IN ({placeholders})
+        ORDER BY datetime(created_at) DESC, id DESC
+        LIMIT ?
+        """,
+        (*event_types, limit),
+    ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
 def parse_datetime(value: Any) -> datetime:
     if not value:
         return utc_now()
@@ -3297,16 +3331,7 @@ def feed_prediction_outcome_stats(limit: int = 1500) -> dict[str, Any]:
     }
 
     with db_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT event_type, event_payload, created_at
-            FROM article_events
-            WHERE event_type IN ('article_skipped', 'summary_requested')
-            ORDER BY datetime(created_at) DESC, id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+        rows = fetch_recent_article_events(conn, ["article_skipped", "summary_requested"], limit)
 
     considered = 0
     for row in rows:
