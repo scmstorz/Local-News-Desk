@@ -840,6 +840,31 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(status_code, 418)
         self.assertEqual(response.get_json(), {"status": "error", "message": "Nope"})
 
+    def test_request_json_body_accepts_only_json_objects(self):
+        with backend.APP.test_request_context(json={"enabled": True}):
+            self.assertEqual(backend.request_json_body(), {"enabled": True})
+
+        with backend.APP.test_request_context(json=["not", "an", "object"]):
+            self.assertEqual(backend.request_json_body(), {})
+
+    def test_health_payload_exposes_runtime_status(self):
+        with mock.patch("local_news_backend.ollama_health", return_value={"reachable": True}):
+            payload = backend.build_health_payload()
+
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["db_path"], str(backend.DB_PATH))
+        self.assertEqual(payload["ollama"], {"reachable": True})
+        self.assertEqual(payload["version"], "local-v1")
+
+    def test_llm_compare_toggle_api_passes_enabled_flag(self):
+        with backend.APP.app_context(), mock.patch(
+            "local_news_backend.set_compare_enabled", return_value={"enabled": True}
+        ) as set_enabled:
+            response = backend.run_llm_compare_toggle_api({"enabled": 1})
+
+        set_enabled.assert_called_once_with(True)
+        self.assertEqual(response.get_json(), {"enabled": True})
+
     def test_feed_action_api_maps_domain_errors_to_http_responses(self):
         with backend.APP.app_context(), mock.patch(
             "local_news_backend.set_feed_decision", side_effect=LookupError()
@@ -873,6 +898,42 @@ class LocalNewsRegressionTests(unittest.TestCase):
 
         self.assertEqual(status_code, 404)
         self.assertEqual(response.get_json()["message"], "Article not found")
+
+    def test_legacy_import_api_maps_result_status_to_http_response(self):
+        with backend.APP.app_context(), mock.patch(
+            "local_news_backend.import_legacy_preferences",
+            return_value={"status": "ok", "imported": 2},
+        ) as import_preferences:
+            response = backend.run_legacy_import_api({"payload": "legacy text", "auto_train": 0})
+
+        import_preferences.assert_called_once_with("legacy text", auto_train=False)
+        self.assertEqual(response.get_json(), {"status": "ok", "imported": 2})
+
+        with backend.APP.app_context(), mock.patch(
+            "local_news_backend.import_legacy_preferences",
+            return_value={"status": "error", "message": "No importable legacy labels found", "imported": 0},
+        ):
+            response, status_code = backend.run_legacy_import_api({})
+
+        self.assertEqual(status_code, 400)
+        self.assertEqual(response.get_json()["status"], "error")
+
+    def test_model_train_api_resolves_targets_and_maps_domain_errors(self):
+        with backend.APP.app_context(), mock.patch(
+            "local_news_backend.TARGET_CONFIG", {"feed_recommendation": {}, "summary_interest": {}}
+        ), mock.patch("local_news_backend.train_targets", return_value=[{"target": "feed_recommendation"}]) as train:
+            response = backend.run_model_train_api({"target": "all"})
+
+        train.assert_called_once_with(["feed_recommendation", "summary_interest"])
+        self.assertEqual(response.get_json(), {"status": "ok", "results": [{"target": "feed_recommendation"}]})
+
+        with backend.APP.app_context(), mock.patch(
+            "local_news_backend.train_targets", side_effect=ValueError("Unsupported target bad")
+        ):
+            response, status_code = backend.run_model_train_api({"target": "bad"})
+
+        self.assertEqual(status_code, 400)
+        self.assertEqual(response.get_json(), {"status": "error", "message": "Unsupported target bad"})
 
     def test_model_ops_target_payload_enriches_runs_and_prediction_outcomes(self):
         latest_run = {

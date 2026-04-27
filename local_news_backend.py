@@ -4251,6 +4251,26 @@ def api_error_response(message: str, status_code: int):
     return jsonify({"status": "error", "message": message}), status_code
 
 
+def request_json_body() -> dict[str, Any]:
+    body = request.get_json(silent=True) or {}
+    if isinstance(body, dict):
+        return body
+    return {}
+
+
+def build_health_payload() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "db_path": str(DB_PATH),
+        "ollama": ollama_health(),
+        "version": "local-v1",
+    }
+
+
+def run_llm_compare_toggle_api(body: dict[str, Any]):
+    return jsonify(set_compare_enabled(bool(body.get("enabled", False))))
+
+
 def run_feed_action_api(article_id: int, decision: str):
     try:
         return jsonify(set_feed_decision(article_id, decision))
@@ -4267,6 +4287,31 @@ def run_summary_feedback_api(article_id: int, feedback: Any):
         return api_error_response("Unsupported feedback", 400)
     except LookupError:
         return api_error_response("Article not found", 404)
+
+
+def run_legacy_import_api(body: dict[str, Any]):
+    payload = body.get("payload", "")
+    auto_train = bool(body.get("auto_train", True))
+    result = import_legacy_preferences(payload, auto_train=auto_train)
+    if result.get("status") == "error":
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+def resolve_training_targets(target: Any) -> list[Any]:
+    if target == "all":
+        return list(TARGET_CONFIG.keys())
+    return [target]
+
+
+def run_model_train_api(body: dict[str, Any]):
+    target = body.get("target", "all")
+    targets = resolve_training_targets(target)
+    try:
+        results = train_targets(targets)
+    except ValueError as exc:
+        return api_error_response(str(exc), 400)
+    return jsonify({"status": "ok", "results": results})
 
 
 def build_model_ops_target_payload(target: str) -> dict[str, Any]:
@@ -4354,14 +4399,7 @@ def app_index():
 
 @APP.get("/api/health")
 def api_health():
-    return jsonify(
-        {
-            "status": "ok",
-            "db_path": str(DB_PATH),
-            "ollama": ollama_health(),
-            "version": "local-v1",
-        }
-    )
+    return jsonify(build_health_payload())
 
 
 @APP.get("/api/status")
@@ -4376,9 +4414,7 @@ def api_refresh_feeds():
 
 @APP.post("/api/llm-compare")
 def api_llm_compare_toggle():
-    body = request.get_json(silent=True) or {}
-    enabled = bool(body.get("enabled", False))
-    return jsonify(set_compare_enabled(enabled))
+    return run_llm_compare_toggle_api(request_json_body())
 
 
 @APP.post("/api/feed/reset")
@@ -4424,25 +4460,12 @@ def api_model_ops():
 
 @APP.post("/api/legacy/import")
 def api_legacy_import():
-    body = request.get_json(silent=True) or {}
-    payload = body.get("payload", "")
-    auto_train = bool(body.get("auto_train", True))
-    result = import_legacy_preferences(payload, auto_train=auto_train)
-    if result.get("status") == "error":
-        return jsonify(result), 400
-    return jsonify(result)
+    return run_legacy_import_api(request_json_body())
 
 
 @APP.post("/api/model-ops/train")
 def api_model_train():
-    body = request.get_json(silent=True) or {}
-    target = body.get("target", "all")
-    targets = list(TARGET_CONFIG.keys()) if target == "all" else [target]
-    try:
-        results = train_targets(targets)
-    except ValueError as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 400
-    return jsonify({"status": "ok", "results": results})
+    return run_model_train_api(request_json_body())
 
 
 def start_background_threads() -> list[threading.Thread]:
