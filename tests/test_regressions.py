@@ -839,6 +839,55 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(status_code, 404)
         self.assertEqual(response.get_json()["message"], "Article not found")
 
+    def test_model_ops_target_payload_enriches_runs_and_prediction_outcomes(self):
+        latest_run = {
+            "trained_at": "2026-04-27T09:00:00+00:00",
+            "notes": '{"latest": true}',
+            "confusion_matrix_json": "[[1, 2], [3, 4]]",
+        }
+        previous_run = {
+            "trained_at": "2026-04-26T09:00:00+00:00",
+            "notes": '{"previous": true}',
+        }
+        active_run = {
+            "trained_at": "2026-04-27T08:00:00+00:00",
+            "notes": '{"active": true}',
+        }
+
+        with mock.patch("local_news_backend.latest_model_run", side_effect=[latest_run, active_run]), mock.patch(
+            "local_news_backend.previous_model_run", return_value=previous_run
+        ), mock.patch("local_news_backend.latest_labels_count", return_value={"total": 10}), mock.patch(
+            "local_news_backend.new_labels_since_training", return_value=3
+        ), mock.patch("local_news_backend.retraining_recommendation", return_value={"recommended": False}), mock.patch(
+            "local_news_backend.model_quality_assessment", return_value={"level": "usable"}
+        ), mock.patch("local_news_backend.feed_prediction_outcome_stats", return_value={"considered_events": 5}):
+            payload = backend.build_model_ops_target_payload("feed_recommendation")
+
+        self.assertEqual(payload["latest_run"]["notes_json"], {"latest": True})
+        self.assertEqual(payload["latest_run"]["confusion_matrix"], [[1, 2], [3, 4]])
+        self.assertEqual(payload["previous_run"]["notes_json"], {"previous": True})
+        self.assertEqual(payload["active_run"]["notes_json"], {"active": True})
+        self.assertEqual(payload["label_counts"], {"total": 10})
+        self.assertEqual(payload["new_labels_since_training"], 3)
+        self.assertEqual(payload["prediction_outcomes"], {"considered_events": 5})
+
+    def test_model_ops_payload_collects_all_targets_and_training_status(self):
+        with mock.patch("local_news_backend.TARGET_CONFIG", {"target_a": {}, "target_b": {}}), mock.patch(
+            "local_news_backend.build_model_ops_target_payload", side_effect=lambda target: {"target": target}
+        ), mock.patch("local_news_backend.get_training_status", return_value={"active": False}):
+            payload = backend.build_model_ops_payload()
+
+        self.assertEqual(
+            payload,
+            {
+                "targets": {
+                    "target_a": {"target": "target_a"},
+                    "target_b": {"target": "target_b"},
+                },
+                "training": {"active": False},
+            },
+        )
+
     def test_feed_recommended_and_maybe_modes_are_disjoint(self):
         run_id = 42
         with backend.STATE.model_lock:

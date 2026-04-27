@@ -4222,6 +4222,34 @@ def run_summary_feedback_api(article_id: int, feedback: Any):
         return api_error_response("Article not found", 404)
 
 
+def build_model_ops_target_payload(target: str) -> dict[str, Any]:
+    latest_run = attach_model_run_json_fields(latest_model_run(target))
+    previous_run = attach_model_run_json_fields(previous_model_run(target))
+    active_run = attach_model_run_json_fields(latest_model_run(target, include_rejected=False))
+    payload = {
+        "latest_run": latest_run,
+        "previous_run": previous_run,
+        "active_run": active_run,
+        "label_counts": latest_labels_count(target),
+        "new_labels_since_training": new_labels_since_training(
+            target,
+            active_run["trained_at"] if active_run else None,
+        ),
+        "retraining": retraining_recommendation(target, active_run),
+        "quality": model_quality_assessment(target, active_run),
+    }
+    if target == "feed_recommendation":
+        payload["prediction_outcomes"] = feed_prediction_outcome_stats()
+    return payload
+
+
+def build_model_ops_payload() -> dict[str, Any]:
+    return {
+        "targets": {target: build_model_ops_target_payload(target) for target in TARGET_CONFIG},
+        "training": get_training_status(),
+    }
+
+
 @APP.before_request
 def handle_options():  # type: ignore[no-untyped-def]
     if request.method == "OPTIONS":
@@ -4373,27 +4401,7 @@ def api_summary_feedback(article_id: int):
 
 @APP.get("/api/model-ops")
 def api_model_ops():
-    payload: dict[str, Any] = {"targets": {}, "training": get_training_status()}
-    for target in TARGET_CONFIG:
-        latest_run = attach_model_run_json_fields(latest_model_run(target))
-        previous_run = attach_model_run_json_fields(previous_model_run(target))
-        active_run = attach_model_run_json_fields(latest_model_run(target, include_rejected=False))
-        counts = latest_labels_count(target)
-        payload["targets"][target] = {
-            "latest_run": latest_run,
-            "previous_run": previous_run,
-            "active_run": active_run,
-            "label_counts": counts,
-            "new_labels_since_training": new_labels_since_training(
-                target,
-                active_run["trained_at"] if active_run else None,
-            ),
-            "retraining": retraining_recommendation(target, active_run),
-            "quality": model_quality_assessment(target, active_run),
-        }
-        if target == "feed_recommendation":
-            payload["targets"][target]["prediction_outcomes"] = feed_prediction_outcome_stats()
-    return jsonify(payload)
+    return jsonify(build_model_ops_payload())
 
 
 @APP.post("/api/legacy/import")
