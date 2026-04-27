@@ -134,6 +134,35 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(backend.decode_event_payload("not-json"), {})
         self.assertEqual(backend.decode_event_payload("[1, 2]"), {})
 
+    def test_app_state_codec_round_trips_json_values_and_defaults_invalid_rows(self):
+        encoded = backend.encode_app_state_value({"b": 2, "a": "ä", "enabled": True})
+
+        self.assertEqual(encoded, '{"a": "\\u00e4", "b": 2, "enabled": true}')
+        self.assertEqual(
+            backend.decode_app_state_value(encoded),
+            {"a": "ä", "b": 2, "enabled": True},
+        )
+        self.assertEqual(backend.decode_app_state_value(None, default="fallback"), "fallback")
+        self.assertEqual(backend.decode_app_state_value("not-json", default="fallback"), "fallback")
+
+    def test_app_state_store_helpers_upsert_fetch_and_default_invalid_values(self):
+        with backend.db_connection() as conn:
+            backend.upsert_app_state(conn, "test_state", {"count": 1})
+            self.assertEqual(backend.fetch_app_state(conn, "test_state"), {"count": 1})
+
+            backend.upsert_app_state(conn, "test_state", {"count": 2})
+            self.assertEqual(backend.fetch_app_state(conn, "test_state"), {"count": 2})
+
+            self.assertEqual(backend.fetch_app_state(conn, "missing_state", default="missing"), "missing")
+            conn.execute(
+                """
+                INSERT INTO app_state(key, value, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                ("invalid_state", "not-json", backend.utc_now_iso()),
+            )
+            self.assertEqual(backend.fetch_app_state(conn, "invalid_state", default="fallback"), "fallback")
+
     def test_summarize_endpoint_queues_article_and_wakes_worker(self):
         article_id = self.insert_article()
 

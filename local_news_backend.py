@@ -1336,29 +1336,47 @@ def import_legacy_preferences(raw_text: str, auto_train: bool = True) -> dict[st
     }
 
 
+def encode_app_state_value(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True)
+
+
+def decode_app_state_value(value: Any, default: Any = None) -> Any:
+    if value is None:
+        return default
+    try:
+        return json.loads(str(value))
+    except json.JSONDecodeError:
+        return default
+
+
+def upsert_app_state(conn: sqlite3.Connection, key: str, value: Any) -> None:
+    conn.execute(
+        """
+        INSERT INTO app_state(key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at
+        """,
+        (key, encode_app_state_value(value), utc_now_iso()),
+    )
+
+
+def fetch_app_state(conn: sqlite3.Connection, key: str, default: Any = None) -> Any:
+    row = conn.execute("SELECT value FROM app_state WHERE key = ?", (key,)).fetchone()
+    if not row:
+        return default
+    return decode_app_state_value(row["value"], default)
+
+
 def update_app_state(key: str, value: Any) -> None:
     with db_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO app_state(key, value, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                updated_at = excluded.updated_at
-            """,
-            (key, json.dumps(value), utc_now_iso()),
-        )
+        upsert_app_state(conn, key, value)
 
 
 def get_app_state(key: str, default: Any = None) -> Any:
     with db_connection() as conn:
-        row = conn.execute("SELECT value FROM app_state WHERE key = ?", (key,)).fetchone()
-    if not row:
-        return default
-    try:
-        return json.loads(row["value"])
-    except json.JSONDecodeError:
-        return default
+        return fetch_app_state(conn, key, default)
 
 
 def get_training_status() -> dict[str, Any]:
