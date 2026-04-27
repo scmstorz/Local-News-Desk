@@ -246,6 +246,43 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual([event["event_type"] for event in self.event_rows(article_id)], ["summary_generated"])
         self.assertTrue(self.event_payloads(article_id)[0]["extraction_fallback"])
 
+    def test_summary_payload_includes_prompt_rules_and_model_settings(self):
+        payload = backend.build_ollama_summary_payload(
+            "Article title",
+            "Article text",
+            model_name="summary-model",
+        )
+
+        self.assertEqual(payload["model"], "summary-model")
+        self.assertFalse(payload["stream"])
+        self.assertEqual(payload["options"]["temperature"], 0.2)
+        self.assertIn("ARTIKELTITEL:\nArticle title", payload["prompt"])
+        self.assertIn("ARTIKELTEXT:\nArticle text", payload["prompt"])
+        self.assertIn("wenn der Artikeltext nur Metadaten oder kurze Auszüge enthält", payload["prompt"])
+        self.assertIn('"summary": "..."', payload["prompt"])
+
+    def test_ollama_generate_summary_posts_payload_and_parses_response(self):
+        response = mock.Mock()
+        response.status_code = 200
+        response.json.return_value = {"response": '{"title": "Generated title", "summary": "Generated summary"}'}
+
+        with mock.patch("local_news_backend.requests.post", return_value=response) as post:
+            title, summary = backend.ollama_generate_summary(
+                "Article title",
+                "Article text",
+                model_name="summary-model",
+                timeout_seconds=123,
+            )
+
+        self.assertEqual(title, "Generated title")
+        self.assertEqual(summary, "Generated summary")
+        post.assert_called_once()
+        self.assertEqual(post.call_args.args[0], f"{backend.OLLAMA_BASE_URL}/api/generate")
+        self.assertEqual(post.call_args.kwargs["timeout"], 123)
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "summary-model")
+        self.assertIn("Article title", post.call_args.kwargs["json"]["prompt"])
+        response.raise_for_status.assert_called_once_with()
+
     def test_article_fetch_url_candidates_decode_and_skip_source_homepage(self):
         article = {
             "link_to_article": "https://news.google.com/rss/articles/token",

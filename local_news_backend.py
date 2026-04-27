@@ -2225,13 +2225,8 @@ def run_compare_summaries(
     clear_compare_progress()
 
 
-def ollama_generate_summary(
-    article_title: str,
-    article_text: str,
-    model_name: Optional[str] = None,
-    timeout_seconds: Optional[int] = None,
-) -> tuple[str, str]:
-    prompt = f"""
+def build_summary_prompt(article_title: str, article_text: str) -> str:
+    return f"""
 Du bist ein präziser Nachrichtenassistent.
 Erzeuge einen deutschen Titel und eine deutsche Zusammenfassung.
 
@@ -2257,20 +2252,37 @@ ARTIKELTEXT:
 {article_text}
 """.strip()
 
+
+def build_ollama_summary_payload(
+    article_title: str,
+    article_text: str,
+    model_name: Optional[str] = None,
+) -> dict[str, Any]:
+    return {
+        "model": model_name or OLLAMA_MODEL,
+        "prompt": build_summary_prompt(article_title, article_text),
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+        },
+    }
+
+
+def ollama_generate_summary(
+    article_title: str,
+    article_text: str,
+    model_name: Optional[str] = None,
+    timeout_seconds: Optional[int] = None,
+) -> tuple[str, str]:
+    payload = build_ollama_summary_payload(article_title, article_text, model_name=model_name)
+
     # Only one Ollama generation may run at a time. Large local models will
     # otherwise compete for RAM/VRAM and trigger slowdowns or timeouts.
     with STATE.ollama_lock:
         response = requests.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             timeout=timeout_seconds or get_summary_timeout_seconds(),
-            json={
-                "model": model_name or OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.2,
-                },
-            },
+            json=payload,
         )
     response.raise_for_status()
     body = response.json()
