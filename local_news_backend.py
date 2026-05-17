@@ -326,6 +326,8 @@ TARGET_CONFIG = {
     },
 }
 
+FEED_RECOMMENDED_MIN_PROBABILITY = 0.9
+
 
 class RuntimeState:
     def __init__(self) -> None:
@@ -2517,20 +2519,30 @@ def build_threshold_feed_prediction(
     )
 
 
-def build_cached_feed_prediction(item: dict[str, Any], run_id: int, maybe_threshold: Optional[float] = None) -> Optional[dict[str, Any]]:
+def effective_feed_recommended_threshold(artifact: dict[str, Any]) -> float:
+    raw_threshold = artifact.get("high_precision_threshold", artifact.get("threshold", 0.5))
+    return max(float(raw_threshold), FEED_RECOMMENDED_MIN_PROBABILITY)
+
+
+def build_cached_feed_prediction(
+    item: dict[str, Any],
+    run_id: int,
+    maybe_threshold: Optional[float] = None,
+    recommended_threshold: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
     probability = item.get("predicted_probability")
-    recommendation = item.get("predicted_recommendation")
     if item.get("prediction_model_run_id") != run_id:
         return None
-    if probability is None or recommendation is None:
+    if probability is None:
         return None
+    threshold = max(float(recommended_threshold or 0.0), FEED_RECOMMENDED_MIN_PROBABILITY)
     maybe = False
     if maybe_threshold is not None:
         try:
             maybe = float(probability) >= float(maybe_threshold)
         except (TypeError, ValueError):
-            maybe = bool(recommendation)
-    return build_feed_prediction(bool(recommendation), bool(maybe), float(probability), run_id)
+            maybe = float(probability) >= threshold
+    return build_feed_prediction(float(probability) >= threshold, bool(maybe), float(probability), run_id)
 
 
 def predict_feed_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[list[dict[str, Any]], Optional[int]]:
@@ -2549,8 +2561,14 @@ def predict_feed_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[list[di
     pipeline: Pipeline = artifact["pipeline"]
     items = [row if isinstance(row, dict) else row_to_dict(row) for row in rows]
     stale_items: list[dict[str, Any]] = []
+    recommended_threshold = effective_feed_recommended_threshold(artifact)
     for item in items:
-        cached_prediction = build_cached_feed_prediction(item, artifact["run_id"], artifact.get("maybe_threshold"))
+        cached_prediction = build_cached_feed_prediction(
+            item,
+            artifact["run_id"],
+            artifact.get("maybe_threshold"),
+            recommended_threshold,
+        )
         if cached_prediction is not None:
             item["prediction"] = cached_prediction
         else:
@@ -2562,7 +2580,7 @@ def predict_feed_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[list[di
         for item, probability in zip(stale_items, probabilities):
             item["prediction"] = build_threshold_feed_prediction(
                 float(probability),
-                float(artifact["threshold"]),
+                recommended_threshold,
                 float(artifact.get("maybe_threshold", artifact["threshold"])),
                 int(artifact["run_id"]),
             )
@@ -2576,14 +2594,20 @@ def compute_feed_prediction_snapshot(row: sqlite3.Row | dict[str, Any]) -> Optio
         return None
 
     item = row if isinstance(row, dict) else row_to_dict(row)
-    cached_prediction = build_cached_feed_prediction(item, artifact["run_id"], artifact.get("maybe_threshold"))
+    recommended_threshold = effective_feed_recommended_threshold(artifact)
+    cached_prediction = build_cached_feed_prediction(
+        item,
+        artifact["run_id"],
+        artifact.get("maybe_threshold"),
+        recommended_threshold,
+    )
     if cached_prediction is None:
         pipeline: Pipeline = artifact["pipeline"]
         feature = build_feature_text("feed_recommendation", item)
         probability = float(pipeline.predict_proba([feature])[0][1])
         cached_prediction = build_threshold_feed_prediction(
             probability,
-            float(artifact["threshold"]),
+            recommended_threshold,
             float(artifact.get("maybe_threshold", artifact["threshold"])),
             int(artifact["run_id"]),
         )
@@ -2594,7 +2618,7 @@ def compute_feed_prediction_snapshot(row: sqlite3.Row | dict[str, Any]) -> Optio
         "predicted_recommendation": bool(cached_prediction["recommended"]),
         "predicted_maybe": bool(cached_prediction.get("maybe")),
         "predicted_tier": cached_prediction.get("tier"),
-        "threshold": round(float(artifact["threshold"]), 4),
+        "threshold": round(recommended_threshold, 4),
         "maybe_threshold": round(float(artifact.get("maybe_threshold", artifact["threshold"])), 4),
     }
 
@@ -3549,12 +3573,17 @@ def select_feed_threshold(labels: list[int], probabilities: list[float]) -> tupl
     if not probabilities:
         return 0.5, 0.35, {
             "strategy": "fixed_default",
-            "objective": "precision_first_two_stage",
+            "objective": "zero_false_positive_recommended",
             "candidate_count": 1,
             "beta": 0.5,
         }
 
-    candidate_thresholds = sorted({round(float(probability), 6) for probability in probabilities} | {0.5})
+    probability_values = [float(probability) for probability in probabilities]
+    candidate_thresholds = sorted(
+        {round(probability, 6) for probability in probability_values}
+        | {round(min(1.0001, probability + 0.0001), 6) for probability in probability_values}
+        | {0.5, FEED_RECOMMENDED_MIN_PROBABILITY}
+    )
     baseline_predicted = [1 if probability >= 0.5 else 0 for probability in probabilities]
     baseline_precision = float(precision_score(labels, baseline_predicted, zero_division=0))
     baseline_recall = float(recall_score(labels, baseline_predicted, zero_division=0))
@@ -3576,25 +3605,46 @@ def select_feed_threshold(labels: list[int], probabilities: list[float]) -> tupl
             eligible_snapshots.append(snapshot)
 
     chosen_snapshot = max(eligible_snapshots or fallback_snapshots)
-    best_fbeta, best_precision, best_recall, _distance_bias, best_threshold = chosen_snapshot
+    balanced_fbeta, balanced_precision, balanced_recall, _distance_bias, balanced_threshold = chosen_snapshot
+
+    zero_false_positive_snapshots: list[tuple[int, float, float, float]] = []
+    for threshold in candidate_thresholds:
+        predicted = [1 if probability >= threshold else 0 for probability in probabilities]
+        true_positives = sum(1 for label, prediction in zip(labels, predicted) if label == 1 and prediction == 1)
+        false_positives = sum(1 for label, prediction in zip(labels, predicted) if label == 0 and prediction == 1)
+        predicted_count = sum(predicted)
+        if predicted_count > 0 and false_positives == 0:
+            recall = float(recall_score(labels, predicted, zero_division=0))
+            zero_false_positive_snapshots.append((true_positives, recall, -threshold, threshold))
+
+    if zero_false_positive_snapshots:
+        _true_positives, high_precision_recall, _negative_threshold, best_threshold = max(zero_false_positive_snapshots)
+        high_precision_predicted = [1 if probability >= best_threshold else 0 for probability in probabilities]
+        best_precision = float(precision_score(labels, high_precision_predicted, zero_division=0))
+    else:
+        best_threshold = round(min(1.0001, max(probability_values) + 0.0001), 6)
+    best_threshold = max(best_threshold, FEED_RECOMMENDED_MIN_PROBABILITY)
+    high_precision_predicted = [1 if probability >= best_threshold else 0 for probability in probabilities]
+    best_precision = float(precision_score(labels, high_precision_predicted, zero_division=0))
+    high_precision_recall = float(recall_score(labels, high_precision_predicted, zero_division=0))
 
     maybe_beta = 1.0
-    maybe_precision_floor = max(0.16, best_precision * 0.72)
-    maybe_recall_floor = max(best_recall, baseline_recall * 0.95)
+    maybe_precision_floor = max(0.16, balanced_precision * 0.72)
+    maybe_recall_floor = max(balanced_recall, baseline_recall * 0.95)
     maybe_candidates: list[tuple[float, float, float, float, float]] = []
     for threshold in candidate_thresholds:
-        if threshold > best_threshold:
+        if threshold > balanced_threshold:
             continue
         predicted = [1 if probability >= threshold else 0 for probability in probabilities]
         precision = float(precision_score(labels, predicted, zero_division=0))
         recall = float(recall_score(labels, predicted, zero_division=0))
         fbeta = float(fbeta_score(labels, predicted, beta=maybe_beta, zero_division=0))
         if precision >= maybe_precision_floor and recall >= maybe_recall_floor:
-            maybe_candidates.append((fbeta, recall, precision, -abs(threshold - (best_threshold - 0.08)), threshold))
+            maybe_candidates.append((fbeta, recall, precision, -abs(threshold - (balanced_threshold - 0.08)), threshold))
     if maybe_candidates:
         _maybe_fbeta, maybe_recall, maybe_precision, _bias, maybe_threshold = max(maybe_candidates)
     else:
-        maybe_threshold = max(0.0, round(best_threshold - 0.10, 4))
+        maybe_threshold = max(0.0, round(balanced_threshold - 0.10, 4))
         maybe_predicted = [1 if probability >= maybe_threshold else 0 for probability in probabilities]
         maybe_precision = float(precision_score(labels, maybe_predicted, zero_division=0))
         maybe_recall = float(recall_score(labels, maybe_predicted, zero_division=0))
@@ -3603,16 +3653,21 @@ def select_feed_threshold(labels: list[int], probabilities: list[float]) -> tupl
 
     return round(float(best_threshold), 4), maybe_threshold, {
         "strategy": "auto_tuned",
-        "objective": "precision_first_two_stage",
+        "objective": "zero_false_positive_recommended",
         "candidate_count": len(candidate_thresholds),
         "beta": beta,
         "baseline_precision": round(baseline_precision, 4),
         "baseline_recall": round(baseline_recall, 4),
         "precision_floor": round(precision_floor, 4),
         "recall_floor": round(recall_floor, 4),
-        "best_fbeta": round(best_fbeta, 4),
+        "balanced_threshold": round(balanced_threshold, 4),
+        "balanced_fbeta": round(balanced_fbeta, 4),
+        "balanced_precision": round(balanced_precision, 4),
+        "balanced_recall": round(balanced_recall, 4),
         "best_precision": round(best_precision, 4),
-        "best_recall": round(best_recall, 4),
+        "best_recall": round(high_precision_recall, 4),
+        "zero_false_positive_threshold_found": bool(zero_false_positive_snapshots),
+        "minimum_recommended_probability": FEED_RECOMMENDED_MIN_PROBABILITY,
         "used_precision_floor": bool(eligible_snapshots),
         "maybe_threshold": maybe_threshold,
         "maybe_precision": round(maybe_precision, 4),
@@ -3650,6 +3705,13 @@ def should_promote_model(
     candidate_recall = float(candidate_metrics.get("recall", 0.0))
     candidate_p20 = float((candidate_notes or {}).get("precision_at_k", {}).get("20", {}).get("value") or 0.0)
     active_p20 = float((active_notes or {}).get("precision_at_k", {}).get("20", {}).get("value") or 0.0)
+
+    if candidate_precision >= 0.95 and candidate_recall > 0:
+        return True, {
+            "decision": "promote",
+            "reason": "high_precision_feed_objective_met",
+            "champion_run_id": current_active_run["id"],
+        }
 
     if candidate_precision >= active_precision + 0.02 and candidate_f1 >= active_f1 - 0.01:
         return True, {
@@ -3851,6 +3913,7 @@ def train_model(target: str) -> dict[str, Any]:
         "run_id": run_id,
         "trained_at": trained_at,
         "threshold": threshold_value,
+        "high_precision_threshold": threshold_value,
         "maybe_threshold": maybe_threshold_value,
         "pipeline": pipeline,
     }

@@ -1240,6 +1240,48 @@ class LocalNewsRegressionTests(unittest.TestCase):
             },
         )
 
+    def test_cached_feed_prediction_reinterprets_old_recommendations_conservatively(self):
+        item = {
+            "prediction_model_run_id": 42,
+            "predicted_probability": 0.72,
+            "predicted_recommendation": 1,
+        }
+
+        prediction = backend.build_cached_feed_prediction(
+            item,
+            run_id=42,
+            maybe_threshold=0.5,
+            recommended_threshold=0.9,
+        )
+
+        self.assertEqual(prediction["tier"], "maybe")
+        self.assertFalse(prediction["recommended"])
+        self.assertTrue(prediction["maybe"])
+
+    def test_select_feed_threshold_prefers_zero_false_positive_recommended_tier(self):
+        labels = [0, 1, 0, 1, 0, 1]
+        probabilities = [0.95, 0.94, 0.9, 0.82, 0.7, 0.65]
+
+        threshold, maybe_threshold, notes = backend.select_feed_threshold(labels, probabilities)
+        predicted = [1 if probability >= threshold else 0 for probability in probabilities]
+        false_positives = sum(1 for label, prediction in zip(labels, predicted) if label == 0 and prediction == 1)
+
+        self.assertEqual(false_positives, 0)
+        self.assertGreaterEqual(threshold, max(probability for label, probability in zip(labels, probabilities) if label == 0))
+        self.assertLessEqual(maybe_threshold, threshold)
+        self.assertEqual(notes["objective"], "zero_false_positive_recommended")
+
+    def test_feed_model_promotion_accepts_high_precision_even_with_lower_f1(self):
+        promote, notes = backend.should_promote_model(
+            "feed_recommendation",
+            {"precision": 1.0, "recall": 0.05, "f1": 0.095},
+            {},
+            {"id": 8, "precision": 0.27, "recall": 0.31, "f1": 0.29, "notes": "{}"},
+        )
+
+        self.assertTrue(promote)
+        self.assertEqual(notes["reason"], "high_precision_feed_objective_met")
+
     def test_embedding_input_preserves_unicode_title_fallback(self):
         article = {
             "title": "Сэм Альтман: «Хатоларимиз учун аҳолидан чуқур узр сўрайман» - Zamin.uz"
