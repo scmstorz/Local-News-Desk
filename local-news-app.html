@@ -778,6 +778,8 @@
         }
 
         const API_BASE = resolveApiBase();
+        const API_TIMEOUT_MS = 15000;
+        const FEED_MUTATION_CHAIN_TIMEOUT_MS = 20000;
         const state = {
             screen: 'feed',
             feedMode: 'all',
@@ -844,19 +846,37 @@
             }
         }
 
-        async function api(path, options = {}) {
-            const response = await fetch(`${API_BASE}${path}`, {
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                ...options,
+        function timeoutAfter(ms, message) {
+            return new Promise((_, reject) => {
+                window.setTimeout(() => reject(new Error(message)), ms);
             });
-            const body = await response.json().catch(() => ({}));
-            if (!response.ok) {
-                const message = body.message || `HTTP ${response.status}`;
-                throw new Error(message);
+        }
+
+        async function api(path, options = {}) {
+            const controller = new AbortController();
+            const timeoutHandle = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+            try {
+                const response = await fetch(`${API_BASE}${path}`, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    signal: controller.signal,
+                    ...options,
+                }).catch(error => {
+                    if (error.name === 'AbortError') {
+                        throw new Error('Backend-Anfrage hat zu lange gedauert. Bitte Feed neu laden.');
+                    }
+                    throw error;
+                });
+                const body = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    const message = body.message || `HTTP ${response.status}`;
+                    throw new Error(message);
+                }
+                return body;
+            } finally {
+                window.clearTimeout(timeoutHandle);
             }
-            return body;
         }
 
         function formatRelativeTime(isoString) {
@@ -1406,6 +1426,10 @@ Die Markdown-Datei ist attached.`;
         }
 
         function queueFeedMutation(task) {
+            const previous = Promise.race([
+                state.feedMutationChain,
+                timeoutAfter(FEED_MUTATION_CHAIN_TIMEOUT_MS, 'Vorherige Feed-Aktion hängt. Starte neue Aktion trotzdem.'),
+            ]);
             const runner = async () => {
                 try {
                     await task();
@@ -1415,7 +1439,7 @@ Die Markdown-Datei ist attached.`;
                     await loadFeed(false);
                 }
             };
-            state.feedMutationChain = state.feedMutationChain.then(runner, runner);
+            state.feedMutationChain = previous.then(runner, runner);
             return state.feedMutationChain;
         }
 
@@ -1765,8 +1789,8 @@ Die Markdown-Datei ist attached.`;
             }
             const wasViewingHistory = state.feedHistoryIndex >= 0;
             pushFeedHistoryItem(item, 'summarize');
-            state.lastFeedActionStatus = `Summary vorgemerkt: ${item.title}`;
-            showToast('Summary vorgemerkt.', 'info');
+            state.lastFeedActionStatus = `Summary wird vorgemerkt: ${item.title}`;
+            showToast('Summary wird vorgemerkt …', 'info');
             if (!wasViewingHistory) {
                 removeOnlyCurrentFeedItem(item);
                 switchEmptyFeedModeToAll();
@@ -1777,10 +1801,11 @@ Die Markdown-Datei ist attached.`;
             queueFeedMutation(async () => {
                 const result = await api(`/articles/${item.id}/summarize`, { method: 'POST' });
                 removeCurrentAndSimilarFeedItems(item, result.deduplicated_count);
+                state.lastFeedActionStatus = `Summary vorgemerkt: ${item.title}`;
                 const duplicateText = result.deduplicated_count
                     ? ` ${result.deduplicated_count} ähnliche Meldung${result.deduplicated_count > 1 ? 'en wurden' : ' wurde'} ebenfalls aus dem Feed entfernt.`
                     : '';
-                showToast(`Summary läuft im Hintergrund.${duplicateText}`, 'info');
+                showToast(`Summary vorgemerkt. Läuft im Hintergrund.${duplicateText}`, 'info');
                 switchEmptyFeedModeToAll();
                 if (state.screen === 'feed') {
                     renderFeedScreen();

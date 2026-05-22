@@ -92,11 +92,12 @@ class LocalNewsRegressionTests(unittest.TestCase):
     def event_payloads(self, article_id):
         return [backend.decode_event_payload(event["event_payload"]) for event in self.event_rows(article_id)]
 
-    def store_embedding(self, article_id, input_hash=None, model=None):
+    def store_embedding(self, article_id, input_hash=None, model=None, vector=None):
         now = backend.utc_now_iso()
         article = self.article_row(article_id)
         input_hash = input_hash if input_hash is not None else backend.build_embedding_input_hash(article)
         model = model if model is not None else backend.get_embedding_model()
+        vector = vector if vector is not None else [0.1, 0.2]
         with backend.db_connection() as conn:
             conn.execute(
                 """
@@ -111,7 +112,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
                     generated_at = excluded.generated_at,
                     updated_at = excluded.updated_at
                 """,
-                (article_id, model, input_hash, backend.encode_embedding_vector([0.1, 0.2]), now, now),
+                (article_id, model, input_hash, backend.encode_embedding_vector(vector), now, now),
             )
 
     def test_event_payload_codec_handles_empty_invalid_and_non_object_values(self):
@@ -1060,6 +1061,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
             predicted_probability=0.2,
             prediction_model_run_id=run_id,
         )
+        self.store_embedding(recommended_id)
 
         recommended_response = self.client.get("/api/feed?mode=recommended")
         maybe_response = self.client.get("/api/feed?mode=maybe")
@@ -1096,7 +1098,7 @@ class LocalNewsRegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             [row["id"] for row in backend.filter_predicted_feed_rows(rows, "maybe_plus")],
-            [1, 2],
+            [2, 1],
         )
         self.assertEqual(
             [row["id"] for row in backend.filter_predicted_feed_rows(rows, "all")],
@@ -1119,6 +1121,31 @@ class LocalNewsRegressionTests(unittest.TestCase):
                 "similar_hidden_count": 0,
             },
         )
+
+    def test_update_feed_similarity_snapshot_uses_limited_snapshot_for_large_inbox(self):
+        rows = [
+            {
+                "id": 10,
+                "title": "First limited article",
+                "published_at": "2026-04-27T10:00:00+00:00",
+            },
+            {
+                "id": 9,
+                "title": "Second limited article",
+                "published_at": "2026-04-27T09:00:00+00:00",
+            },
+        ]
+        with mock.patch("local_news_backend.FEED_SIMILARITY_FULL_CLUSTER_LIMIT", 1), mock.patch(
+            "local_news_backend.FEED_API_ITEM_LIMIT", 2
+        ), mock.patch("local_news_backend.count_rows", return_value=42), mock.patch(
+            "local_news_backend.fetch_pending_feed_articles", return_value=rows
+        ), mock.patch("local_news_backend.build_feed_similarity_snapshot") as build_full:
+            snapshot = backend.update_feed_similarity_snapshot()
+
+        build_full.assert_not_called()
+        self.assertTrue(snapshot["limited"])
+        self.assertEqual(snapshot["pending_total"], 42)
+        self.assertEqual(snapshot["visible_article_ids"], [10, 9])
 
     def test_load_feed_rows_for_api_uses_snapshot_rows_when_available(self):
         rows = [{"id": 1, "title": "Visible row"}]
@@ -1153,6 +1180,21 @@ class LocalNewsRegressionTests(unittest.TestCase):
         )
         ensure_snapshot.assert_called_once_with()
 
+    def test_load_feed_rows_for_api_limits_fallback_rows_but_preserves_pending_total(self):
+        for index in range(3):
+            self.insert_article(guid=f"limited-{index}", title=f"Limited feed article {index}")
+
+        with mock.patch("local_news_backend.FEED_API_ITEM_LIMIT", 2), mock.patch(
+            "local_news_backend.current_feed_similarity_snapshot", return_value={}
+        ), mock.patch(
+            "local_news_backend.fetch_visible_pending_feed_articles_from_snapshot", return_value=[]
+        ), mock.patch("local_news_backend.ensure_feed_similarity_snapshot_async"):
+            rows, similarity = backend.load_feed_rows_for_api()
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(similarity["pending_total"], 3)
+        self.assertEqual(similarity["visible_total"], 2)
+
     def test_build_feed_api_payload_filters_and_serializes_items(self):
         rows = [
             {
@@ -1184,6 +1226,8 @@ class LocalNewsRegressionTests(unittest.TestCase):
             "local_news_backend.load_feed_rows_for_api",
             return_value=(rows, {"similar_group_count": 2, "similar_hidden_count": 3}),
         ), mock.patch("local_news_backend.predict_feed_rows", return_value=(predicted_rows, 42)), mock.patch(
+            "local_news_backend.apply_feed_embedding_similarity_gate", side_effect=lambda rows: rows
+        ), mock.patch(
             "local_news_backend.update_cached_feed_predictions"
         ) as update_predictions:
             payload = backend.build_feed_api_payload("recommended")
@@ -1195,7 +1239,432 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(payload["counts"]["maybe_pending"], 1)
         self.assertEqual(payload["counts"]["similar_group_count"], 2)
         self.assertEqual(payload["counts"]["similar_hidden_count"], 3)
+        self.assertEqual(payload["counts"]["gate_demotions"]["total"], 0)
         update_predictions.assert_called_once_with(predicted_rows, 42)
+
+    def test_stale_recommended_prediction_cache_is_reset_below_hard_threshold(self):
+        stale_id = self.insert_article(
+            guid="stale-rec",
+            predicted_recommendation=1,
+            predicted_probability=0.72,
+            prediction_model_run_id=42,
+        )
+        strong_id = self.insert_article(
+            guid="strong-rec",
+            predicted_recommendation=1,
+            predicted_probability=0.93,
+            prediction_model_run_id=42,
+        )
+
+        changed = backend.reset_stale_recommended_prediction_cache()
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(self.article_row(stale_id)["predicted_recommendation"], 0)
+        self.assertEqual(self.article_row(strong_id)["predicted_recommendation"], 1)
+
+    def test_source_quality_gate_demotes_poor_historical_sources_to_maybe(self):
+        source_stats = {
+            "low.example": {"total": 8, "positives": 0, "raw_precision": 0.0, "precision": 0.09},
+            "good.example": {"total": 8, "positives": 6, "raw_precision": 0.75, "precision": 0.465},
+        }
+        rows = [
+            {
+                "id": 1,
+                "source_label": "low.example",
+                "prediction": {
+                    "available": True,
+                    "recommended": True,
+                    "maybe": True,
+                    "tier": "recommended",
+                    "probability": 0.96,
+                    "run_id": 42,
+                },
+            },
+            {
+                "id": 2,
+                "source_label": "good.example",
+                "prediction": {
+                    "available": True,
+                    "recommended": True,
+                    "maybe": True,
+                    "tier": "recommended",
+                    "probability": 0.96,
+                    "run_id": 42,
+                },
+            },
+            {
+                "id": 3,
+                "source_label": "new.example",
+                "prediction": {
+                    "available": True,
+                    "recommended": True,
+                    "maybe": True,
+                    "tier": "recommended",
+                    "probability": 0.96,
+                    "run_id": 42,
+                },
+            },
+        ]
+
+        gated = backend.apply_feed_source_quality_gate(rows, source_stats)
+
+        self.assertFalse(gated[0]["prediction"]["recommended"])
+        self.assertTrue(gated[0]["prediction"]["maybe"])
+        self.assertEqual(gated[0]["prediction"]["tier"], "maybe")
+        self.assertEqual(gated[0]["prediction"]["recommended_gate"]["reason"], "source_precision_below_recommended_floor")
+        self.assertTrue(gated[1]["prediction"]["recommended"])
+        self.assertTrue(gated[2]["prediction"]["recommended"])
+
+    def test_bayesian_source_precision_smooths_small_source_samples(self):
+        self.assertAlmostEqual(
+            backend.bayesian_feed_source_precision(0, 1),
+            (backend.FEED_SOURCE_BAYESIAN_PRIOR_TOTAL * backend.FEED_SOURCE_BAYESIAN_PRIOR_PRECISION)
+            / (backend.FEED_SOURCE_BAYESIAN_PRIOR_TOTAL + 1),
+        )
+        self.assertLess(backend.bayesian_feed_source_precision(1, 1), 0.4)
+        self.assertGreater(backend.bayesian_feed_source_precision(8, 10), 0.4)
+
+    def test_negative_pattern_gate_demotes_common_false_positive_titles(self):
+        rows = [
+            {
+                "id": 1,
+                "title": "OpenAI IPO talks send Wall Street stocks higher",
+                "source_label": "example.com",
+                "source_feed": "test-feed",
+                "prediction": {
+                    "recommended": True,
+                    "maybe": True,
+                    "tier": "recommended",
+                    "probability": 0.97,
+                    "recommended_gate": {"source_allowed": True},
+                },
+            },
+            {
+                "id": 2,
+                "title": "OpenAI releases a new agent safety evaluation",
+                "source_label": "example.com",
+                "source_feed": "test-feed",
+                "prediction": {
+                    "recommended": True,
+                    "maybe": True,
+                    "tier": "recommended",
+                    "probability": 0.97,
+                    "recommended_gate": {"source_allowed": True},
+                },
+            },
+        ]
+
+        gated = backend.apply_feed_negative_pattern_gate(rows)
+
+        self.assertFalse(gated[0]["prediction"]["recommended"])
+        self.assertEqual(gated[0]["prediction"]["tier"], "maybe")
+        self.assertEqual(gated[0]["prediction"]["recommended_gate"]["negative_pattern"], "finance_market_noise")
+        self.assertTrue(gated[1]["prediction"]["recommended"])
+
+    def test_feed_gate_demotion_stats_count_reasons_by_category(self):
+        rows = [
+            {"prediction": {"recommended_gate": {"reason": "source_precision_below_recommended_floor"}}},
+            {"prediction": {"recommended_gate": {"reason": "negative_pattern_finance_market_noise"}}},
+            {"prediction": {"recommended_gate": {"reason": "embedding_missing"}}},
+            {"prediction": {"recommended_gate": {"reason": "embedding_similarity_below_recommended_floor"}}},
+            {"prediction": {"recommended_gate": {"reason": "outside_recommended_top_k"}}},
+            {"prediction": {"recommended_gate": {"reason": "unknown_reason"}}},
+            {"prediction": {"recommended_gate": {}}},
+        ]
+
+        stats = backend.feed_gate_demotion_stats(rows)
+
+        self.assertEqual(
+            stats,
+            {
+                "source": 1,
+                "negative_pattern": 1,
+                "embedding_missing": 1,
+                "embedding_similarity": 1,
+                "top_k": 1,
+                "other": 1,
+                "total": 6,
+            },
+        )
+
+    def test_embedding_gate_demotes_recommended_article_without_embedding(self):
+        rows = [
+            {
+                "id": 1,
+                "prediction": {
+                    "recommended": True,
+                    "maybe": True,
+                    "tier": "recommended",
+                    "probability": 0.97,
+                    "recommended_gate": {"source_allowed": True},
+                },
+            }
+        ]
+
+        gated = backend.apply_feed_embedding_similarity_gate(
+            rows,
+            {"positive": [[1.0, 0.0]], "negative": [[0.0, 1.0]]},
+        )
+
+        self.assertFalse(gated[0]["prediction"]["recommended"])
+        self.assertEqual(gated[0]["prediction"]["tier"], "maybe")
+        self.assertEqual(gated[0]["prediction"]["recommended_gate"]["reason"], "embedding_missing")
+
+    def test_embedding_gate_keeps_article_closer_to_positive_than_negative_examples(self):
+        article_id = self.insert_article(guid="embedding-positive", title="Relevant AI agent article")
+        self.store_embedding(article_id, vector=[1.0, 0.0])
+        rows = [
+            {
+                "id": article_id,
+                "prediction": {
+                    "recommended": True,
+                    "maybe": True,
+                    "tier": "recommended",
+                    "probability": 0.97,
+                    "recommended_gate": {"source_allowed": True},
+                },
+            }
+        ]
+
+        gated = backend.apply_feed_embedding_similarity_gate(
+            rows,
+            {"positive": [[1.0, 0.0]], "negative": [[0.0, 1.0]]},
+        )
+
+        self.assertTrue(gated[0]["prediction"]["recommended"])
+        self.assertEqual(gated[0]["prediction"]["recommended_gate"]["embedding"]["net_similarity"], 1.0)
+
+    def test_embedding_gate_demotes_article_closer_to_negative_examples(self):
+        article_id = self.insert_article(guid="embedding-negative", title="Irrelevant market article")
+        self.store_embedding(article_id, vector=[0.0, 1.0])
+        rows = [
+            {
+                "id": article_id,
+                "prediction": {
+                    "recommended": True,
+                    "maybe": True,
+                    "tier": "recommended",
+                    "probability": 0.97,
+                    "recommended_gate": {"source_allowed": True},
+                },
+            }
+        ]
+
+        gated = backend.apply_feed_embedding_similarity_gate(
+            rows,
+            {"positive": [[1.0, 0.0]], "negative": [[0.0, 1.0]]},
+        )
+
+        self.assertFalse(gated[0]["prediction"]["recommended"])
+        self.assertEqual(
+            gated[0]["prediction"]["recommended_gate"]["reason"],
+            "embedding_similarity_below_recommended_floor",
+        )
+        self.assertLess(gated[0]["prediction"]["recommended_gate"]["embedding"]["net_similarity"], 0)
+
+    def test_recommended_top_k_demotes_lower_ranked_candidates_to_maybe(self):
+        rows = [
+            {
+                "id": 1,
+                "prediction": {
+                    "recommended": True,
+                    "maybe": True,
+                    "tier": "recommended",
+                    "probability": 0.91,
+                    "recommended_gate": {"source_precision": 0.8},
+                },
+            },
+            {
+                "id": 2,
+                "prediction": {
+                    "recommended": True,
+                    "maybe": True,
+                    "tier": "recommended",
+                    "probability": 0.99,
+                    "recommended_gate": {"source_precision": 0.2},
+                },
+            },
+            {
+                "id": 3,
+                "prediction": {
+                    "recommended": True,
+                    "maybe": True,
+                    "tier": "recommended",
+                    "probability": 0.93,
+                    "recommended_gate": {"source_precision": 0.5},
+                },
+            },
+        ]
+
+        gated = backend.apply_feed_recommended_top_k(rows, top_k=2)
+
+        recommended_ids = [row["id"] for row in gated if row["prediction"]["recommended"]]
+        maybe_ids = [row["id"] for row in gated if row["prediction"]["tier"] == "maybe"]
+        self.assertEqual(recommended_ids, [2, 3])
+        self.assertEqual(maybe_ids, [1])
+        self.assertEqual(gated[0]["prediction"]["recommended_gate"]["reason"], "outside_recommended_top_k")
+
+    def test_maybe_feed_rows_are_sorted_by_quality_signal(self):
+        rows = [
+            {
+                "id": 1,
+                "published_at": "2026-04-27T10:00:00+00:00",
+                "prediction": {
+                    "recommended": False,
+                    "tier": "maybe",
+                    "probability": 0.80,
+                    "recommended_gate": {"reason": "embedding_missing"},
+                },
+            },
+            {
+                "id": 2,
+                "published_at": "2026-04-27T09:00:00+00:00",
+                "prediction": {
+                    "recommended": False,
+                    "tier": "maybe",
+                    "probability": 0.70,
+                    "recommended_gate": {
+                        "reason": "outside_recommended_top_k",
+                        "source_precision": 0.6,
+                        "embedding": {"net_similarity": 0.4},
+                    },
+                },
+            },
+            {
+                "id": 3,
+                "published_at": "2026-04-27T11:00:00+00:00",
+                "prediction": {
+                    "recommended": False,
+                    "tier": "maybe",
+                    "probability": 0.75,
+                    "recommended_gate": {"reason": "negative_pattern_finance_market_noise"},
+                },
+            },
+        ]
+
+        filtered = backend.filter_predicted_feed_rows(rows, "maybe")
+
+        self.assertEqual([row["id"] for row in filtered], [2, 1, 3])
+
+    def test_archive_exact_pending_title_duplicates_keeps_newest_canonical(self):
+        older_id = self.insert_article(
+            guid="exact-old",
+            title="Same Headline - Example",
+            published_at="2026-04-27T09:00:00+00:00",
+        )
+        newest_id = self.insert_article(
+            guid="exact-new",
+            title="Same Headline - Example",
+            published_at="2026-04-27T10:00:00+00:00",
+        )
+        unique_id = self.insert_article(guid="exact-unique", title="Different Headline")
+
+        with backend.db_connection() as conn:
+            result = backend.archive_exact_pending_title_duplicates(conn)
+
+        self.assertEqual(result["archived_count"], 1)
+        self.assertEqual(self.article_row(newest_id)["feed_decision"], "pending")
+        self.assertEqual(self.article_row(unique_id)["feed_decision"], "pending")
+        self.assertEqual(self.article_row(older_id)["feed_decision"], "archived")
+        events = self.event_rows(older_id)
+        self.assertEqual([event["event_type"] for event in events], ["feed_exact_title_deduplicated"])
+        self.assertEqual(self.event_payloads(older_id)[0]["canonical_article_id"], newest_id)
+
+    def test_deduplicate_current_pending_feed_reports_exact_title_archives(self):
+        self.insert_article(
+            guid="manual-exact-old",
+            title="Repeated Headline - Example",
+            published_at="2026-04-27T09:00:00+00:00",
+        )
+        self.insert_article(
+            guid="manual-exact-new",
+            title="Repeated Headline - Example",
+            published_at="2026-04-27T10:00:00+00:00",
+        )
+
+        with mock.patch("local_news_backend.ensure_feed_similarity_snapshot_async"):
+            result = backend.deduplicate_current_pending_feed()
+
+        self.assertEqual(result["archived_count"], 1)
+        self.assertEqual(result["exact_archived_count"], 1)
+        self.assertEqual(result["similar_archived_count"], 0)
+        self.assertEqual(result["before_pending"], 2)
+        self.assertEqual(result["after_pending"], 1)
+
+    def test_feed_api_payload_applies_source_quality_gate_before_filtering_and_cache_update(self):
+        run_id = 42
+        with backend.db_connection() as conn:
+            for index in range(backend.FEED_SOURCE_RECOMMENDED_MIN_LABELS):
+                conn.execute(
+                    """
+                    INSERT INTO articles(
+                        guid, title, link_to_article, rss_source_url, source_url, source_label,
+                        source_feed, published_at, created_at, updated_at, feed_decision, feed_decision_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'skip', ?)
+                    """,
+                    (
+                        f"bad-source-{index}",
+                        f"Bad source skipped {index}",
+                        f"https://low.example/{index}",
+                        "https://low.example/rss",
+                        "https://low.example",
+                        "low.example",
+                        "test-feed",
+                        backend.utc_now_iso(),
+                        backend.utc_now_iso(),
+                        backend.utc_now_iso(),
+                        backend.utc_now_iso(),
+                    ),
+                )
+
+        pending_id = self.insert_article(
+            guid="bad-source-pending",
+            title="High score from historically poor source",
+            source_label="low.example",
+            predicted_recommendation=1,
+            predicted_probability=0.95,
+            prediction_model_run_id=run_id,
+        )
+        with backend.STATE.model_lock:
+            backend.STATE.models["feed_recommendation"] = {
+                "run_id": run_id,
+                "threshold": 0.7,
+                "maybe_threshold": 0.4,
+                "pipeline": None,
+            }
+
+        recommended_payload = backend.build_feed_api_payload("recommended")
+        maybe_payload = backend.build_feed_api_payload("maybe")
+
+        self.assertEqual(recommended_payload["items"], [])
+        self.assertEqual([item["id"] for item in maybe_payload["items"]], [pending_id])
+        self.assertEqual(self.article_row(pending_id)["predicted_recommendation"], 0)
+
+    def test_temporal_feed_evaluation_reports_recent_holdout_metrics(self):
+        rows = []
+        for index in range(24):
+            is_positive = index in {0, 3, 6, 9, 18, 21}
+            rows.append(
+                {
+                    "id": index + 1,
+                    "title": "great relevant ai agent" if is_positive else "boring stock market update",
+                    "source_label": "example.com",
+                    "source_feed": "test-feed",
+                    "published_at": f"2026-04-{index + 1:02d}T10:00:00+00:00",
+                    "feed_decision_at": f"2026-04-{index + 1:02d}T11:00:00+00:00",
+                    "feed_decision": "summarize" if is_positive else "skip",
+                }
+            )
+
+        result = backend.evaluate_temporal_feed_model(rows, threshold=0.5, maybe_threshold=0.4)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["train_size"], 18)
+        self.assertEqual(result["test_size"], 6)
+        self.assertEqual(result["test_positive_labels"], 2)
+        self.assertIn("recommended_precision", result)
+        self.assertIn("precision_at_k", result)
 
     def test_feed_prediction_helpers_build_consistent_tiers(self):
         self.assertEqual(
@@ -1518,7 +1987,31 @@ class LocalNewsRegressionTests(unittest.TestCase):
 
         self.assertIn("document.addEventListener('keydown', handleKeyboard, true)", html)
         self.assertIn("isPlainShortcut(event, 's', 'KeyS')", html)
-        self.assertIn("showToast('Summary vorgemerkt.", html)
+        self.assertIn("showToast('Summary wird vorgemerkt", html)
+        self.assertIn("showToast(`Summary vorgemerkt. Läuft im Hintergrund.", html)
+
+    def test_frontend_feed_mutation_queue_has_timeout_escape_hatch(self):
+        html = Path("local-news-app.html").read_text(encoding="utf-8")
+
+        self.assertIn("const API_TIMEOUT_MS = 15000", html)
+        self.assertIn("const FEED_MUTATION_CHAIN_TIMEOUT_MS = 20000", html)
+        self.assertIn("Promise.race([", html)
+        self.assertIn("Backend-Anfrage hat zu lange gedauert", html)
+        self.assertIn("Vorherige Feed-Aktion hängt", html)
+
+    def test_frontend_summary_success_toast_happens_after_backend_call(self):
+        html = Path("local-news-app.html").read_text(encoding="utf-8")
+        start = html.index("async function handleFeedSummarize()")
+        end = html.index("function consumeKeyboardEvent", start)
+        handler = html[start:end]
+
+        pending_index = handler.index("showToast('Summary wird vorgemerkt")
+        api_index = handler.index("await api(`/articles/${item.id}/summarize`")
+        success_index = handler.index("showToast(`Summary vorgemerkt. Läuft im Hintergrund.")
+
+        self.assertLess(pending_index, api_index)
+        self.assertLess(api_index, success_index)
+        self.assertNotIn("showToast('Summary vorgemerkt.", handler[:api_index])
 
     def test_frontend_empty_ranked_feed_switches_to_all_without_reload(self):
         html = Path("local-news-app.html").read_text(encoding="utf-8")

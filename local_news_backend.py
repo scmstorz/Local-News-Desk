@@ -303,7 +303,7 @@ TARGET_CONFIG = {
         "artifact_name": "feed_recommendation.joblib",
         "positive_label": "summarize",
         "query": """
-            SELECT id, title, source_label, source_feed, published_at, feed_decision
+            SELECT id, title, source_label, source_feed, published_at, feed_decision, feed_decision_at
             FROM articles
             WHERE feed_decision IN ('skip', 'summarize')
         """,
@@ -327,6 +327,23 @@ TARGET_CONFIG = {
 }
 
 FEED_RECOMMENDED_MIN_PROBABILITY = 0.9
+FEED_SOURCE_RECOMMENDED_MIN_LABELS = 5
+FEED_SOURCE_RECOMMENDED_MIN_PRECISION = 0.4
+FEED_SOURCE_BAYESIAN_PRIOR_TOTAL = 8
+FEED_SOURCE_BAYESIAN_PRIOR_PRECISION = 0.18
+FEED_RECOMMENDED_TOP_K = 5
+FEED_EMBEDDING_REFERENCE_LIMIT = 80
+FEED_EMBEDDING_SIMILARITY_TOP_N = 3
+FEED_EMBEDDING_MIN_POSITIVE_SIMILARITY = 0.7
+FEED_EMBEDDING_MIN_NET_SIMILARITY = 0.015
+FEED_API_ITEM_LIMIT = 300
+FEED_SIMILARITY_FULL_CLUSTER_LIMIT = 600
+FEED_NEGATIVE_RECOMMENDED_PATTERNS = [
+    ("finance_market_noise", re.compile(r"\b(stock|stocks|share price|price target|earnings|ipo|wall street|nasdaq|nyse|dow jones|market cap|valuation)\b", re.I)),
+    ("sponsored_or_pr", re.compile(r"\b(sponsored|press release|prnewswire|globenewswire|business wire)\b", re.I)),
+    ("generic_ai_transformation", re.compile(r"\b(how|why)\s+ai\s+(is\s+)?(transforming|reshaping|revolutionizing|changing)\b", re.I)),
+    ("top_listicle", re.compile(r"\b(top|best)\s+\d+\b", re.I)),
+]
 
 
 class RuntimeState:
@@ -591,6 +608,10 @@ def normalize_title_for_similarity(title: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def exact_duplicate_title_key(title: Any) -> str:
+    return normalize_title_for_similarity(str(title or ""))
+
+
 def build_title_signature(title: str) -> dict[str, Any]:
     normalized = normalize_title_for_similarity(title)
     raw_tokens = [token for token in normalized.split() if len(token) >= 2]
@@ -801,6 +822,81 @@ def build_feed_similarity_snapshot(rows: list[sqlite3.Row | dict[str, Any]]) -> 
     }
 
 
+def build_limited_feed_similarity_snapshot(rows: list[sqlite3.Row | dict[str, Any]], pending_total: int) -> dict[str, Any]:
+    items = [row if isinstance(row, dict) else row_to_dict(row) for row in rows]
+    return {
+        "pending_total": int(pending_total),
+        "visible_total": len(items),
+        "similar_group_count": 0,
+        "similar_hidden_count": 0,
+        "visible_article_ids": [int(item["id"]) for item in items],
+        "similar_count_by_id": {},
+        "limited": True,
+        "updated_at": utc_now_iso(),
+    }
+
+
+def archive_exact_pending_title_duplicates(
+    conn: sqlite3.Connection,
+    event_type: str = "feed_exact_title_deduplicated",
+) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT id, title, published_at
+        FROM articles
+        WHERE feed_decision = 'pending'
+        ORDER BY datetime(published_at) DESC, id DESC
+        """
+    ).fetchall()
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        item = row_to_dict(row)
+        key = exact_duplicate_title_key(item.get("title"))
+        if not key:
+            continue
+        groups.setdefault(key, []).append(item)
+
+    archive_map: dict[int, int] = {}
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        canonical_id = int(members[0]["id"])
+        for member in members[1:]:
+            archive_map[int(member["id"])] = canonical_id
+
+    if not archive_map:
+        return {
+            "archived_count": 0,
+            "duplicate_group_count": sum(1 for members in groups.values() if len(members) > 1),
+        }
+
+    now = utc_now_iso()
+    archive_ids = list(archive_map.keys())
+    placeholders = ",".join("?" for _ in archive_ids)
+    conn.execute(
+        f"""
+        UPDATE articles
+        SET feed_decision = 'archived',
+            feed_decision_at = ?,
+            updated_at = ?
+        WHERE id IN ({placeholders})
+        """,
+        (now, now, *archive_ids),
+    )
+    for article_id, canonical_article_id in archive_map.items():
+        log_event(
+            conn,
+            article_id,
+            event_type,
+            {"canonical_article_id": canonical_article_id, "match_type": "exact_title"},
+        )
+
+    return {
+        "archived_count": len(archive_map),
+        "duplicate_group_count": sum(1 for members in groups.values() if len(members) > 1),
+    }
+
+
 def trigger_feed_similarity_refresh() -> None:
     with STATE.feed_similarity_lock:
         STATE.feed_similarity_dirty = True
@@ -812,8 +908,17 @@ def current_feed_similarity_snapshot() -> dict[str, Any]:
 
 
 def update_feed_similarity_snapshot(rows: Optional[list[sqlite3.Row | dict[str, Any]]] = None) -> dict[str, Any]:
-    pending_rows = rows if rows is not None else fetch_pending_feed_articles()
-    snapshot = build_feed_similarity_snapshot(pending_rows)
+    if rows is not None:
+        pending_rows = rows
+        snapshot = build_feed_similarity_snapshot(pending_rows)
+    else:
+        pending_total = count_rows("feed_decision = 'pending'")
+        if pending_total > FEED_SIMILARITY_FULL_CLUSTER_LIMIT:
+            pending_rows = fetch_pending_feed_articles(FEED_API_ITEM_LIMIT)
+            snapshot = build_limited_feed_similarity_snapshot(pending_rows, pending_total)
+        else:
+            pending_rows = fetch_pending_feed_articles()
+            snapshot = build_feed_similarity_snapshot(pending_rows)
     with STATE.feed_similarity_lock:
         STATE.feed_similarity_snapshot = snapshot
         STATE.feed_similarity_dirty = False
@@ -824,6 +929,8 @@ def update_feed_similarity_snapshot(rows: Optional[list[sqlite3.Row | dict[str, 
 def _feed_similarity_build_loop() -> None:
     while not STATE.stop_event.is_set():
         try:
+            with db_connection() as conn:
+                archive_exact_pending_title_duplicates(conn)
             update_feed_similarity_snapshot()
         except Exception as exc:  # pragma: no cover - runtime defensive
             LOGGER.warning("Feed similarity refresh failed: %s", exc)
@@ -895,6 +1002,7 @@ def archive_pending_duplicates_for_article(
 
 
 def auto_archive_pending_duplicates_of_handled_articles(conn: sqlite3.Connection) -> int:
+    exact_result = archive_exact_pending_title_duplicates(conn)
     cutoff = (utc_now() - timedelta(hours=SIMILARITY_LOOKBACK_HOURS)).isoformat()
     handled_rows = conn.execute(
         """
@@ -931,7 +1039,7 @@ def auto_archive_pending_duplicates_of_handled_articles(conn: sqlite3.Connection
                 break
 
     if not archive_map:
-        return 0
+        return int(exact_result["archived_count"])
 
     now = utc_now_iso()
     archive_ids = list(archive_map.keys())
@@ -955,12 +1063,13 @@ def auto_archive_pending_duplicates_of_handled_articles(conn: sqlite3.Connection
             {"canonical_article_id": canonical_article_id},
         )
 
-    return len(archive_ids)
+    return int(exact_result["archived_count"]) + len(archive_ids)
 
 
 def deduplicate_current_pending_feed() -> dict[str, Any]:
     now = utc_now_iso()
     with db_connection() as conn:
+        exact_result = archive_exact_pending_title_duplicates(conn, "feed_manual_exact_title_deduplicated")
         rows = conn.execute(
             """
             SELECT *
@@ -983,11 +1092,15 @@ def deduplicate_current_pending_feed() -> dict[str, Any]:
         if not archive_map:
             trigger_feed_similarity_refresh()
             ensure_feed_similarity_snapshot_async()
+            archived_count = int(exact_result["archived_count"])
             return {
                 "status": "ok",
-                "archived_count": 0,
+                "archived_count": archived_count,
+                "exact_archived_count": archived_count,
+                "similar_archived_count": 0,
                 "cluster_count": len(clusters),
-                "before_pending": before_pending,
+                "exact_duplicate_group_count": int(exact_result["duplicate_group_count"]),
+                "before_pending": before_pending + archived_count,
                 "after_pending": before_pending,
                 "before_visible": before_visible,
                 "after_visible": before_visible,
@@ -1016,12 +1129,17 @@ def deduplicate_current_pending_feed() -> dict[str, Any]:
 
     trigger_feed_similarity_refresh()
     ensure_feed_similarity_snapshot_async()
+    exact_archived_count = int(exact_result["archived_count"])
+    similar_archived_count = len(archive_map)
     return {
         "status": "ok",
-        "archived_count": len(archive_map),
+        "archived_count": exact_archived_count + similar_archived_count,
+        "exact_archived_count": exact_archived_count,
+        "similar_archived_count": similar_archived_count,
         "cluster_count": len(clusters),
-        "before_pending": before_pending,
-        "after_pending": before_pending - len(archive_map),
+        "exact_duplicate_group_count": int(exact_result["duplicate_group_count"]),
+        "before_pending": before_pending + exact_archived_count,
+        "after_pending": before_pending - similar_archived_count,
         "before_visible": before_visible,
         "after_visible": before_visible,
         "processed_at": now,
@@ -2524,6 +2642,280 @@ def effective_feed_recommended_threshold(artifact: dict[str, Any]) -> float:
     return max(float(raw_threshold), FEED_RECOMMENDED_MIN_PROBABILITY)
 
 
+def reset_stale_recommended_prediction_cache() -> int:
+    with db_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE articles
+            SET predicted_recommendation = 0,
+                updated_at = ?
+            WHERE predicted_recommendation = 1
+              AND (
+                predicted_probability IS NULL
+                OR predicted_probability < ?
+              )
+            """,
+            (utc_now_iso(), FEED_RECOMMENDED_MIN_PROBABILITY),
+        )
+        return int(cursor.rowcount or 0)
+
+
+def normalize_feed_source_label(source_label: Any) -> str:
+    return str(source_label or "").strip().lower()
+
+
+def bayesian_feed_source_precision(positives: int, total: int) -> float:
+    prior_positive = FEED_SOURCE_BAYESIAN_PRIOR_TOTAL * FEED_SOURCE_BAYESIAN_PRIOR_PRECISION
+    return (float(positives) + prior_positive) / (float(total) + FEED_SOURCE_BAYESIAN_PRIOR_TOTAL)
+
+
+def fetch_feed_source_quality_stats() -> dict[str, dict[str, Any]]:
+    with db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                LOWER(TRIM(source_label)) AS source_key,
+                COUNT(*) AS total,
+                SUM(CASE WHEN feed_decision = 'summarize' THEN 1 ELSE 0 END) AS positives
+            FROM articles
+            WHERE feed_decision IN ('skip', 'summarize')
+              AND TRIM(source_label) != ''
+            GROUP BY source_key
+            """
+        ).fetchall()
+
+    stats: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        total = int(row["total"] or 0)
+        positives = int(row["positives"] or 0)
+        raw_precision = positives / total if total else 0.0
+        stats[row["source_key"]] = {
+            "total": total,
+            "positives": positives,
+            "raw_precision": raw_precision,
+            "precision": bayesian_feed_source_precision(positives, total),
+        }
+    return stats
+
+
+def source_allows_recommended(source_label: Any, source_stats: dict[str, dict[str, Any]]) -> bool:
+    source_key = normalize_feed_source_label(source_label)
+    stats = source_stats.get(source_key)
+    if not stats:
+        return True
+    if int(stats.get("total", 0)) < FEED_SOURCE_RECOMMENDED_MIN_LABELS:
+        return True
+    return float(stats.get("precision", 0.0)) >= FEED_SOURCE_RECOMMENDED_MIN_PRECISION
+
+
+def find_feed_negative_pattern(item: dict[str, Any]) -> Optional[str]:
+    text = " ".join(
+        str(item.get(key) or "")
+        for key in ("title", "source_label", "source_feed")
+    )
+    for reason, pattern in FEED_NEGATIVE_RECOMMENDED_PATTERNS:
+        if pattern.search(text):
+            return reason
+    return None
+
+
+def demote_feed_recommendation(item: dict[str, Any], reason: str, extra_gate: Optional[dict[str, Any]] = None) -> None:
+    prediction = dict(item.get("prediction") or {})
+    prediction["recommended"] = False
+    prediction["maybe"] = True
+    prediction["tier"] = "maybe"
+    gate = dict(prediction.get("recommended_gate") or {})
+    gate.update(extra_gate or {})
+    gate["reason"] = reason
+    prediction["recommended_gate"] = gate
+    item["prediction"] = prediction
+
+
+def apply_feed_source_quality_gate(
+    rows: list[dict[str, Any]],
+    source_stats: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    for item in rows:
+        prediction = item.get("prediction") or {}
+        if not prediction.get("recommended"):
+            continue
+        source_key = normalize_feed_source_label(item.get("source_label"))
+        stats = source_stats.get(source_key) or {}
+        if source_allows_recommended(item.get("source_label"), source_stats):
+            prediction["recommended_gate"] = {
+                "source_allowed": True,
+                "source_total": int(stats.get("total", 0)),
+                "source_raw_precision": round(float(stats.get("raw_precision", 0.0)), 4),
+                "source_precision": round(float(stats.get("precision", 0.0)), 4),
+            }
+            continue
+        demote_feed_recommendation(
+            item,
+            "source_precision_below_recommended_floor",
+            {
+                "source_allowed": False,
+                "source_total": int(stats.get("total", 0)),
+                "source_raw_precision": round(float(stats.get("raw_precision", 0.0)), 4),
+                "source_precision": round(float(stats.get("precision", 0.0)), 4),
+            },
+        )
+    return rows
+
+
+def apply_feed_negative_pattern_gate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for item in rows:
+        prediction = item.get("prediction") or {}
+        if not prediction.get("recommended"):
+            continue
+        reason = find_feed_negative_pattern(item)
+        if reason:
+            demote_feed_recommendation(item, f"negative_pattern_{reason}", {"negative_pattern": reason})
+    return rows
+
+
+def fetch_feed_embedding_reference_vectors(
+    per_class_limit: int = FEED_EMBEDDING_REFERENCE_LIMIT,
+) -> dict[str, list[list[float]]]:
+    references: dict[str, list[list[float]]] = {"positive": [], "negative": []}
+    with db_connection() as conn:
+        for key, decision in (("positive", "summarize"), ("negative", "skip")):
+            rows = conn.execute(
+                """
+                SELECT ae.embedding_json
+                FROM articles a
+                JOIN article_embeddings ae
+                  ON ae.article_id = a.id
+                 AND ae.embedding_model = ?
+                WHERE a.feed_decision = ?
+                ORDER BY datetime(a.feed_decision_at) DESC, a.id DESC
+                LIMIT ?
+                """,
+                (get_embedding_model(), decision, per_class_limit),
+            ).fetchall()
+            for row in rows:
+                vector = decode_embedding_vector(row["embedding_json"])
+                if vector is not None:
+                    references[key].append(vector)
+    return references
+
+
+def top_embedding_similarity_average(
+    vector: list[float],
+    reference_vectors: list[list[float]],
+    top_n: int = FEED_EMBEDDING_SIMILARITY_TOP_N,
+) -> Optional[float]:
+    if not vector or not reference_vectors:
+        return None
+    similarities = sorted(
+        (cosine_similarity(vector, reference) for reference in reference_vectors),
+        reverse=True,
+    )
+    top = similarities[: max(1, top_n)]
+    return sum(top) / len(top) if top else None
+
+
+def build_feed_embedding_gate(
+    vector: Optional[list[float]],
+    reference_vectors: dict[str, list[list[float]]],
+) -> dict[str, Any]:
+    if vector is None:
+        return {"allowed": False, "reason": "embedding_missing"}
+
+    positive_similarity = top_embedding_similarity_average(vector, reference_vectors.get("positive", []))
+    negative_similarity = top_embedding_similarity_average(vector, reference_vectors.get("negative", []))
+    if positive_similarity is None or negative_similarity is None:
+        return {
+            "allowed": True,
+            "reason": "embedding_references_unavailable",
+            "positive_reference_count": len(reference_vectors.get("positive", [])),
+            "negative_reference_count": len(reference_vectors.get("negative", [])),
+        }
+
+    net_similarity = positive_similarity - negative_similarity
+    allowed = (
+        positive_similarity >= FEED_EMBEDDING_MIN_POSITIVE_SIMILARITY
+        and net_similarity >= FEED_EMBEDDING_MIN_NET_SIMILARITY
+    )
+    return {
+        "allowed": allowed,
+        "positive_similarity": round(float(positive_similarity), 4),
+        "negative_similarity": round(float(negative_similarity), 4),
+        "net_similarity": round(float(net_similarity), 4),
+        "positive_reference_count": len(reference_vectors.get("positive", [])),
+        "negative_reference_count": len(reference_vectors.get("negative", [])),
+        "reason": None if allowed else "embedding_similarity_below_recommended_floor",
+    }
+
+
+def apply_feed_embedding_similarity_gate(
+    rows: list[dict[str, Any]],
+    reference_vectors: Optional[dict[str, list[list[float]]]] = None,
+) -> list[dict[str, Any]]:
+    recommended_rows = [row for row in rows if (row.get("prediction") or {}).get("recommended")]
+    if not recommended_rows:
+        return rows
+
+    references = reference_vectors if reference_vectors is not None else fetch_feed_embedding_reference_vectors()
+    embedding_map = load_embeddings_for_article_ids([int(row["id"]) for row in recommended_rows if row.get("id") is not None])
+    for item in recommended_rows:
+        gate = build_feed_embedding_gate(embedding_map.get(int(item["id"])), references)
+        prediction = item.get("prediction") or {}
+        existing_gate = dict(prediction.get("recommended_gate") or {})
+        existing_gate["embedding"] = {key: value for key, value in gate.items() if key != "allowed"}
+        prediction["recommended_gate"] = existing_gate
+        item["prediction"] = prediction
+        if not gate["allowed"]:
+            demote_feed_recommendation(
+                item,
+                str(gate.get("reason") or "embedding_similarity_below_recommended_floor"),
+                {"embedding": {key: value for key, value in gate.items() if key != "allowed"}},
+            )
+    return rows
+
+
+def feed_recommended_rank_key(row: dict[str, Any]) -> tuple[float, float, int]:
+    prediction = row.get("prediction") or {}
+    gate = prediction.get("recommended_gate") or {}
+    return (
+        float(prediction.get("probability") or 0.0),
+        float(gate.get("source_precision") or 0.0),
+        int(row.get("id") or 0),
+    )
+
+
+def apply_feed_recommended_top_k(rows: list[dict[str, Any]], top_k: int = FEED_RECOMMENDED_TOP_K) -> list[dict[str, Any]]:
+    if top_k <= 0:
+        allowed_ids: set[int] = set()
+    else:
+        recommended_rows = [row for row in rows if (row.get("prediction") or {}).get("recommended")]
+        allowed_ids = {
+            int(row.get("id") or 0)
+            for row in sorted(recommended_rows, key=feed_recommended_rank_key, reverse=True)[:top_k]
+        }
+
+    for item in rows:
+        prediction = item.get("prediction") or {}
+        if not prediction.get("recommended"):
+            continue
+        if int(item.get("id") or 0) in allowed_ids:
+            gate = dict(prediction.get("recommended_gate") or {})
+            gate["top_k_allowed"] = True
+            gate["top_k_limit"] = top_k
+            prediction["recommended_gate"] = gate
+            continue
+        gated_prediction = dict(prediction)
+        gated_prediction["recommended"] = False
+        gated_prediction["maybe"] = True
+        gated_prediction["tier"] = "maybe"
+        gate = dict(gated_prediction.get("recommended_gate") or {})
+        gate["top_k_allowed"] = False
+        gate["top_k_limit"] = top_k
+        gate["reason"] = "outside_recommended_top_k"
+        gated_prediction["recommended_gate"] = gate
+        item["prediction"] = gated_prediction
+    return rows
+
+
 def build_cached_feed_prediction(
     item: dict[str, Any],
     run_id: int,
@@ -2612,6 +3004,17 @@ def compute_feed_prediction_snapshot(row: sqlite3.Row | dict[str, Any]) -> Optio
             int(artifact["run_id"]),
         )
 
+    prediction_item = {
+        "title": item.get("title"),
+        "source_label": item.get("source_label"),
+        "source_feed": item.get("source_feed"),
+        "prediction": cached_prediction,
+    }
+    apply_feed_source_quality_gate([prediction_item], fetch_feed_source_quality_stats())
+    apply_feed_negative_pattern_gate([prediction_item])
+    apply_feed_embedding_similarity_gate([prediction_item])
+    cached_prediction = prediction_item["prediction"]
+
     return {
         "prediction_model_run_id": cached_prediction["run_id"],
         "predicted_probability": cached_prediction["probability"],
@@ -2658,23 +3061,98 @@ def feed_row_is_maybe(row: dict[str, Any]) -> bool:
     return row.get("prediction", {}).get("tier") == "maybe"
 
 
+def feed_prediction_gate_reason(row: dict[str, Any]) -> Optional[str]:
+    gate = (row.get("prediction") or {}).get("recommended_gate") or {}
+    reason = gate.get("reason")
+    return str(reason) if reason else None
+
+
+def feed_gate_demotion_stats(rows: list[dict[str, Any]]) -> dict[str, int]:
+    stats = {
+        "source": 0,
+        "negative_pattern": 0,
+        "embedding_missing": 0,
+        "embedding_similarity": 0,
+        "top_k": 0,
+        "other": 0,
+    }
+    for row in rows:
+        reason = feed_prediction_gate_reason(row)
+        if not reason:
+            continue
+        if reason == "source_precision_below_recommended_floor":
+            stats["source"] += 1
+        elif reason.startswith("negative_pattern_"):
+            stats["negative_pattern"] += 1
+        elif reason == "embedding_missing":
+            stats["embedding_missing"] += 1
+        elif reason == "embedding_similarity_below_recommended_floor":
+            stats["embedding_similarity"] += 1
+        elif reason == "outside_recommended_top_k":
+            stats["top_k"] += 1
+        else:
+            stats["other"] += 1
+    stats["total"] = sum(stats.values())
+    return stats
+
+
+def maybe_rank_score(row: dict[str, Any]) -> float:
+    prediction = row.get("prediction") or {}
+    gate = prediction.get("recommended_gate") or {}
+    embedding = gate.get("embedding") or {}
+    score = float(prediction.get("probability") or 0.0)
+    score += 0.20 * max(0.0, float(gate.get("source_precision") or 0.0))
+    score += 0.25 * max(0.0, float(embedding.get("net_similarity") or 0.0))
+    reason = str(gate.get("reason") or "")
+    if reason == "embedding_missing":
+        score -= 0.20
+    elif reason == "embedding_similarity_below_recommended_floor":
+        score -= 0.12
+    elif reason.startswith("negative_pattern_"):
+        score -= 0.18
+    elif reason == "source_precision_below_recommended_floor":
+        score -= 0.08
+    elif reason == "outside_recommended_top_k":
+        score += 0.05
+    return score
+
+
+def sort_feed_rows_for_mode(rows: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
+    if mode not in {"maybe", "maybe_plus"}:
+        return rows
+    return sorted(
+        rows,
+        key=lambda row: (
+            maybe_rank_score(row),
+            float((row.get("prediction") or {}).get("probability") or 0.0),
+            parse_datetime(row.get("published_at")),
+            int(row.get("id") or 0),
+        ),
+        reverse=True,
+    )
+
+
 def filter_predicted_feed_rows(rows: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
     if mode == "recommended":
         return [row for row in rows if feed_row_is_recommended(row)]
     if mode == "maybe":
-        return [row for row in rows if feed_row_is_maybe(row)]
+        return sort_feed_rows_for_mode([row for row in rows if feed_row_is_maybe(row)], mode)
     if mode == "maybe_plus":
-        return [row for row in rows if feed_row_is_recommended(row) or feed_row_is_maybe(row)]
+        return sort_feed_rows_for_mode(
+            [row for row in rows if feed_row_is_recommended(row) or feed_row_is_maybe(row)],
+            mode,
+        )
     return list(rows)
 
 
 def build_feed_response_counts(rows: list[dict[str, Any]], similarity: dict[str, int]) -> dict[str, int]:
     return {
-        "total_pending": len(rows),
+        "total_pending": int(similarity.get("pending_total", len(rows))),
         "recommended_pending": sum(1 for row in rows if feed_row_is_recommended(row)),
         "maybe_pending": sum(1 for row in rows if feed_row_is_maybe(row)),
         "similar_group_count": similarity["similar_group_count"],
         "similar_hidden_count": similarity["similar_hidden_count"],
+        "gate_demotions": feed_gate_demotion_stats(rows),
     }
 
 
@@ -2690,16 +3168,19 @@ def build_feed_similarity_counts(snapshot: dict[str, Any], visible_count: int) -
 def load_feed_rows_for_api() -> tuple[list[dict[str, Any]], dict[str, int]]:
     snapshot = current_feed_similarity_snapshot()
     rows = fetch_visible_pending_feed_articles_from_snapshot()
+    if len(rows) > FEED_API_ITEM_LIMIT:
+        rows = rows[:FEED_API_ITEM_LIMIT]
     similarity = build_feed_similarity_counts(snapshot, len(rows))
 
     if rows:
         return rows, similarity
 
-    pending_rows = fetch_pending_feed_articles()
+    total_pending = count_rows("feed_decision = 'pending'")
+    pending_rows = fetch_pending_feed_articles(FEED_API_ITEM_LIMIT)
     fallback_rows = [row_to_dict(row) for row in pending_rows]
     ensure_feed_similarity_snapshot_async()
     return fallback_rows, {
-        "pending_total": len(fallback_rows),
+        "pending_total": total_pending,
         "visible_total": len(fallback_rows),
         "similar_group_count": 0,
         "similar_hidden_count": 0,
@@ -2709,6 +3190,10 @@ def load_feed_rows_for_api() -> tuple[list[dict[str, Any]], dict[str, int]]:
 def build_feed_api_payload(mode: str) -> dict[str, Any]:
     rows, similarity = load_feed_rows_for_api()
     predicted_rows, run_id = predict_feed_rows(rows)
+    predicted_rows = apply_feed_source_quality_gate(predicted_rows, fetch_feed_source_quality_stats())
+    predicted_rows = apply_feed_negative_pattern_gate(predicted_rows)
+    predicted_rows = apply_feed_embedding_similarity_gate(predicted_rows)
+    predicted_rows = apply_feed_recommended_top_k(predicted_rows)
     update_cached_feed_predictions(predicted_rows, run_id)
     filtered = filter_predicted_feed_rows(predicted_rows, mode)
     return {
@@ -3296,15 +3781,22 @@ def count_rows(where_sql: str, params: tuple[Any, ...] = ()) -> int:
     return int(row["total"])
 
 
-def fetch_pending_feed_articles() -> list[sqlite3.Row]:
+def fetch_pending_feed_articles(limit: Optional[int] = None) -> list[sqlite3.Row]:
+    limit_sql = ""
+    params: tuple[Any, ...] = ()
+    if limit is not None:
+        limit_sql = "LIMIT ?"
+        params = (max(1, int(limit)),)
     with db_connection() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT *
             FROM articles
             WHERE feed_decision = 'pending'
             ORDER BY datetime(published_at) DESC, id DESC
-            """
+            {limit_sql}
+            """,
+            params,
         ).fetchall()
     return list(rows)
 
@@ -3569,6 +4061,83 @@ def precision_at_k(probabilities: list[float], labels: list[int], k: int) -> dic
     }
 
 
+def build_text_classifier_pipeline() -> Pipeline:
+    return Pipeline(
+        steps=[
+            (
+                "vectorizer",
+                TfidfVectorizer(
+                    ngram_range=(1, 2),
+                    min_df=1,
+                    max_features=6000,
+                    sublinear_tf=True,
+                ),
+            ),
+            (
+                "classifier",
+                LogisticRegression(
+                    max_iter=2500,
+                    class_weight="balanced",
+                ),
+            ),
+        ]
+    )
+
+
+def evaluate_temporal_feed_model(
+    rows: list[sqlite3.Row | dict[str, Any]],
+    threshold: float,
+    maybe_threshold: float,
+) -> dict[str, Any]:
+    ordered_rows = sorted(
+        [row if isinstance(row, dict) else row_to_dict(row) for row in rows],
+        key=lambda row: (
+            parse_datetime(row.get("feed_decision_at") or row.get("published_at")),
+            int(row.get("id", 0)),
+        ),
+    )
+    if len(ordered_rows) < 20:
+        return {"available": False, "reason": "not_enough_rows"}
+
+    split_index = max(1, int(len(ordered_rows) * 0.75))
+    train_rows = ordered_rows[:split_index]
+    test_rows = ordered_rows[split_index:]
+    train_labels = [1 if row["feed_decision"] == "summarize" else 0 for row in train_rows]
+    test_labels = [1 if row["feed_decision"] == "summarize" else 0 for row in test_rows]
+    if len(set(train_labels)) < 2 or len(set(test_labels)) < 2:
+        return {
+            "available": False,
+            "reason": "missing_class_in_temporal_split",
+            "train_size": len(train_rows),
+            "test_size": len(test_rows),
+            "test_positive_labels": sum(test_labels),
+        }
+
+    temporal_pipeline = build_text_classifier_pipeline()
+    temporal_pipeline.fit([build_feature_text("feed_recommendation", row) for row in train_rows], train_labels)
+    probabilities = [
+        float(value)
+        for value in temporal_pipeline.predict_proba([build_feature_text("feed_recommendation", row) for row in test_rows])[:, 1]
+    ]
+    recommended_predictions = [1 if probability >= threshold else 0 for probability in probabilities]
+    maybe_predictions = [1 if probability >= maybe_threshold else 0 for probability in probabilities]
+    return {
+        "available": True,
+        "train_size": len(train_rows),
+        "test_size": len(test_rows),
+        "test_positive_labels": sum(test_labels),
+        "recommended_precision": round(float(precision_score(test_labels, recommended_predictions, zero_division=0)), 4),
+        "recommended_recall": round(float(recall_score(test_labels, recommended_predictions, zero_division=0)), 4),
+        "recommended_predicted_count": sum(recommended_predictions),
+        "maybe_precision": round(float(precision_score(test_labels, maybe_predictions, zero_division=0)), 4),
+        "maybe_recall": round(float(recall_score(test_labels, maybe_predictions, zero_division=0)), 4),
+        "precision_at_k": {
+            "10": precision_at_k(probabilities, test_labels, 10),
+            "20": precision_at_k(probabilities, test_labels, 20),
+        },
+    }
+
+
 def select_feed_threshold(labels: list[int], probabilities: list[float]) -> tuple[float, float, dict[str, Any]]:
     if not probabilities:
         return 0.5, 0.35, {
@@ -3806,26 +4375,7 @@ def train_model(target: str) -> dict[str, Any]:
         stratify=labels,
     )
 
-    pipeline = Pipeline(
-        steps=[
-            (
-                "vectorizer",
-                TfidfVectorizer(
-                    ngram_range=(1, 2),
-                    min_df=1,
-                    max_features=6000,
-                    sublinear_tf=True,
-                ),
-            ),
-            (
-                "classifier",
-                LogisticRegression(
-                    max_iter=2500,
-                    class_weight="balanced",
-                ),
-            ),
-        ]
-    )
+    pipeline = build_text_classifier_pipeline()
     pipeline.fit(train_x, train_y)
     threshold_value = 0.5
     maybe_threshold_value = 0.35
@@ -3842,6 +4392,7 @@ def train_model(target: str) -> dict[str, Any]:
                 "20": precision_at_k(probabilities, test_y, 20),
                 "50": precision_at_k(probabilities, test_y, 50),
             },
+            "temporal_evaluation": evaluate_temporal_feed_model(rows, threshold_value, maybe_threshold_value),
         }
     else:
         predicted = pipeline.predict(test_x)
@@ -3926,6 +4477,10 @@ def train_model(target: str) -> dict[str, Any]:
         if target == "feed_recommendation":
             rows_for_prediction = fetch_visible_pending_feed_articles()
             predicted_rows, used_run_id = predict_feed_rows(rows_for_prediction)
+            predicted_rows = apply_feed_source_quality_gate(predicted_rows, fetch_feed_source_quality_stats())
+            predicted_rows = apply_feed_negative_pattern_gate(predicted_rows)
+            predicted_rows = apply_feed_embedding_similarity_gate(predicted_rows)
+            predicted_rows = apply_feed_recommended_top_k(predicted_rows)
             update_cached_feed_predictions(predicted_rows, used_run_id)
 
     return {
@@ -4549,6 +5104,7 @@ def shutdown() -> None:
 
 def main() -> None:
     init_db()
+    reset_stale_recommended_prediction_cache()
     load_persisted_models()
     bootstrap_compare_mode()
     ensure_feed_similarity_snapshot_async()
