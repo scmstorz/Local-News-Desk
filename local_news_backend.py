@@ -3165,12 +3165,28 @@ def build_feed_similarity_counts(snapshot: dict[str, Any], visible_count: int) -
     }
 
 
-def load_feed_rows_for_api() -> tuple[list[dict[str, Any]], dict[str, int]]:
+def load_feed_rows_for_api(offset: int = 0) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    offset = max(0, int(offset or 0))
+    if offset:
+        total_pending = count_rows("feed_decision = 'pending'")
+        pending_rows = fetch_pending_feed_articles(FEED_API_ITEM_LIMIT, offset=offset)
+        rows = [row_to_dict(row) for row in pending_rows]
+        return rows, {
+            "pending_total": total_pending,
+            "visible_total": len(rows),
+            "similar_group_count": 0,
+            "similar_hidden_count": 0,
+            "offset": offset,
+            "limit": FEED_API_ITEM_LIMIT,
+        }
+
     snapshot = current_feed_similarity_snapshot()
     rows = fetch_visible_pending_feed_articles_from_snapshot()
     if len(rows) > FEED_API_ITEM_LIMIT:
         rows = rows[:FEED_API_ITEM_LIMIT]
     similarity = build_feed_similarity_counts(snapshot, len(rows))
+    similarity["offset"] = 0
+    similarity["limit"] = FEED_API_ITEM_LIMIT
 
     if rows:
         return rows, similarity
@@ -3184,11 +3200,13 @@ def load_feed_rows_for_api() -> tuple[list[dict[str, Any]], dict[str, int]]:
         "visible_total": len(fallback_rows),
         "similar_group_count": 0,
         "similar_hidden_count": 0,
+        "offset": 0,
+        "limit": FEED_API_ITEM_LIMIT,
     }
 
 
-def build_feed_api_payload(mode: str) -> dict[str, Any]:
-    rows, similarity = load_feed_rows_for_api()
+def build_feed_api_payload(mode: str, offset: int = 0) -> dict[str, Any]:
+    rows, similarity = load_feed_rows_for_api(offset)
     predicted_rows, run_id = predict_feed_rows(rows)
     predicted_rows = apply_feed_source_quality_gate(predicted_rows, fetch_feed_source_quality_stats())
     predicted_rows = apply_feed_negative_pattern_gate(predicted_rows)
@@ -3196,10 +3214,21 @@ def build_feed_api_payload(mode: str) -> dict[str, Any]:
     predicted_rows = apply_feed_recommended_top_k(predicted_rows)
     update_cached_feed_predictions(predicted_rows, run_id)
     filtered = filter_predicted_feed_rows(predicted_rows, mode)
+    batch_offset = int(similarity.get("offset", 0))
+    batch_limit = int(similarity.get("limit", FEED_API_ITEM_LIMIT))
+    total_pending = int(similarity.get("pending_total", len(predicted_rows)))
     return {
         "mode": mode,
         "items": [serialize_article_for_feed(item) for item in filtered],
         "counts": build_feed_response_counts(predicted_rows, similarity),
+        "batch": {
+            "offset": batch_offset,
+            "limit": batch_limit,
+            "loaded": len(predicted_rows),
+            "total_pending": total_pending,
+            "has_previous": batch_offset > 0,
+            "has_next": batch_offset + batch_limit < total_pending,
+        },
     }
 
 
@@ -3781,12 +3810,12 @@ def count_rows(where_sql: str, params: tuple[Any, ...] = ()) -> int:
     return int(row["total"])
 
 
-def fetch_pending_feed_articles(limit: Optional[int] = None) -> list[sqlite3.Row]:
+def fetch_pending_feed_articles(limit: Optional[int] = None, offset: int = 0) -> list[sqlite3.Row]:
     limit_sql = ""
     params: tuple[Any, ...] = ()
     if limit is not None:
-        limit_sql = "LIMIT ?"
-        params = (max(1, int(limit)),)
+        limit_sql = "LIMIT ? OFFSET ?"
+        params = (max(1, int(limit)), max(0, int(offset or 0)))
     with db_connection() as conn:
         rows = conn.execute(
             f"""
@@ -5047,7 +5076,11 @@ def api_feed_deduplicate():
 
 @APP.get("/api/feed")
 def api_feed():
-    return jsonify(build_feed_api_payload(request.args.get("mode", "all")))
+    try:
+        offset = int(request.args.get("offset", "0"))
+    except ValueError:
+        offset = 0
+    return jsonify(build_feed_api_payload(request.args.get("mode", "all"), offset=offset))
 
 
 @APP.post("/api/articles/<int:article_id>/skip")

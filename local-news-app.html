@@ -307,6 +307,11 @@
             font-weight: 700;
         }
 
+        .compact-button {
+            min-width: 64px;
+            padding: 8px 10px;
+        }
+
         .feed-card,
         .summary-card {
             padding: 30px;
@@ -747,8 +752,8 @@
                 </div>
                 <div class="status-row">
                     <div class="status-pill">Feed <strong id="feedPendingCount">0</strong></div>
-                    <div class="status-pill">Empfohlen <strong id="feedRecommendedCount">0</strong></div>
-                    <div class="status-pill">Vielleicht <strong id="feedMaybeCount">0</strong></div>
+                    <div class="status-pill">+ <strong id="feedRecommendedCount">0</strong></div>
+                    <div class="status-pill">? <strong id="feedMaybeCount">0</strong></div>
                     <div class="status-pill" id="feedSimilarPill" style="display:none;">Ähnliche <strong id="feedSimilarCount">0 in 0 Gruppen</strong></div>
                     <div class="status-pill">Primär-Queue <strong id="summaryQueueCount">0</strong></div>
                     <div class="status-pill">Primär bereit <strong id="summaryReadyCount">0</strong></div>
@@ -786,6 +791,8 @@
             allFeedItems: [],
             feedItems: [],
             feedCounts: null,
+            feedBatch: null,
+            feedOffset: 0,
             feedIndex: 0,
             feedHistory: [],
             feedHistoryIndex: -1,
@@ -852,6 +859,14 @@
             });
         }
 
+        class ApiError extends Error {
+            constructor(message, status) {
+                super(message);
+                this.name = 'ApiError';
+                this.status = status;
+            }
+        }
+
         async function api(path, options = {}) {
             const controller = new AbortController();
             const timeoutHandle = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
@@ -871,7 +886,7 @@
                 const body = await response.json().catch(() => ({}));
                 if (!response.ok) {
                     const message = body.message || `HTTP ${response.status}`;
-                    throw new Error(message);
+                    throw new ApiError(message, response.status);
                 }
                 return body;
             } finally {
@@ -1271,7 +1286,8 @@ Die Markdown-Datei ist attached.`;
             const hasLocalFeedSnapshot = Boolean(state.feedCounts);
             const localTotals = hasLocalFeedSnapshot
                 ? {
-                    total_pending: localItems.length,
+                    total_pending: state.feedCounts?.total_pending ?? localItems.length,
+                    loaded_pending: localItems.length,
                     recommended_pending: localItems.filter(item => item.prediction?.recommended).length,
                     maybe_pending: localItems.filter(item => item.prediction?.tier === 'maybe').length,
                     similar_group_count: state.feedCounts?.similar_group_count ?? state.status?.feed?.similar_groups ?? 0,
@@ -1285,6 +1301,7 @@ Die Markdown-Datei ist attached.`;
 
             return {
                 total_pending: state.feedCounts?.total_pending ?? state.status?.feed?.pending ?? 0,
+                loaded_pending: state.feedCounts?.visible_total ?? state.feedItems.length,
                 recommended_pending: state.feedCounts?.recommended_pending ?? state.status?.feed?.recommended ?? 0,
                 maybe_pending: state.feedCounts?.maybe_pending ?? state.status?.feed?.maybe ?? 0,
                 similar_group_count: state.feedCounts?.similar_group_count ?? state.status?.feed?.similar_groups ?? 0,
@@ -1320,7 +1337,7 @@ Die Markdown-Datei ist attached.`;
             const localItems = state.allFeedItems || [];
             state.feedCounts = {
                 ...state.feedCounts,
-                total_pending: localItems.length,
+                loaded_pending: localItems.length,
                 recommended_pending: localItems.filter(item => item.prediction?.recommended).length,
                 maybe_pending: localItems.filter(item => item.prediction?.tier === 'maybe').length,
             };
@@ -1434,6 +1451,13 @@ Die Markdown-Datei ist attached.`;
                 try {
                     await task();
                 } catch (error) {
+                    if (error.status === 404 && error.message === 'Article not found') {
+                        state.lastFeedActionStatus = 'Der Artikel war nicht mehr in der aktiven Inbox. Feed wurde neu geladen.';
+                        showToast('Artikel war nicht mehr in der aktiven Inbox. Feed wird neu geladen.', 'info');
+                        await loadStatus();
+                        await loadFeed(false);
+                        return;
+                    }
                     showToast(error.message, 'error');
                     await loadStatus();
                     await loadFeed(false);
@@ -1443,7 +1467,7 @@ Die Markdown-Datei ist attached.`;
             return state.feedMutationChain;
         }
 
-        async function loadFeed(reset = true) {
+        async function loadFeed(reset = true, preserveOffset = false) {
             state.feedLoading = true;
             state.feedError = '';
             if (state.screen === 'feed') {
@@ -1453,10 +1477,14 @@ Die Markdown-Datei ist attached.`;
                 ? state.feedItems[state.feedIndex].id
                 : null;
             try {
-                const payload = await api('/feed?mode=all');
+                if (reset && !preserveOffset) {
+                    state.feedOffset = 0;
+                }
+                const payload = await api(`/feed?mode=all&offset=${encodeURIComponent(state.feedOffset)}`);
                 state.feedError = '';
                 state.allFeedItems = payload.items || [];
                 state.feedCounts = payload.counts || null;
+                state.feedBatch = payload.batch || null;
                 applyFeedMode(reset, currentId);
                 state.feedLoading = false;
                 renderHeaderStatus();
@@ -1471,6 +1499,23 @@ Die Markdown-Datei ist attached.`;
                     state.feedLoading = false;
                 }
             }
+        }
+
+        async function loadFeedBatch(offset) {
+            state.feedOffset = Math.max(0, Number(offset) || 0);
+            await loadFeed(true, true);
+        }
+
+        async function handleNextFeedBatch() {
+            const batch = state.feedBatch || {};
+            const limit = Number(batch.limit || state.allFeedItems.length || 300);
+            await loadFeedBatch(Number(batch.offset || state.feedOffset || 0) + limit);
+        }
+
+        async function handlePreviousFeedBatch() {
+            const batch = state.feedBatch || {};
+            const limit = Number(batch.limit || state.allFeedItems.length || 300);
+            await loadFeedBatch(Math.max(0, Number(batch.offset || state.feedOffset || 0) - limit));
         }
 
         async function loadSummaries(preserveCurrent = false) {
@@ -1541,6 +1586,21 @@ Die Markdown-Datei ist attached.`;
             const item = currentFeedItem();
             const viewingHistory = state.feedHistoryIndex >= 0;
             const totals = counts || currentVisibleFeedCounts();
+            const batch = state.feedBatch || {};
+            const batchOffset = Number(batch.offset || state.feedOffset || 0);
+            const batchLimit = Number(batch.limit || state.allFeedItems.length || 300);
+            const batchLoaded = Number(batch.loaded ?? state.allFeedItems.length ?? 0);
+            const batchStart = batchLoaded ? batchOffset + 1 : 0;
+            const batchEnd = batchOffset + batchLoaded;
+            const hasPreviousBatch = Boolean(batch.has_previous || batchOffset > 0);
+            const hasNextBatch = Boolean(batch.has_next || (batchOffset + batchLimit < (totals.total_pending ?? 0)));
+            const batchSummary = batchLoaded
+                ? `${batchStart}-${batchEnd} geladen · ${totals.total_pending ?? batchLoaded} offen gesamt`
+                : `${totals.total_pending ?? 0} offen gesamt`;
+            const batchControls = `
+                <button class="inline-button compact-button" id="previousFeedBatchButton" ${hasPreviousBatch && !state.feedLoading ? '' : 'disabled'}>&lt; 300</button>
+                <button class="inline-button compact-button" id="nextFeedBatchButton" ${hasNextBatch && !state.feedLoading ? '' : 'disabled'}>300 &gt;</button>
+            `;
             const lastDeduplicate = state.lastFeedDeduplicateResult;
             const actionStatus = state.lastFeedActionStatus
                 ? `<div class="ops-assessment" style="margin: 0 22px 18px;"><strong>${escapeHtml(state.lastFeedActionStatus)}</strong></div>`
@@ -1583,7 +1643,7 @@ Die Markdown-Datei ist attached.`;
                     : 'unbekannt';
                 const emptyRecommended = (state.feedMode === 'recommended' || state.feedMode === 'maybe') && (totals.total_pending ?? 0) > 0;
                 const hasFeedError = Boolean(state.feedError);
-                const emptyModeLabel = state.feedMode === 'maybe' ? '„Vielleicht“' : '„Empfohlen“';
+                const emptyModeLabel = state.feedMode === 'maybe' ? '?' : '+';
                 host.innerHTML = `
                     <div class="panel">
                         <div class="panel-header">
@@ -1593,12 +1653,12 @@ Die Markdown-Datei ist attached.`;
                             <div class="toolbar">
                                 <div class="segmented">
                                     <button class="segment-button ${state.feedMode === 'all' ? 'active' : ''}" data-feed-mode="all">Alle</button>
-                                    <button class="segment-button ${state.feedMode === 'recommended' ? 'active' : ''}" data-feed-mode="recommended">Empfohlen</button>
-                                    <button class="segment-button ${state.feedMode === 'maybe' ? 'active' : ''}" data-feed-mode="maybe">Vielleicht</button>
+                                    <button class="segment-button ${state.feedMode === 'recommended' ? 'active' : ''}" data-feed-mode="recommended">+</button>
+                                    <button class="segment-button ${state.feedMode === 'maybe' ? 'active' : ''}" data-feed-mode="maybe">?</button>
                                 </div>
-                                <button class="inline-button" id="feedDeduplicateButton" ${state.feedDeduplicating ? 'disabled' : ''}>${state.feedDeduplicating ? 'Kompaktiere …' : 'Inbox kompaktieren'}</button>
-                                <button class="inline-button" id="feedResetButton">Inbox-Reset</button>
-                                <button class="inline-button" id="refreshFeedButton">Feeds aktualisieren</button>
+                                <button class="inline-button" id="feedDeduplicateButton" ${state.feedDeduplicating ? 'disabled' : ''}>${state.feedDeduplicating ? 'Dedupe …' : 'Inbox dedupe'}</button>
+                                ${batchControls}
+                                <button class="inline-button" id="feedResetButton">Reset</button>
                             </div>
                         </div>
                         ${deduplicateBanner}
@@ -1630,18 +1690,18 @@ Die Markdown-Datei ist attached.`;
                             <div class="panel-title">
                                 <h2>Feed</h2>
                                 <p>${viewingHistory
-                                    ? `Verlauf ${state.feedHistoryIndex + 1} / ${state.feedHistory.length} · ${totals.total_pending ?? state.feedItems.length} offen · ${totals.recommended_pending ?? 0} empfohlen · ${totals.maybe_pending ?? 0} vielleicht`
-                                    : `${state.feedIndex + 1} / ${state.feedItems.length} in dieser Session · ${totals.total_pending ?? state.feedItems.length} offen · ${totals.recommended_pending ?? 0} empfohlen · ${totals.maybe_pending ?? 0} vielleicht`}</p>
+                                    ? `Verlauf ${state.feedHistoryIndex + 1} / ${state.feedHistory.length} · ${batchSummary} · ${totals.recommended_pending ?? 0} empfohlen geladen · ${totals.maybe_pending ?? 0} vielleicht geladen`
+                                    : `${state.feedIndex + 1} / ${state.feedItems.length} in Tranche · ${batchSummary} · ${totals.recommended_pending ?? 0} empfohlen geladen · ${totals.maybe_pending ?? 0} vielleicht geladen`}</p>
                             </div>
                         <div class="toolbar">
                                 <div class="segmented">
                                     <button class="segment-button ${state.feedMode === 'all' ? 'active' : ''}" data-feed-mode="all">Alle</button>
-                                    <button class="segment-button ${state.feedMode === 'recommended' ? 'active' : ''}" data-feed-mode="recommended">Empfohlen</button>
-                                    <button class="segment-button ${state.feedMode === 'maybe' ? 'active' : ''}" data-feed-mode="maybe">Vielleicht</button>
+                                    <button class="segment-button ${state.feedMode === 'recommended' ? 'active' : ''}" data-feed-mode="recommended">+</button>
+                                    <button class="segment-button ${state.feedMode === 'maybe' ? 'active' : ''}" data-feed-mode="maybe">?</button>
                                 </div>
-                                <button class="inline-button" id="feedDeduplicateButton" ${state.feedDeduplicating ? 'disabled' : ''}>${state.feedDeduplicating ? 'Kompaktiere …' : 'Inbox kompaktieren'}</button>
-                                <button class="inline-button" id="feedResetButton">Inbox-Reset</button>
-                                <button class="inline-button" id="refreshFeedButton">Feeds aktualisieren</button>
+                                <button class="inline-button" id="feedDeduplicateButton" ${state.feedDeduplicating ? 'disabled' : ''}>${state.feedDeduplicating ? 'Dedupe …' : 'Inbox dedupe'}</button>
+                                ${batchControls}
+                                <button class="inline-button" id="feedResetButton">Reset</button>
                             </div>
                         </div>
 	                    ${deduplicateBanner}
@@ -1693,18 +1753,10 @@ Die Markdown-Datei ist attached.`;
                     renderFeedScreen(state.feedCounts);
                 });
             });
-            document.getElementById('refreshFeedButton')?.addEventListener('click', async () => {
-                try {
-                    showToast('Feeds werden aktualisiert …', 'info');
-                    await api('/feeds/refresh', { method: 'POST' });
-                    await loadStatus();
-                    await loadFeed(true);
-                } catch (error) {
-                    showToast(error.message, 'error');
-                }
-            });
             document.getElementById('feedDeduplicateButton')?.addEventListener('click', handleFeedDeduplicate);
             document.getElementById('feedResetButton')?.addEventListener('click', handleFeedReset);
+            document.getElementById('nextFeedBatchButton')?.addEventListener('click', handleNextFeedBatch);
+            document.getElementById('previousFeedBatchButton')?.addEventListener('click', handlePreviousFeedBatch);
         }
 
         async function handleFeedDeduplicate() {
@@ -1744,6 +1796,8 @@ Die Markdown-Datei ist attached.`;
                 showToast(`Inbox-Reset: ${result.archived_count} Einträge aus dem Feed entfernt.`, 'info');
                 state.feedItems = [];
                 state.feedIndex = 0;
+                state.feedOffset = 0;
+                state.feedBatch = null;
                 await loadStatus();
                 await loadFeed(true);
             } catch (error) {

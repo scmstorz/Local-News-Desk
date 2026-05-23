@@ -1176,6 +1176,8 @@ class LocalNewsRegressionTests(unittest.TestCase):
                 "visible_total": 1,
                 "similar_group_count": 0,
                 "similar_hidden_count": 0,
+                "offset": 0,
+                "limit": backend.FEED_API_ITEM_LIMIT,
             },
         )
         ensure_snapshot.assert_called_once_with()
@@ -1194,6 +1196,37 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(similarity["pending_total"], 3)
         self.assertEqual(similarity["visible_total"], 2)
+
+    def test_load_feed_rows_for_api_uses_offset_for_later_batches(self):
+        self.insert_article(
+            guid="batch-newest",
+            title="Newest batch article",
+            published_at="2026-04-27T12:00:00+00:00",
+        )
+        middle_id = self.insert_article(
+            guid="batch-middle",
+            title="Middle batch article",
+            published_at="2026-04-27T11:00:00+00:00",
+        )
+        oldest_id = self.insert_article(
+            guid="batch-oldest",
+            title="Oldest batch article",
+            published_at="2026-04-27T10:00:00+00:00",
+        )
+
+        with mock.patch("local_news_backend.FEED_API_ITEM_LIMIT", 2), mock.patch(
+            "local_news_backend.current_feed_similarity_snapshot"
+        ) as current_snapshot, mock.patch(
+            "local_news_backend.fetch_visible_pending_feed_articles_from_snapshot"
+        ) as fetch_snapshot:
+            rows, similarity = backend.load_feed_rows_for_api(offset=1)
+
+        current_snapshot.assert_not_called()
+        fetch_snapshot.assert_not_called()
+        self.assertEqual([row["id"] for row in rows], [middle_id, oldest_id])
+        self.assertEqual(similarity["pending_total"], 3)
+        self.assertEqual(similarity["offset"], 1)
+        self.assertEqual(similarity["limit"], 2)
 
     def test_build_feed_api_payload_filters_and_serializes_items(self):
         rows = [
@@ -1239,6 +1272,8 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertEqual(payload["counts"]["maybe_pending"], 1)
         self.assertEqual(payload["counts"]["similar_group_count"], 2)
         self.assertEqual(payload["counts"]["similar_hidden_count"], 3)
+        self.assertEqual(payload["batch"]["offset"], 0)
+        self.assertEqual(payload["batch"]["loaded"], 2)
         self.assertEqual(payload["counts"]["gate_demotions"]["total"], 0)
         update_predictions.assert_called_once_with(predicted_rows, 42)
 
@@ -1995,9 +2030,21 @@ class LocalNewsRegressionTests(unittest.TestCase):
 
         self.assertIn("const API_TIMEOUT_MS = 15000", html)
         self.assertIn("const FEED_MUTATION_CHAIN_TIMEOUT_MS = 20000", html)
+        self.assertIn("class ApiError extends Error", html)
         self.assertIn("Promise.race([", html)
         self.assertIn("Backend-Anfrage hat zu lange gedauert", html)
         self.assertIn("Vorherige Feed-Aktion hängt", html)
+
+    def test_frontend_stale_feed_action_404_reload_is_not_raw_error(self):
+        html = Path("local-news-app.html").read_text(encoding="utf-8")
+        start = html.index("function queueFeedMutation(task)")
+        end = html.index("async function loadFeed", start)
+        handler = html[start:end]
+
+        self.assertIn("error.status === 404", handler)
+        self.assertIn("error.message === 'Article not found'", handler)
+        self.assertIn("Artikel war nicht mehr in der aktiven Inbox", handler)
+        self.assertIn("await loadFeed(false);", handler)
 
     def test_frontend_summary_success_toast_happens_after_backend_call(self):
         html = Path("local-news-app.html").read_text(encoding="utf-8")
@@ -2021,6 +2068,29 @@ class LocalNewsRegressionTests(unittest.TestCase):
         self.assertIn("Keine Treffer mehr in diesem Modus. Zeige alle offenen Feed-Einträge.", html)
         self.assertIn("switchEmptyFeedModeToAll();", html)
         self.assertNotIn("else if (!state.feedItems.length)", html)
+
+    def test_frontend_feed_batch_navigation_uses_offset(self):
+        html = Path("local-news-app.html").read_text(encoding="utf-8")
+
+        self.assertIn("feedOffset: 0", html)
+        self.assertIn("feedBatch: null", html)
+        self.assertIn("offset=${encodeURIComponent(state.feedOffset)}", html)
+        self.assertIn("async function handleNextFeedBatch()", html)
+        self.assertIn("async function handlePreviousFeedBatch()", html)
+        self.assertIn("&lt; 300", html)
+        self.assertIn("300 &gt;", html)
+        self.assertIn("Inbox dedupe", html)
+        self.assertIn("Dedupe", html)
+        self.assertNotIn("Inbox kompaktieren", html)
+        self.assertIn('data-feed-mode="recommended">+</button>', html)
+        self.assertIn('data-feed-mode="maybe">?</button>', html)
+        self.assertIn('id="feedResetButton">Reset</button>', html)
+        self.assertIn("in Tranche", html)
+        self.assertNotIn("in dieser Tranche", html)
+        self.assertNotIn("Inbox-Reset</button>", html)
+        self.assertNotIn("Feeds aktualisieren", html)
+        self.assertNotIn("refreshFeedButton", html)
+        self.assertIn("empfohlen geladen", html)
 
     def test_frontend_marks_metadata_fallback_summaries(self):
         html = Path("local-news-app.html").read_text(encoding="utf-8")
