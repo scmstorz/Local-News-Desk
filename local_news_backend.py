@@ -3245,7 +3245,9 @@ def refresh_feeds() -> dict[str, Any]:
         parsed_feeds: list[tuple[str, Any]] = []
         for feed_url in RSS_FEED_URLS:
             try:
-                feed = feedparser.parse(feed_url)
+                response = requests.get(feed_url, timeout=get_request_timeout_seconds())
+                response.raise_for_status()
+                feed = feedparser.parse(response.content)
                 parsed_feeds.append((feed_url, feed))
             except Exception as exc:
                 feed_errors.append(f"{feed_url}: {exc}")
